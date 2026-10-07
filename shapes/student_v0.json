@@ -1,0 +1,14 @@
+{
+  "name": "student_v0",
+  "comment": "design.md D2 的初始冻结点:同金字塔、变窄、减深、全分辨率块去注意力。sweep(1.8)后允许 ±20% GMAC 内调整。",
+  "levels": [
+    {"level": "full", "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 2, "attn": false},
+    {"level": "d0",   "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 4, "attn": true},
+    {"level": "d1",   "kind": "expert", "channels": 64,  "hidden": 64, "blocks": 4, "attn": true},
+    {"level": "d2",   "kind": "expert", "channels": 128, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d3",   "kind": "expert", "channels": 256, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d4",   "kind": "split",  "channels": 256, "hidden": 64, "blocks": 2, "attn": true,
+     "branches": 8, "branch_channels": 32, "middle_channels": 128}
+  ],
+  "vit": {"channels": 512, "ffn": 1024, "blocks": 3, "tokens_level": "d5"}
+}

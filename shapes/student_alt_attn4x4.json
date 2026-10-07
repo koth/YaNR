@@ -1,0 +1,15 @@
+{
+  "name": "student_alt_attn4x4",
+  "comment": "D3 备选(v0 + 全分辨率块 4x4 窗口注意力,16 槽;d0 4->2 块补回预算,~5.4x):v0 的全分辨率细节质量不达标时启用 —— 给 full 级补 4x4 上下文,代价 +0.6 GMAC,需 window kernel 16 槽变体(task 3.7)。",
+  "levels": [
+    {"level": "full", "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 2, "attn": true,
+     "window_slots": 16},
+    {"level": "d0",   "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 2, "attn": true},
+    {"level": "d1",   "kind": "expert", "channels": 64,  "hidden": 64, "blocks": 4, "attn": true},
+    {"level": "d2",   "kind": "expert", "channels": 128, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d3",   "kind": "expert", "channels": 256, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d4",   "kind": "split",  "channels": 256, "hidden": 64, "blocks": 2, "attn": true,
+     "branches": 8, "branch_channels": 32, "middle_channels": 128}
+  ],
+  "vit": {"channels": 512, "ffn": 1024, "blocks": 3, "tokens_level": "d5"}
+}

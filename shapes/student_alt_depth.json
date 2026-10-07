@@ -1,0 +1,14 @@
+{
+  "name": "student_alt_depth",
+  "comment": "sweep 候选 B(w0.6-d0.4-ffn-only-v3,512² 13.16 GMAC → 5.29×):通道略宽、深度更浅。质量风险:深度砍到 1+1~2+2,容量均匀;若 v0 深层级欠拟合(细节纹理发糊)换此形状重训。ch=32 级用 ffn kind(实现约束)。",
+  "levels": [
+    {"level": "full", "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 2, "attn": false},
+    {"level": "d0",   "kind": "ffn",    "channels": 32,  "hidden": 64, "blocks": 4, "attn": true},
+    {"level": "d1",   "kind": "ffn",    "channels": 32,  "hidden": 64, "blocks": 4, "attn": true},
+    {"level": "d2",   "kind": "expert", "channels": 64,  "hidden": 64, "blocks": 4, "attn": true},
+    {"level": "d3",   "kind": "expert", "channels": 160, "hidden": 64, "blocks": 6, "attn": true},
+    {"level": "d4",   "kind": "split",  "channels": 320, "hidden": 64, "blocks": 6, "attn": true,
+     "branches": 10, "branch_channels": 32, "middle_channels": 128}
+  ],
+  "vit": {"channels": 608, "ffn": 1216, "blocks": 3, "tokens_level": "d5"}
+}
