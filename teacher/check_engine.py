@@ -58,12 +58,11 @@ def main():
     features = build_features(proxy, g, args.seed, 1.5, 0.5, 0.35, -1.0, False)
 
     hook_store = {}
-    m0 = model.enc_blocks['d0'][0]
-    m1 = model.enc_blocks['d0'][1]
-    m0.register_forward_pre_hook(
+    d0_blocks = list(model.enc_blocks['d0'])
+    d0_blocks[0].register_forward_pre_hook(
         lambda mod, inp: hook_store.__setitem__('trans-d0', inp[0].detach().numpy()))
-    for tag, blk in (('enc_blocks.d0.0', m0), ('enc_blocks.d0.1', m1),
-                     ('vit_blocks.0', model.vit_blocks[0])):
+    for tag, blk in [('enc_blocks.d0.%d' % i, b) for i, b in enumerate(d0_blocks)] + \
+                    [('vit_blocks.0', model.vit_blocks[0])]:
         blk.register_forward_hook(
             lambda mod, inp, out, tag=tag: hook_store.__setitem__('blk-' + tag,
                                                                  out.detach().numpy()))

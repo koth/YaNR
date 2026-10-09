@@ -1,0 +1,14 @@
+{
+  "name": "student_slim_deep",
+  "comment": "512²/30ms 候选(猛砍 ~60%):d0/d1 减半深、d3/d4 减半宽、ViT 砍半;质量风险大,供形状敏感度消融定夺。",
+  "levels": [
+    {"level": "full", "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 1, "attn": false},
+    {"level": "d0",   "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 2, "attn": true},
+    {"level": "d1",   "kind": "expert", "channels": 64,  "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d2",   "kind": "expert", "channels": 128, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d3",   "kind": "expert", "channels": 128, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d4",   "kind": "split",  "channels": 128, "hidden": 64, "blocks": 2, "attn": true,
+     "branches": 4, "branch_channels": 32, "middle_channels": 128}
+  ],
+  "vit": {"channels": 256, "ffn": 512, "blocks": 2, "tokens_level": "d5"}
+}

@@ -36,6 +36,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from annotate import TeacherAnnotator                                # noqa: E402
 from nr_geometry import geometry_from_valid                          # noqa: E402
+from nr_history import reproject_history, store_history              # noqa: E402
 from nr_student import StudentNetwork, load_student_shape, student_alignment   # noqa: E402
 from run_image import build_features, save_png                       # noqa: E402
 
@@ -49,6 +50,7 @@ DEFAULTS = {
     'overfit': 0,
     'lr': 2e-4, 'wd': 0.01, 'warmup': 2000, 'ema': 0.999, 'clip': 1.0,
     'loss_out': 1.0, 'loss_detail': 0.5, 'loss_feature': 0.5, 'loss_temporal': 0.0,
+    'pair_fraction': 0.3,        # 时序对采样比例(历史腿:上帧教师输出 -> truncate_half -> 重投影)
     'log_every': 100, 'vis_every': 2000, 'ckpt_every': 5000,
     'seed': 20261007,
     'style_range': [0.0, 3.0], 'tone_range': [0.3, 0.7], 'structure_range': [0.2, 0.8],
@@ -76,7 +78,7 @@ def load_config(args):
             cfg.update(json.load(fh))
     for key in ('shape', 'teacher_weights', 'batch', 'steps', 'overfit', 'lr', 'wd',
                 'warmup', 'ema', 'clip', 'loss_out', 'loss_detail', 'loss_feature',
-                'loss_temporal', 'seed'):
+                'loss_temporal', 'pair_fraction', 'seed'):
         value = getattr(args, key, None)
         if value is not None:
             cfg[key] = value
@@ -138,6 +140,41 @@ class FrameSource:
         noise_seed = int(rng.integers(1 << 30))
         return proxy, noise_seed, lane, self.files[idx]
 
+    def sample_pair(self, step):
+        """时序对(历史腿):同一源图两个合成视角 + 已知运动场(输出像素系)。
+
+        构造:big = resize(size+2P);B(当前) = [P:P+size];A(上帧) = [P+d:P+d+size]
+        —— 即 A[y][x] == B[y+dy][x+dx],reproject 口径"prev 坐标 = current + motion"
+        对应 motion = (-dx, -dy)(归一化:uv 除以 size,同 nr_history 的单位)。
+        """
+        rng = np.random.default_rng([self.cfg['seed'], step])
+        idx = step % len(self.files) if self.overfit else int(rng.integers(len(self.files)))
+        size_cfg = self.size if isinstance(self.size, (list, tuple)) else [self.size]
+        weights = self.cfg.get('size_weights')
+        if weights:
+            p = [w / sum(weights) for w in weights]
+            size = int(size_cfg[int(rng.choice(len(size_cfg), p=p))])
+        else:
+            size = int(size_cfg[int(rng.integers(len(size_cfg)))])
+        image = Image.open(self.files[idx]).convert('RGB')
+        pad = 8
+        big = np.asarray(image.resize((size + 2 * pad, size + 2 * pad), Image.LANCZOS),
+                         dtype=np.float32) / 255.0
+        dx = int(rng.integers(-6, 7))
+        dy = int(rng.integers(-6, 7))
+        cur = np.ascontiguousarray(big[pad:pad + size, pad:pad + size])
+        prev = np.ascontiguousarray(big[pad + dy:pad + dy + size, pad + dx:pad + dx + size])
+        motion = np.zeros((size, size, 2), np.float32)
+        motion[..., 0] = -dx / size
+        motion[..., 1] = -dy / size
+        lane = {
+            'style': float(rng.uniform(*self.cfg['style_range'])),
+            'tone': float(rng.uniform(*self.cfg['tone_range'])),
+            'structure': float(rng.uniform(*self.cfg['structure_range'])),
+            'skin': -1.0, 'auto_mask': False,
+        }
+        return prev, cur, motion, lane, self.files[idx]
+
 
 # ---------------------------------------------------------------- losses
 
@@ -172,13 +209,24 @@ def sobel_l1(a, b):
     return (gxa - gxb).abs().mean() + (gya - gyb).abs().mean()
 
 
-def output_losses(s_head, t_head, proxy):
-    """输出损失(5.3):rgb/4 L1 + blend logit SmoothL1 + 合成图 L1。"""
+def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0):
+    """输出损失(5.3):rgb/4 L1 + blend logit SmoothL1 + 合成图 L1。
+
+    有历史(repro 非空)时合成走 temporal blend(run_image 语义:权重
+    clamp(sigmoid(logit)*blend_scale)),blend logit 的监督此时才有意义;
+    返回的 neural 是部署口径合成图(时序损失吃它)。
+    """
     s_rgb, t_rgb = s_head[..., :3] / 4.0, t_head[..., :3] / 4.0
     out = F.l1_loss(s_rgb, t_rgb) + 0.5 * F.smooth_l1_loss(s_head[..., 3], t_head[..., 3])
     s_neural = torch.clamp(proxy + s_rgb, 0, 1)
     t_neural = torch.clamp(proxy + t_rgb, 0, 1)
     out = out + F.l1_loss(s_neural, t_neural)
+    if repro is not None:
+        s_w = torch.clamp(torch.sigmoid(s_head[..., 3]) * s_scale, 0, 1)
+        t_w = torch.clamp(torch.sigmoid(t_head[..., 3]) * t_scale, 0, 1)
+        s_neural = s_neural + (repro - s_neural) * s_w[..., None]
+        t_neural = t_neural + (repro - t_neural) * t_w[..., None]
+        out = out + F.l1_loss(s_neural, t_neural)
     return out, s_neural, t_neural
 
 
@@ -261,6 +309,8 @@ def main():
     parser.add_argument('--loss-detail', dest='loss_detail', type=float)
     parser.add_argument('--loss-feature', dest='loss_feature', type=float)
     parser.add_argument('--loss-temporal', dest='loss_temporal', type=float)
+    parser.add_argument('--pair-fraction', dest='pair_fraction', type=float,
+                        help='时序对采样比例(0 关闭历史腿)')
     parser.add_argument('--seed', type=int)
     args = parser.parse_args()
     cfg = load_config(args)
@@ -302,13 +352,17 @@ def main():
     model = StudentNetwork(shape, g).to(device)
     model.capture_enabled = True
 
-    # 形状不匹配的特征对(d4/ViT) -> 1x1 投影表。
-    align_pairs = {}
-    s_dims = {'s-enc-full': 32, 's-enc-d0': 32, 's-enc-d1': 64, 's-enc-d2': 128,
-              's-enc-d3': 256, 's-enc-d4': shape['levels'][5]['channels'],
+    # 形状不匹配的特征对(d4/ViT) -> 1x1 投影表。s 维从形状读 —— 曾经硬编码 v0,
+    # 非 v0 形状(如 slim 系列 d3=128)会漏建投影,教师维度原样穿透直接崩。
+    lv = shape['levels']
+    s_dims = {'s-enc-full': lv[0]['channels'], 's-enc-d0': lv[1]['channels'],
+              's-enc-d1': lv[2]['channels'], 's-enc-d2': lv[3]['channels'],
+              's-enc-d3': lv[4]['channels'], 's-enc-d4': lv[5]['channels'],
               's-vit': shape['vit']['channels'],
-              's-dec-d4': shape['levels'][5]['channels'], 's-dec-d3': 256,
-              's-dec-d2': 128, 's-dec-d1': 64, 's-dec-d0': 32}
+              's-dec-d4': lv[5]['channels'], 's-dec-d3': lv[4]['channels'],
+              's-dec-d2': lv[3]['channels'], 's-dec-d1': lv[2]['channels'],
+              's-dec-d0': lv[1]['channels']}
+    align_pairs = {}
     t_dims = {'s-enc-full': 32, 's-enc-d0': 32, 's-enc-d1': 64, 's-enc-d2': 128,
               's-enc-d3': 256, 's-enc-d4': 512, 's-vit': 1024,
               's-dec-d4': 512, 's-dec-d3': 256, 's-dec-d2': 128, 's-dec-d1': 64,
@@ -343,8 +397,8 @@ def main():
     log = open(log_path, 'a', newline='')
     writer = csv.writer(log)
     if new_log:
-        writer.writerow(['step', 'lr', 'loss', 'out', 'detail', 'feature', 'psnr_teacher',
-                         'ms'])
+        writer.writerow(['step', 'lr', 'loss', 'out', 'detail', 'feature', 'temporal',
+                         'psnr_teacher', 'ms'])
 
     print(f"train: {len(source.files)} files, {sizes}², {cfg['batch']} batch, "
           f"{cfg['steps']} steps, device {device}")
@@ -354,32 +408,72 @@ def main():
         for group in optim.param_groups:
             group['lr'] = lr
         t0 = time.perf_counter()
-        totals = {'out': 0.0, 'detail': 0.0, 'feature': 0.0}
+        totals = {'out': 0.0, 'detail': 0.0, 'feature': 0.0, 'temporal': 0.0}
         feat_detail = {}
         psnrs = []
         optim.zero_grad()
-        for _ in range(cfg['batch']):
-            proxy, noise_seed, lane, _ = source.sample(step * cfg['batch'] + len(psnrs))
-            s = proxy.shape[0]
-            g_s, teacher_s = geo_for(s)
-            model.g = g_s                              # 学生算子与分辨率无关,换几何即换边长
-            features_np = build_features(proxy, g_s, noise_seed, lane['style'], lane['tone'],
+        pair_mode = (cfg['pair_fraction'] > 0 and
+                     np.random.default_rng([cfg['seed'], step, 7]).random() < cfg['pair_fraction'])
+        for bi in range(cfg['batch']):
+            if pair_mode:
+                # 历史腿:上帧教师输出(teacher-forcing)-> truncate_half 存史 ->
+                # 已知运动重投影 -> 当前帧带真实历史 lanes(与部署管线同口径)。
+                prev_p, cur_p, motion, lane, _ = source.sample_pair(step * cfg['batch'] + bi)
+                seed_a = int(np.random.default_rng([cfg['seed'], step, bi, 1]).integers(1 << 30))
+                noise_seed = int(np.random.default_rng([cfg['seed'], step, bi, 2]).integers(1 << 30))
+                s = cur_p.shape[0]
+                g_s, teacher_s = geo_for(s)
+                model.g = g_s
+                feats_a = build_features(prev_p, g_s, seed_a, lane['style'], lane['tone'],
                                          lane['structure'], lane['skin'], lane['auto_mask'])
+                with torch.no_grad():
+                    t_res_a = teacher_s.annotate(feats_a)
+                    t_head_a = torch.from_numpy(t_res_a['head']).view(
+                        g_s['full_height'], g_s['full_width'], 4)[:s, :s].to(device)
+                    prev_t = torch.from_numpy(prev_p).to(device)
+                    t_neural_a = torch.clamp(prev_t + t_head_a[..., :3] / 4, 0, 1)
+                    hist = store_history(t_neural_a.detach().cpu().numpy().astype(np.float32))
+                    repro_np = reproject_history(hist, motion)
+                proxy = cur_p
+                features_np = build_features(cur_p, g_s, noise_seed, lane['style'], lane['tone'],
+                                             lane['structure'], lane['skin'], lane['auto_mask'],
+                                             history=repro_np)
+            else:
+                proxy, noise_seed, lane, _ = source.sample(step * cfg['batch'] + bi)
+                repro_np = None
+                s = proxy.shape[0]
+                g_s, teacher_s = geo_for(s)
+                model.g = g_s                              # 学生算子与分辨率无关,换几何即换边长
+                features_np = build_features(proxy, g_s, noise_seed, lane['style'], lane['tone'],
+                                             lane['structure'], lane['skin'], lane['auto_mask'])
             with torch.no_grad():
                 t_res = teacher_s.annotate(features_np, capture=teacher_caps)
             # head 是场分辨率(如 512² -> 场 576x512),裁到有效区再进损失。
             t_head = torch.from_numpy(t_res['head']).view(
                 g_s['full_height'], g_s['full_width'], 4)[:s, :s].to(device)
             proxy_t = torch.from_numpy(proxy).to(device)
+            repro_t = torch.from_numpy(repro_np).to(device) if repro_np is not None else None
 
             with torch.autocast(device, dtype=torch.bfloat16):
                 s_head = model(torch.from_numpy(features_np).to(device))
             s_head = s_head.view(g_s['full_height'], g_s['full_width'], 4)[:s, :s].float()
-            out, s_neural, t_neural = output_losses(s_head, t_head, proxy_t)
+            out, s_neural, t_neural = output_losses(
+                s_head, t_head, proxy_t, repro=repro_t,
+                s_scale=float(model.blend_scale.detach()), t_scale=teacher_s.blend_scale)
             detail = laplacian_l1(s_neural, t_neural) + sobel_l1(s_neural, t_neural)
             feat, feat_detail = feature_losses(model.captures, t_res, aligner, feature_weights)
             loss = (cfg['loss_out'] * out + cfg['loss_detail'] * detail
                     + cfg['loss_feature'] * feat)
+            temporal = None
+            if pair_mode and cfg['loss_temporal'] > 0:
+                # 时序损失(真接上):帧差残差匹配 L1((s_B - s_A) - (t_B - t_A)) ——
+                # 正是 eval_temporal 的 flicker 口径(输入差分抵消后)。
+                with torch.no_grad():
+                    s_head_a = model(torch.from_numpy(feats_a).to(device))
+                s_head_a = s_head_a.view(g_s['full_height'], g_s['full_width'], 4)[:s, :s].float()
+                _, s_neural_a, _ = output_losses(s_head_a, t_head_a, prev_t)
+                temporal = F.l1_loss(s_neural - s_neural_a, t_neural - t_neural_a.detach())
+                loss = loss + cfg['loss_temporal'] * temporal
             if not torch.isfinite(loss):
                 print(f'step {step}: non-finite sample loss, skipped')
                 continue
@@ -387,6 +481,8 @@ def main():
             totals['out'] += float(out.detach())
             totals['detail'] += float(detail.detach())
             totals['feature'] += float(feat.detach())
+            if temporal is not None:
+                totals['temporal'] += float(temporal.detach())
             psnrs.append(psnr(s_neural.detach(), t_neural))
         torch.nn.utils.clip_grad_norm_(params, cfg['clip'])
         optim.step()
@@ -417,14 +513,16 @@ def main():
         if step % cfg['log_every'] == 0 or step == cfg['steps'] - 1:
             n = cfg['batch']
             pn = max(1, len(psnrs))
-            row = [step, f'{lr:.2e}', f"{(totals['out'] + totals['detail'] + totals['feature']) / n:.5f}",
+            row = [step, f'{lr:.2e}',
+                   f"{(totals['out'] + totals['detail'] + totals['feature'] + totals['temporal']) / n:.5f}",
                    f"{totals['out'] / n:.5f}", f"{totals['detail'] / n:.5f}",
-                   f"{totals['feature'] / n:.5f}", f'{sum(psnrs) / pn:.2f}',
-                   f'{ms:.0f}']
+                   f"{totals['feature'] / n:.5f}", f"{totals['temporal'] / n:.5f}",
+                   f'{sum(psnrs) / pn:.2f}', f'{ms:.0f}']
             writer.writerow(row)
             log.flush()
             print(f"step {step:6d}  lr {lr:.2e}  out {totals['out'] / n:.5f}  "
                   f"detail {totals['detail'] / n:.5f}  feat {totals['feature'] / n:.5f}  "
+                  f"temp {totals['temporal'] / n:.5f}  "
                   f"psnr(t) {sum(psnrs) / len(psnrs):.2f}  {ms:.0f} ms")
 
         if cfg['vis_every'] and step % cfg['vis_every'] == 0 and step > 0:

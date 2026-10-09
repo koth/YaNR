@@ -1,0 +1,14 @@
+{
+  "name": "student_slim_mixed",
+  "comment": "30ms@320² 候选 B(减深 + 减宽混合):d3/d4 256->192、ViT 512/1024->384/768,砍得更深,质量风险更大。",
+  "levels": [
+    {"level": "full", "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 1, "attn": false},
+    {"level": "d0",   "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 3, "attn": true},
+    {"level": "d1",   "kind": "expert", "channels": 64,  "hidden": 64, "blocks": 3, "attn": true},
+    {"level": "d2",   "kind": "expert", "channels": 128, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d3",   "kind": "expert", "channels": 192, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d4",   "kind": "split",  "channels": 192, "hidden": 64, "blocks": 2, "attn": true,
+     "branches": 6, "branch_channels": 32, "middle_channels": 128}
+  ],
+  "vit": {"channels": 384, "ffn": 768, "blocks": 2, "tokens_level": "d5"}
+}

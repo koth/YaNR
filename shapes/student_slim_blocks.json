@@ -1,0 +1,14 @@
+{
+  "name": "student_slim_blocks",
+  "comment": "30ms@320² 候选 A(减深优先,通道不动):砍块数对质量最温和,复用 v0 的宽度布局。",
+  "levels": [
+    {"level": "full", "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 1, "attn": false},
+    {"level": "d0",   "kind": "ffn",    "channels": 32,  "hidden": 32, "blocks": 3, "attn": true},
+    {"level": "d1",   "kind": "expert", "channels": 64,  "hidden": 64, "blocks": 3, "attn": true},
+    {"level": "d2",   "kind": "expert", "channels": 128, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d3",   "kind": "expert", "channels": 256, "hidden": 64, "blocks": 2, "attn": true},
+    {"level": "d4",   "kind": "split",  "channels": 256, "hidden": 64, "blocks": 2, "attn": true,
+     "branches": 8, "branch_channels": 32, "middle_channels": 128}
+  ],
+  "vit": {"channels": 512, "ffn": 1024, "blocks": 2, "tokens_level": "d5"}
+}
