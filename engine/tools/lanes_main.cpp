@@ -6,6 +6,8 @@
 // proxy/history: raw f32 [vh][vw][3] code values. lanes: raw f32 [full_rows][16].
 // The parity check (teacher/check_lanes.py) compares this byte stream against
 // run_image.build_features elementwise.
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,7 +19,7 @@
 
 int main(int argc, char** argv) {
     std::string proxy_path, history_path, out_path;
-    int vw = 0, vh = 0;
+    int vw = 0, vh = 0, bench_reps = 0;
     LaneParams p;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -36,6 +38,7 @@ int main(int argc, char** argv) {
         else if (a == "--structure") p.structure = std::atof(next());
         else if (a == "--skin") p.skin = std::atof(next());
         else if (a == "--automask") p.auto_mask = true;
+        else if (a == "--bench") bench_reps = std::atoi(next());
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     if (proxy_path.empty() || out_path.empty() || vw <= 0 || vh <= 0) {
@@ -62,7 +65,20 @@ int main(int argc, char** argv) {
 
     Geometry g = geometry_from_valid(vw, vh);
     std::vector<float> lanes((size_t)g.full_rows * 16);
-    build_lanes(proxy.data(), vw, vh, g, p, lanes.data());
+    if (bench_reps > 0) {                       // 一键基准(8.5):lane 构造分段计时
+        std::vector<double> times;
+        for (int i = 0; i < bench_reps + 1; i++) {
+            auto t0 = std::chrono::steady_clock::now();
+            build_lanes(proxy.data(), vw, vh, g, p, lanes.data());
+            auto t1 = std::chrono::steady_clock::now();
+            if (i > 0) times.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        std::sort(times.begin(), times.end());
+        std::printf("cpu_lanes  %dx%d  median %.3f ms  min %.3f ms  (%d reps)\n",
+                    vw, vh, times[times.size() / 2], times.front(), bench_reps);
+    } else {
+        build_lanes(proxy.data(), vw, vh, g, p, lanes.data());
+    }
 
     FILE* f = std::fopen(out_path.c_str(), "wb");
     if (!f) { std::fprintf(stderr, "cannot write %s\n", out_path.c_str()); return 1; }

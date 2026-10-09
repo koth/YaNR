@@ -67,6 +67,8 @@ void build_lanes(const float* proxy, int vw, int vh, const Geometry& g,
         s14 = f16_to_f32(f32_to_f16(-1.0f));
     }
 
+    // 每像素独立、无跨像素归约 —— 按行并行且逐位不变(check_lanes 对账不受影响)。
+#pragma omp parallel for schedule(static)
     for (int y = 0; y < full_h; y++) {
         int ry = y < vh ? y : 2 * vh - y - 2;
         if (ry < 0) ry = 0;

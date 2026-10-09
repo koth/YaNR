@@ -115,7 +115,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::vector<uint8_t> rgb((size_t)vs * vs * 3), bw((size_t)vs * vs * 3);
-        double rmin = 1e30, rmax = -1e30, rsum = 0.0, lmin = 1e30, lmax = -1e30, bsum = 0.0;
+        double rmin = 0, rmax = 0, rsum = 0, lmin = 0, lmax = 0, bsum = 0;
+        std::vector<double> ctimes;
+        const int creps = bench ? repeats : 1;
+        for (int rep = 0; rep < creps; rep++) {
+        auto c0 = std::chrono::steady_clock::now();
+        rmin = 1e30; rmax = -1e30; rsum = 0.0; lmin = 1e30; lmax = -1e30; bsum = 0.0;
         for (int y = 0; y < vs; y++) {
             for (int x = 0; x < vs; x++) {
                 const float* hv = head.data() + ((size_t)y * gg.full_width + x) * 4;
@@ -138,10 +143,16 @@ int main(int argc, char** argv) {
                 bsum += bl;
             }
         }
+        auto c1 = std::chrono::steady_clock::now();
+        if (bench) ctimes.push_back(std::chrono::duration<double, std::milli>(c1 - c0).count());
+        }
+        std::sort(ctimes.begin(), ctimes.end());
+        double cmed = ctimes.empty() ? 0.0 : ctimes[ctimes.size() / 2];
         double n3 = (double)vs * vs * 3, n1 = (double)vs * vs;
-        std::printf("composite %dx%d: rgb/4 min %+.3f max %+.3f mean %+.3f | "
+        std::printf("composite %dx%d  %s%.3f ms: rgb/4 min %+.3f max %+.3f mean %+.3f | "
                     "blend logit min %+.3f max %+.3f | blend applied mean %.3f\n",
-                    vs, vs, rmin, rmax, rsum / n3, lmin, lmax, bsum / n1);
+                    vs, vs, bench ? "median " : "", cmed, rmin, rmax, rsum / n3,
+                    lmin, lmax, bsum / n1);
         if (!png_path.empty()) {
             pngw::write_rgb8(png_path, vs, vs, rgb.data());
             std::printf("wrote %s\n", png_path.c_str());
