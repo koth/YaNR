@@ -22,10 +22,11 @@
 ## 目录
 - `teacher/` —— 自包含实现:教师(nr_*/run_image/annotate)、学生(nr_student/run_student)、
   训练(train_distill)、成本模型(cost_model/sweep_shapes)、校验与工具。
-- `engine/` —— 学生 CPU 推理引擎(C++17 + OpenMP):lane 管线、前向、f16 基元、几何;
-  AVX2 数值内核(gemm.cpp 打包 GEMM/exp/int8、attn.cpp 融合注意力)、`gemm_bench` 微基准。
-  i9-10850K/8 线程实测 320² 43ms、512² 136ms(fp32;int8 混合质量过线但本机平手)。
-  512²/30ms 在本机物理不可达(硬算术见 STUDENT.md §6);口径见 openspec 8.7/8.8。
+- `engine/` —— 学生 CPU 推理引擎(C++17 + OpenMP):lane 管线、前向、f16 基元、几何、
+  composite+PNG 输出(png_write.h 零依赖编码器);AVX2 数值内核(gemm.cpp 打包
+  GEMM/exp/int8、attn.cpp 向量化注意力)、`gemm_bench` 微基准。i9-10850K/8 线程空载
+  实测 320² 36.7ms、512² 115ms(fp32;int8 混合质量过线但本机平手/略慢)。
+  512²/30ms 在本机物理不可达(硬算术见 STUDENT.md §6);320² 差 ~22%,口径见 8.7/8.8。
 - `shapes/` —— 学生形状 DSL(student_v0 默认,两个备选)。
 - `openspec/` —— 变更提案/任务/规格;完成的任务及时勾选并附数字结论。
 - `data/`、`weights/`、`tmp/`、`runs/`、`teacher/.comet_key` 均在 gitignore:

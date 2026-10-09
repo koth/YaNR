@@ -50,6 +50,8 @@ def main():
     parser.add_argument('--height', type=int, default=512, help='valid height')
     parser.add_argument('--frames', type=int, default=5, help='timed frames after one warm-up')
     parser.add_argument('--weights', default=os.environ.get('NR_WEIGHTS'), help='model directory')
+    parser.add_argument('--shape', default='auto',
+                        help="'auto'(默认,按包内 manifest 自动探测教师/学生)/ 'student'(要求学生包)")
     parser.add_argument('--dump', default=None, help='directory for features/head .bin dumps')
     parser.add_argument('--eager', action='store_true',
                         help='run frame by frame instead of replaying a captured CUDA graph')
@@ -67,12 +69,30 @@ def main():
           + ' '.join(f"{l['width']}x{l['height']}" for l in g['levels'])
           + f", vit tokens {g['vit_tokens']} (padded {g['padded_vit_tokens']})")
 
-    model = Model(device).load(args.weights)
-    print(f'model: {model.block_count} blocks loaded')
+    # ---- 模型加载(7.2):manifest 自动探测;--shape student 显式要求学生包。
+    from nr_package import is_student_package, load_student_package
+    student_mode = is_student_package(args.weights)
+    if args.shape == 'student' and not student_mode:
+        raise SystemExit(f'{args.weights} 不是学生模型包(缺 manifest model.kind=student)')
+    if student_mode:
+        model, manifest = load_student_package(args.weights, args.width, args.height, device)
+        print(f"model: {manifest['model']['version']}  ({manifest['model']['params']:,} params)")
+        boundaries = {}                                    # boundary 捕获是教师调试口径
+
+        def forward(feats):
+            with torch.no_grad():                           # nn.Module 参数会挂 autograd
+                return model(feats)
+    else:
+        tmodel = Model(device).load(args.weights)
+        print(f'model: teacher-nr-{tmodel.block_count}blk ({tmodel.block_count} blocks loaded)')
+        network = Network(tmodel, g)
+        boundaries = network.boundaries
+
+        def forward(feats):
+            return network.record(feats)
 
     features_np = bench_features(g)
     features = torch.from_numpy(features_np).to(nr_torch.DEVICE)
-    network = Network(model, g)
 
     def sync():
         if device.type == 'cuda':
@@ -80,25 +100,28 @@ def main():
 
     # The frame is a fixed sequence of launches, so capture it into a CUDA graph after warm-up: a replay
     # carries neither the Python per-call overhead nor the launch cost (unless --eager asks for both).
-    use_graph = device.type == 'cuda' and not args.eager
+    # 学生前向的窗注意力含掩码布尔索引(nonzero 同步),不可捕获,退回 eager。
+    use_graph = device.type == 'cuda' and not args.eager and not student_mode
+    if student_mode and device.type == 'cuda' and not args.eager:
+        print('note: 学生前向含掩码布尔索引,不支持 CUDA graph 捕获,退回 eager 计时')
     head = None
     if use_graph:
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
-            network.record(features)                       # warm-up: JITs, caches, the allocator
+            forward(features)                              # warm-up: JITs, caches, the allocator
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            head = network.record(features)
+            head = forward(features)
 
         def run():
             graph.replay()
             return head
     else:
         def run():
-            return network.record(features)
+            return forward(features)
 
     print('warm-up frame')
     sync()
@@ -134,10 +157,10 @@ def main():
         print(f'dumped features/head f32 to {args.dump}')
         bnd_dir = os.path.join(args.dump, 'bnd')
         os.makedirs(bnd_dir, exist_ok=True)
-        for name, tensor in network.boundaries.items():
+        for name, tensor in boundaries.items():
             values = tensor.half().cpu().numpy().astype('<f2')
             values.tofile(os.path.join(bnd_dir, f'{name}.f16bin'))
-        print(f'dumped {len(network.boundaries)} boundaries to {bnd_dir}')
+        print(f'dumped {len(boundaries)} boundaries to {bnd_dir}')
 
     ok = all_finite and nonfinite == 0
     print('RUN PASS' if ok else 'RUN FAIL')

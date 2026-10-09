@@ -23,13 +23,14 @@ import os
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
 import nr_torch
 from nr_geometry import geometry_from_valid
 from nr_history import reproject_history, store_history
 from nr_model import Model
 from nr_network import Network
+from nr_package import is_student_package, load_student_package
 
 
 def u32(x):
@@ -118,8 +119,11 @@ def build_features(proxy, g, seed, style, tone, structure, skin, auto_mask, hist
     return features
 
 
-def save_png(path, rgb01):
-    Image.fromarray((np.clip(rgb01, 0, 1) * 255.0 + 0.5).astype(np.uint8)).save(path)
+def save_png(path, rgb01, model=None):
+    info = PngImagePlugin.PngInfo()
+    if model:
+        info.add_text('Model', model)                       # 输出图注明模型版本(7.2)
+    Image.fromarray((np.clip(rgb01, 0, 1) * 255.0 + 0.5).astype(np.uint8)).save(path, pnginfo=info)
     print('  wrote', path)
 
 
@@ -129,6 +133,8 @@ def main():
     parser.add_argument('--width', type=int, default=512, help='valid width to resize to')
     parser.add_argument('--height', type=int, default=512, help='valid height to resize to')
     parser.add_argument('--weights', default=os.environ.get('NR_WEIGHTS'), help='model directory')
+    parser.add_argument('--shape', default='auto',
+                        help="'auto'(默认,按包内 manifest 自动探测教师/学生)/ 'student'(要求学生包)")
     parser.add_argument('-o', '--out', default='out', help='output directory')
     parser.add_argument('--seed', type=int, default=12345, help='noise seed (per frame)')
     parser.add_argument('--style', type=float, default=0.0, help='style id (lane 10 = style/128)')
@@ -183,9 +189,30 @@ def main():
                                  args.structure, args.skin, args.automask, history=repro)
     features = torch.from_numpy(features_np).to(nr_torch.DEVICE)
 
-    model = Model(nr_torch.DEVICE).load(args.weights)
-    network = Network(model, g)
-    head = network.record(features)
+    # ---- 模型加载(7.2):manifest 自动探测;--shape student 显式要求学生包(形状随包内嵌)。
+    student_mode = is_student_package(args.weights)
+    if args.shape == 'student' and not student_mode:
+        raise SystemExit(f'{args.weights} 不是学生模型包(缺 manifest model.kind=student)')
+    if student_mode:
+        model, manifest = load_student_package(args.weights, args.width, args.height,
+                                               nr_torch.DEVICE)
+        version = manifest['model']['version']
+        blend_scale = float(model.blend_scale.detach().cpu())
+
+        def forward(feats):
+            with torch.no_grad():                           # nn.Module 参数会挂 autograd
+                return model(feats)
+    else:
+        tmodel = Model(nr_torch.DEVICE).load(args.weights)
+        network = Network(tmodel, g)
+        version = f'teacher-nr-{tmodel.block_count}blk'
+        blend_scale = float(tmodel.blend_scale())
+
+        def forward(feats):
+            return network.record(feats)
+    print(f'model: {version}')
+
+    head = forward(features)
     torch.cuda.synchronize()
     head_np = head.float().cpu().numpy().reshape(g['full_height'], g['full_width'], 4)
     valid = head_np[:args.height, :args.width]                    # the valid rect, in field coordinates
@@ -195,7 +222,7 @@ def main():
     blend = sigmoid
     if repro is not None:
         # The temporal blend, and the weight is the network's own (clipped by the model's blend scale).
-        blend = np.clip(sigmoid * float(model.blend_scale()), 0, 1)
+        blend = np.clip(sigmoid * blend_scale, 0, 1)
         neural = neural + (repro.astype(np.float64) - neural) * blend[..., None]
 
     print(f'head rgb/4: min {rgb.min():+.3f}  max {rgb.max():+.3f}  mean {rgb.mean():+.3f}')
@@ -208,11 +235,11 @@ def main():
         print('  wrote', args.emit_history)
 
     os.makedirs(args.out, exist_ok=True)
-    save_png(os.path.join(args.out, 'proxy.png'), proxy)
-    save_png(os.path.join(args.out, 'neural.png'), neural)
-    save_png(os.path.join(args.out, 'blend.png'), np.repeat(blend[..., None], 3, axis=2))
+    save_png(os.path.join(args.out, 'proxy.png'), proxy, version)
+    save_png(os.path.join(args.out, 'neural.png'), neural, version)
+    save_png(os.path.join(args.out, 'blend.png'), np.repeat(blend[..., None], 3, axis=2), version)
     side = np.concatenate([proxy, neural, np.repeat(blend[..., None], 3, axis=2)], axis=1)
-    save_png(os.path.join(args.out, 'side_by_side.png'), side)
+    save_png(os.path.join(args.out, 'side_by_side.png'), side, version)
     return 0
 
 

@@ -189,3 +189,91 @@ for the cross-checks.
   half, so the encode/decode tables are only used at the publications.
 * `check_block0.cpp` includes the vendored `vendor/reference/reference.cpp` directly; build it with
   `-I shim` (the shim supplies `nr_model.h`).
+
+## The distilled student (fast-student-distillation)
+
+A small model distilled from the teacher's head contract: same 16-lane input (Box-Muller noise ×3, the
+centred proxy, the reprojected previous output, the conditioning lanes), same composite
+(`clamp(proxy + rgb/4)` + `clamp(sigmoid(logit) · blend_scale)`), **one deterministic feed-forward
+network — not a diffusion model**. Structure, acceptance numbers and the full rationale live in
+[`STUDENT.md`](STUDENT.md) and [`report_final.md`](report_final.md).
+
+### Student structure (shipped shape: `shapes/student_slim_mixed.json`)
+
+| level | channels | hidden | blocks (enc+dec) | kind | attention |
+| --- | --- | --- | --- | --- | --- |
+| full | 32 | 32 | 1+1 | FFN | none |
+| d0 | 32 | 32 | 3+3 | FFN | 8×8 window |
+| d1 | 64 | 64 | 3+3 | expert (E=2) | 8×8 window |
+| d2 | 128 | 64 | 2+2 | expert (E=2) | 8×8 window |
+| d3 | 192 | 64 | 2+2 | expert (E=2) | 8×8 window |
+| d4 | 192 | 64 (branch 32, middle 128) | 2+2 | split (6 branches) | 8×8 window |
+| ViT | 384 | FFN 768 | 2 | ViT (d5 tokens) | global |
+
+**4,286,790 parameters** (fp32 17.2 MB / f16 8.6 MB); **3.34 GMAC @320² / 9.32 GMAC @512²**.
+Alternate shapes in `shapes/`: `student_v0` (13.71 GMAC, the quality baseline), `student_slim_blocks`,
+`student_slim_deep`, `student_alt_depth`, `student_alt_attn4x4`.
+
+### Cost model / shape sweeps
+
+```sh
+python3 cost_model.py --shape ../shapes/student_slim_mixed.json --sizes 320,512,768,1080 [--json]
+python3 sweep_shapes.py          # shape scanning (see STUDENT.md §7 for the accounting)
+```
+
+### Training / evaluation / packaging
+
+```sh
+# distillation (online teacher; 60K steps ≈ 20h on a 3090)
+python3 train_distill.py --teacher-weights $NR_WEIGHTS \
+  --data ../data/raw/DIV2K_train_HR ../data/raw/DAVIS/JPEGImages/Full-Resolution ../data/train/proxy_proc \
+  --shape ../shapes/student_slim_mixed.json --size 320,512 --size-weights 0.7,0.3 \
+  --batch 4 --steps 60000 --warmup 4000 --pair-fraction 0.3 --loss-temporal 0.5 -o runs/v11
+
+# acceptance (6.1-6.3): quality vs teacher, temporal stability
+python3 eval_quality.py  --teacher-weights $NR_WEIGHTS --shape ../shapes/student_slim_mixed.json \
+  --sizes 320,512 --checkpoint runs/v11/ckpt.pt --images '...' -o eval_v11
+python3 eval_temporal.py --teacher-weights $NR_WEIGHTS --shape ../shapes/student_slim_mixed.json \
+  --seq '.../*.jpg' --checkpoint runs/v11/ckpt.pt --size 512 --max-frames 4 -o eval_v11_t
+#   --hist-src teacher = open-loop diagnostic (isolates the feedback loop)
+
+# figures (6.5) and the C++ CPU engine parity + bench (8.4/8.8; NR_INT8=1, NR_PROFILE=1)
+python3 quad_compare.py --image ... --size 512 --shape ../shapes/student_slim_mixed.json \
+  --checkpoint runs/v11/ckpt.pt --teacher-weights $NR_WEIGHTS -o samples
+python3 check_engine.py --image ... --size 512 --shape ../shapes/student_slim_mixed.json \
+  --checkpoint runs/v11/ckpt.pt --bench
+
+# package (7.1) + bit-exact round-trip check (7.3)
+python3 convert_weights.py --shape student runs/v11/ckpt.pt -o weights/student_mixed
+python3 check_package.py --package weights/student_mixed --checkpoint runs/v11/ckpt.pt
+
+# run a packaged student (7.2): the shape is auto-detected from the manifest
+# (the PNG outputs carry the model version in their tEXt metadata)
+python3 run_image.py samples/lake.png --width 512 --height 512 \
+  --weights weights/student_mixed --shape student -o out
+python3 run_nr.py --width 512 --height 512 --frames 5 --weights weights/student_mixed
+```
+
+The student package has the teacher's shape (`manifest.json` + `model/stages/s*.bin`, per-stage sha256
+and per-tensor stage offsets); the tensors are raw f32 and the shape DSL is embedded as `shape.json`, so
+loading needs no external files (`nr_package.load_student_package`).
+
+### Hardware requirements
+
+* **Training**: a CUDA GPU; 60K steps ≈ 20h on a 3090. Dataset: DIV2K + DAVIS frames + the preprocessed
+  proxy corpus (see `train_distill.py --help`).
+* **torch runtime** (evaluation / rendering): CUDA or CPU; needs torch, numpy, Pillow.
+* **CPU engine** (`../engine`): x86-64 AVX2 + OpenMP (CMake; MSVC `/O2 /arch:AVX2` supported). Eight
+  threads measured optimal on an i9-10850K (512² end-to-end 91.5 ms, 320² 28.4 ms, fp32). The int8 path
+  (`NR_INT8=1`, quality-identical) only pays on VNNI-class hardware — that is the 512²/30ms acceptance
+  target (task 8.7).
+
+### Provenance and licensing (发布声明)
+
+* **The student weights are distillation artifacts**: they are trained against this port's teacher
+  outputs and contain **no NVIDIA weights**. They may be redistributed on their own terms.
+* **The teacher weights and the DLL are NVIDIA proprietary and are not redistributed with this source.**
+  `weights/nr` (extracted from `nvngx_dlssnr.dll`) and the DLL itself stay under NVIDIA's terms; every
+  user extracts them from their own copy of the DLL (see "Real weights" above).
+* No NVIDIA weight data, no extracted stage files and no `nvngx_dlssnr.dll` may be committed to this
+  repository or attached to a release of the student.
