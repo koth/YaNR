@@ -127,3 +127,49 @@ def history_no_motion(prev):
     """恒等重投影的便捷入口(静态内容/无运动向量时)。"""
     h, w = prev.shape[:2]
     return reproject_history(prev, np.zeros((h, w, 2), np.float32))
+
+
+def block_match_flow(prev, cur, block=8, search=8):
+    """块匹配光流:cur 的每个 block 在 prev 里搜 SAD 最小偏移(像素单位,y 向下)。
+
+    返回 motion [h][w][2](像素)= 采样偏移,即 prev 坐标 = 当前 + motion(内部搜索出的
+    内容位移取反;2026-10-10 修:此前未取反,重投影方向全程反转,check_motion.py 钉死)。
+    喂 reproject_history 前要归一化成 UV(除以 w/h);warp_bilinear 直接吃像素。
+    暴力但向量化(逐搜索偏移整图算 SAD)。一鱼两吃:历史重投影 + warp error。
+    """
+    h, w = cur.shape[:2]
+    nb_y, nb_x = h // block, w // block
+    best = np.full((nb_y, nb_x), np.inf, np.float64)
+    mv = np.zeros((nb_y, nb_x, 2), np.float32)
+    gray_p = prev.mean(2) if prev.ndim == 3 else prev
+    gray_c = cur.mean(2) if cur.ndim == 3 else cur
+    for dy in range(-search, search + 1):
+        for dx in range(-search, search + 1):
+            ps = np.roll(np.roll(gray_p, dy, 0), dx, 1)
+            sad = np.abs(gray_c - ps)
+            # 按块聚合 SAD
+            b = sad[:nb_y * block, :nb_x * block].reshape(nb_y, block, nb_x, block).sum((1, 3))
+            better = b < best
+            best[better] = b[better]
+            mv[..., 0][better] = dx
+            mv[..., 1][better] = dy
+    motion = np.repeat(np.repeat(-mv, block, 0), block, 1)   # 取反:返回采样偏移,非内容位移
+    return motion[:h, :w]
+
+
+def warp_bilinear(img, motion):
+    """按 motion [h][w][2](采样偏移,像素,y 向下)双线性采样 img —— warp error 口径。"""
+    h, w = img.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    sx = xx + motion[..., 0]
+    sy = yy + motion[..., 1]
+    sx = np.clip(sx, 0, w - 1.001)
+    sy = np.clip(sy, 0, h - 1.001)
+    x0 = sx.astype(np.int32)
+    y0 = sy.astype(np.int32)
+    fx = (sx - x0)[..., None]
+    fy = (sy - y0)[..., None]
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    return (img[y0, x0] * (1 - fx) * (1 - fy) + img[y0, x1] * fx * (1 - fy)
+            + img[y1, x0] * (1 - fx) * fy + img[y1, x1] * fx * fy)

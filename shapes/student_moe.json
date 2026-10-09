@@ -1,0 +1,13 @@
+{
+  "name": "student_moe",
+  "comment": "MoE v2(2026-10-10):E=8 top-1 窗级(UNet)/Token 级(ViT)路由,整块专家化(FFN 与 qkv/proj 同专家)。逐像素计算量与 slim_mixed 相同,容量 ×8(4.3M -> ~30M 参数)。针对 slim_mixed 容量天花板(比 v0 差 2.5-3dB)的质量杠杆。",
+  "levels": [
+    {"level": "full", "kind": "moe", "channels": 32,  "hidden": 32, "blocks": 1, "attn": false, "experts": 8},
+    {"level": "d0",   "kind": "moe", "channels": 32,  "hidden": 32, "blocks": 3, "attn": true,  "experts": 8},
+    {"level": "d1",   "kind": "moe", "channels": 64,  "hidden": 64, "blocks": 3, "attn": true,  "experts": 8},
+    {"level": "d2",   "kind": "moe", "channels": 128, "hidden": 64, "blocks": 2, "attn": true,  "experts": 8},
+    {"level": "d3",   "kind": "moe", "channels": 192, "hidden": 64, "blocks": 2, "attn": true,  "experts": 8},
+    {"level": "d4",   "kind": "moe", "channels": 192, "hidden": 64, "blocks": 2, "attn": true,  "experts": 8}
+  ],
+  "vit": {"channels": 384, "ffn": 768, "blocks": 2, "tokens_level": "d5", "experts": 8}
+}

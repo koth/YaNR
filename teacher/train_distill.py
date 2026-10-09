@@ -19,7 +19,9 @@ import json
 import math
 import os
 import sys
+import threading
 import time
+from queue import Queue
 
 try:
     import comet_ml                                                        # noqa: F401  在 torch 前导入
@@ -35,8 +37,9 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from annotate import TeacherAnnotator                                # noqa: E402
+from degrade import degrade_frame, sample_params as degrade_params   # noqa: E402
 from nr_geometry import geometry_from_valid                          # noqa: E402
-from nr_history import reproject_history, store_history              # noqa: E402
+from nr_history import block_match_flow, reproject_history, store_history  # noqa: E402
 from nr_student import StudentNetwork, load_student_shape, student_alignment   # noqa: E402
 from run_image import build_features, save_png                       # noqa: E402
 
@@ -49,11 +52,18 @@ DEFAULTS = {
     'steps': 200000,
     'overfit': 0,
     'lr': 2e-4, 'wd': 0.01, 'warmup': 2000, 'ema': 0.999, 'clip': 1.0,
-    'loss_out': 1.0, 'loss_detail': 0.5, 'loss_feature': 0.5, 'loss_temporal': 0.0,
-    'pair_fraction': 0.3,        # 时序对采样比例(历史腿:上帧教师输出 -> truncate_half -> 重投影)
+    'loss_out': 1.0, 'loss_detail': 0.5, 'loss_feature': 0.5, 'loss_temporal': 1.0,
+    'pair_fraction': 0.5,        # 时序对采样比例(历史腿:上帧教师输出 -> truncate_half -> 重投影)
+    'crop_prob': 0.5,            # 随机原生裁剪(尺度抖动 1-2x);其余整图 resize
+    'degrade_prob': 0.5,         # 在线退化(degrade.py 链;proxy_proc 已预退化的跳过)
+    'moe_aux': 0.02,             # MoE 均衡正则(配额分配已结构保证均衡;此项仅防 p 漂移)
+    'moe_z': 1e-2,               # router z-loss(ST-MoE,压 logits 幅值;router 前 LN 后配合生效)
     'log_every': 100, 'vis_every': 2000, 'ckpt_every': 5000,
     'seed': 20261007,
-    'style_range': [0.0, 3.0], 'tone_range': [0.3, 0.7], 'structure_range': [0.2, 0.8],
+    'style_range': [0.0, 127.0], 'tone_range': [0.0, 1.0], 'structure_range': [0.0, 1.0],
+    # v1.2 条件全覆盖(2026-10-10):style 是 ID(lane = ID/128,真实量程 [0,1));
+    # v1.1 只采 [0,3] -> lane ≤0.023,导致高档失控(见 eval_conditions 探针)。
+    'automask_prob': 0.3,        # automask 开时 skin ~ U[0,1](lane 13/14 分支),关时 skin=-1
     'comet_project': 'dlss-student', 'comet_workspace': None, 'comet_key': None,
 }
 
@@ -105,16 +115,60 @@ class FrameSource:
         self.cfg = cfg
         self.overfit = overfit
         self.files = []
+        self.file_root = []
         for root in roots:
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames.sort()
                 for name in sorted(filenames):
                     if name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
                         self.files.append(os.path.join(dirpath, name))
+                        self.file_root.append(root)
         if overfit:
             self.files = self.files[:overfit]
+            self.file_root = self.file_root[:overfit]
         if not self.files:
             raise SystemExit(f'no images under {roots}')
+        # 序列分组(真实相邻帧对的原料):2..256 张图的目录 = 一个序列
+        # (DAVIS <seq>/、proxy_proc seq-*/ 算;DIV2K/Flickr2K 平铺 800+ 张的目录不算)。
+        by_dir = {}
+        for i, f in enumerate(self.files):
+            by_dir.setdefault(os.path.dirname(f), []).append(i)
+        self.seq_groups = [idxs for _, idxs in sorted(by_dir.items()) if 2 <= len(idxs) <= 256]
+        if not self.seq_groups:
+            print('warn: no sequence groups found; pair batches will sample single images')
+
+    def _draw_crop(self, rng, size, dims):
+        """按 crop_prob 抽一个原生裁剪框(尺度抖动 1-2x);返回 (x,y,side) 或 None=整图 resize。"""
+        w0, h0 = dims
+        if rng.random() < self.cfg.get('crop_prob', 0.0) and min(w0, h0) >= size:
+            side = min(int(size * float(rng.uniform(1.0, 2.0))), min(w0, h0))
+            return (int(rng.integers(0, w0 - side + 1)), int(rng.integers(0, h0 - side + 1)), side)
+        return None
+
+    def _load_frame(self, path, size, rng, crop_box='draw', deg=None):
+        """一帧 proxy:裁剪 + 在线退化(degrade.py 链)。
+
+        预退化语料(proxy_proc)跳过在线退化;
+        crop_box:'draw'=按 crop_prob 自抽;tuple=共用框(帧对);None=强制整图 resize;
+        deg 三态:False=不做退化;dict=用这组参数(帧对语义:逐序列抽参、逐帧抽噪声);
+        None=按 degrade_prob 自抽。
+        """
+        image = Image.open(path).convert('RGB')
+        if crop_box == 'draw':
+            crop_box = self._draw_crop(rng, size, image.size)
+        if crop_box is not None:
+            x, y, side = crop_box
+            image = image.crop((x, y, x + side, y + side))
+        proxy = np.asarray(image.resize((size, size), Image.LANCZOS), dtype=np.float32) / 255.0
+        predegraded = 'proxy_proc' in path
+        if not predegraded and 'degrade_prob' in self.cfg:
+            if deg is False:
+                pass
+            elif deg is not None:
+                proxy = degrade_frame(proxy, None, deg, rng)
+            elif rng.random() < self.cfg['degrade_prob']:
+                proxy = degrade_frame(proxy, None, degrade_params(rng, 'random'), rng)
+        return proxy, crop_box
 
     def sample(self, step):
         rng = np.random.default_rng([self.cfg['seed'], step])
@@ -128,27 +182,26 @@ class FrameSource:
             size = int(size_cfg[int(rng.choice(len(size_cfg), p=p))])
         else:
             size = int(size_cfg[int(rng.integers(len(size_cfg)))])
-        image = Image.open(self.files[idx]).convert('RGB')
-        proxy = np.asarray(image.resize((size, size), Image.LANCZOS),
-                           dtype=np.float32) / 255.0
+        proxy, _ = self._load_frame(self.files[idx], size, rng)
+        auto_mask = bool(rng.random() < self.cfg.get('automask_prob', 0.0))
         lane = {
             'style': float(rng.uniform(*self.cfg['style_range'])),
             'tone': float(rng.uniform(*self.cfg['tone_range'])),
             'structure': float(rng.uniform(*self.cfg['structure_range'])),
-            'skin': -1.0, 'auto_mask': False,
+            'skin': float(rng.uniform(0.0, 1.0)) if auto_mask else -1.0,
+            'auto_mask': auto_mask,
         }
         noise_seed = int(rng.integers(1 << 30))
         return proxy, noise_seed, lane, self.files[idx]
 
     def sample_pair(self, step):
-        """时序对(历史腿):同一源图两个合成视角 + 已知运动场(输出像素系)。
+        """时序对(历史腿):**真实相邻帧** + 块匹配运动(输出像素系 -> UV 归一化)。
 
-        构造:big = resize(size+2P);B(当前) = [P:P+size];A(上帧) = [P+d:P+d+size]
-        —— 即 A[y][x] == B[y+dy][x+dx],reproject 口径"prev 坐标 = current + motion"
-        对应 motion = (-dx, -dy)(归一化:uv 除以 size,同 nr_history 的单位)。
+        2026-10-10:flicker 修复 —— 合成视角对(同图两裁剪±平移)的统计迁不到真实视频,
+        改为序列里 t/t+1 真实帧对,同 eval_temporal 口径;两帧共用裁剪框与退化参数
+        (逐序列抽参,逐帧抽噪声),motion 由块匹配估计(归一化 UV,喂 reproject_history)。
         """
         rng = np.random.default_rng([self.cfg['seed'], step])
-        idx = step % len(self.files) if self.overfit else int(rng.integers(len(self.files)))
         size_cfg = self.size if isinstance(self.size, (list, tuple)) else [self.size]
         weights = self.cfg.get('size_weights')
         if weights:
@@ -156,24 +209,34 @@ class FrameSource:
             size = int(size_cfg[int(rng.choice(len(size_cfg), p=p))])
         else:
             size = int(size_cfg[int(rng.integers(len(size_cfg)))])
-        image = Image.open(self.files[idx]).convert('RGB')
-        pad = 8
-        big = np.asarray(image.resize((size + 2 * pad, size + 2 * pad), Image.LANCZOS),
-                         dtype=np.float32) / 255.0
-        dx = int(rng.integers(-6, 7))
-        dy = int(rng.integers(-6, 7))
-        cur = np.ascontiguousarray(big[pad:pad + size, pad:pad + size])
-        prev = np.ascontiguousarray(big[pad + dy:pad + dy + size, pad + dx:pad + dx + size])
-        motion = np.zeros((size, size, 2), np.float32)
-        motion[..., 0] = -dx / size
-        motion[..., 1] = -dy / size
+        if self.seq_groups:
+            group = self.seq_groups[int(rng.integers(len(self.seq_groups)))]
+            i = int(rng.integers(len(group) - 1))
+            path_prev, path_cur = self.files[group[i]], self.files[group[i + 1]]
+        else:                                                   # 退化兜底:无序列时单图自对
+            path_prev = path_cur = self.files[int(rng.integers(len(self.files)))]
+        crop_box = self._draw_crop(rng, size, Image.open(path_prev).size)   # 两帧共用
+        deg = False
+        if 'degrade_prob' in self.cfg and rng.random() < self.cfg['degrade_prob']:
+            deg = degrade_params(rng, 'random')                # 逐序列抽参,逐帧抽噪声
+        prev_p, _ = self._load_frame(path_prev, size, rng, crop_box=crop_box, deg=deg)
+        cur_p, _ = self._load_frame(path_cur, size, rng, crop_box=crop_box, deg=deg)
+        h, w = cur_p.shape[:2]
+        if path_prev == path_cur:
+            motion = np.zeros((h, w, 2), np.float32)            # 静态兜底
+        else:
+            motion = block_match_flow(prev_p, cur_p).astype(np.float32)
+            motion[..., 0] /= w                                  # 像素 -> UV(nr_history 口径)
+            motion[..., 1] /= h
+        auto_mask = bool(rng.random() < self.cfg.get('automask_prob', 0.0))
         lane = {
             'style': float(rng.uniform(*self.cfg['style_range'])),
             'tone': float(rng.uniform(*self.cfg['tone_range'])),
             'structure': float(rng.uniform(*self.cfg['structure_range'])),
-            'skin': -1.0, 'auto_mask': False,
+            'skin': float(rng.uniform(0.0, 1.0)) if auto_mask else -1.0,
+            'auto_mask': auto_mask,
         }
-        return prev, cur, motion, lane, self.files[idx]
+        return prev_p, cur_p, motion, lane, path_cur
 
 
 # ---------------------------------------------------------------- losses
@@ -277,6 +340,24 @@ def lr_at(step, cfg):
     span = max(1, cfg['steps'] - cfg['warmup'])
     t = (step - cfg['warmup']) / span
     return cfg['lr'] * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+
+
+def moe_route_metrics(model):
+    """路由健康度(逐块聚合):util_worst = 最偏块的最大专家占比(1.0=整块塌缩)、
+    util_max = 各块最大占比均值、dead_frac = 死专家(<1% 利用)占比、entropy = 平均
+    归一化利用熵(1=均匀)。取的是当前 moe_stats(主前向、时序二次前向之前)。"""
+    stats = [s for m in model.modules() if hasattr(m, 'moe_stats') for s in m.moe_stats]
+    if not stats:
+        return None
+    umax, dead, ent = [], [], []
+    for assign, probs, _logits in stats:
+        e_count = probs.shape[-1]
+        f = torch.bincount(assign, minlength=e_count).float() / assign.numel()
+        umax.append(float(f.max()))
+        dead.append(float((f < 0.01).float().mean()))
+        ent.append(float(-(f * (f + 1e-9).log()).sum() / math.log(e_count)))
+    return {'util_max': sum(umax) / len(umax), 'util_worst': max(umax),
+            'dead_frac': sum(dead) / len(dead), 'entropy': sum(ent) / len(ent)}
 
 
 def psnr(a, b):
@@ -403,29 +484,60 @@ def main():
     print(f"train: {len(source.files)} files, {sizes}², {cfg['batch']} batch, "
           f"{cfg['steps']} steps, device {device}")
     model.train()
+    def prep_item(step, bi):
+        """纯 CPU 数据准备(预取线程):采样/裁剪/退化/块匹配/特征构造。
+
+        逐 (step,bi) 独立种子,与执行顺序无关 -> 结果确定;不碰模型/教师状态(零竞态)。
+        帧对的 feats_b 依赖教师上帧输出,留在主循环。
+        """
+        item_pair = (cfg['pair_fraction'] > 0 and
+                     np.random.default_rng([cfg['seed'], step, 7]).random() < cfg['pair_fraction'])
+        if item_pair:
+            prev_p, cur_p, motion, lane, _ = source.sample_pair(step * cfg['batch'] + bi)
+            seed_a = int(np.random.default_rng([cfg['seed'], step, bi, 1]).integers(1 << 30))
+            noise_seed = int(np.random.default_rng([cfg['seed'], step, bi, 2]).integers(1 << 30))
+            g_s = geometry_from_valid(cur_p.shape[0], cur_p.shape[1])
+            feats_a = build_features(prev_p, g_s, seed_a, lane['style'], lane['tone'],
+                                     lane['structure'], lane['skin'], lane['auto_mask'])
+            return ('pair', prev_p, cur_p, motion, lane, seed_a, noise_seed, feats_a)
+        proxy, noise_seed, lane, _ = source.sample(step * cfg['batch'] + bi)
+        g_s = geometry_from_valid(proxy.shape[0], proxy.shape[1])
+        features_np = build_features(proxy, g_s, noise_seed, lane['style'], lane['tone'],
+                                     lane['structure'], lane['skin'], lane['auto_mask'])
+        return ('single', proxy, None, None, lane, None, noise_seed, features_np)
+
+    prep_q = Queue(maxsize=3)
+
+    def _prep_worker():
+        try:
+            for step_w in range(start, cfg['steps']):
+                for bi_w in range(cfg['batch']):
+                    prep_q.put(prep_item(step_w, bi_w))
+        except Exception as exc:                                # noqa: BLE001
+            print(f'prep worker died: {exc!r}')
+    threading.Thread(target=_prep_worker, daemon=True).start()
+
     for step in range(start, cfg['steps']):
         lr = lr_at(step, cfg)
         for group in optim.param_groups:
             group['lr'] = lr
         t0 = time.perf_counter()
         totals = {'out': 0.0, 'detail': 0.0, 'feature': 0.0, 'temporal': 0.0}
+        moe_tot = {}
         feat_detail = {}
         psnrs = []
         optim.zero_grad()
         pair_mode = (cfg['pair_fraction'] > 0 and
                      np.random.default_rng([cfg['seed'], step, 7]).random() < cfg['pair_fraction'])
         for bi in range(cfg['batch']):
-            if pair_mode:
+            item = prep_q.get()                                 # 预取线程已备好纯 CPU 部分
+            if item[0] == 'pair':
                 # 历史腿:上帧教师输出(teacher-forcing)-> truncate_half 存史 ->
                 # 已知运动重投影 -> 当前帧带真实历史 lanes(与部署管线同口径)。
-                prev_p, cur_p, motion, lane, _ = source.sample_pair(step * cfg['batch'] + bi)
-                seed_a = int(np.random.default_rng([cfg['seed'], step, bi, 1]).integers(1 << 30))
-                noise_seed = int(np.random.default_rng([cfg['seed'], step, bi, 2]).integers(1 << 30))
+                _, prev_p, cur_p, motion, lane, seed_a, noise_seed, feats_a = item
                 s = cur_p.shape[0]
                 g_s, teacher_s = geo_for(s)
                 model.g = g_s
-                feats_a = build_features(prev_p, g_s, seed_a, lane['style'], lane['tone'],
-                                         lane['structure'], lane['skin'], lane['auto_mask'])
                 with torch.no_grad():
                     t_res_a = teacher_s.annotate(feats_a)
                     t_head_a = torch.from_numpy(t_res_a['head']).view(
@@ -439,13 +551,11 @@ def main():
                                              lane['structure'], lane['skin'], lane['auto_mask'],
                                              history=repro_np)
             else:
-                proxy, noise_seed, lane, _ = source.sample(step * cfg['batch'] + bi)
+                _, proxy, _, _, lane, _, noise_seed, features_np = item
                 repro_np = None
                 s = proxy.shape[0]
                 g_s, teacher_s = geo_for(s)
                 model.g = g_s                              # 学生算子与分辨率无关,换几何即换边长
-                features_np = build_features(proxy, g_s, noise_seed, lane['style'], lane['tone'],
-                                             lane['structure'], lane['skin'], lane['auto_mask'])
             with torch.no_grad():
                 t_res = teacher_s.annotate(features_np, capture=teacher_caps)
             # head 是场分辨率(如 512² -> 场 576x512),裁到有效区再进损失。
@@ -459,11 +569,24 @@ def main():
             s_head = s_head.view(g_s['full_height'], g_s['full_width'], 4)[:s, :s].float()
             out, s_neural, t_neural = output_losses(
                 s_head, t_head, proxy_t, repro=repro_t,
-                s_scale=float(model.blend_scale.detach()), t_scale=teacher_s.blend_scale)
+                s_scale=model.blend_scale, t_scale=teacher_s.blend_scale)
+            # ^ s_scale 传张量而非 float:blend_scale 是 nn.Parameter,曾被 float(detach())
+            #   断梯度永远停在 1.0(教师实测 0.7397,历史混合量差 35%)。2026-10-10 修。
             detail = laplacian_l1(s_neural, t_neural) + sobel_l1(s_neural, t_neural)
             feat, feat_detail = feature_losses(model.captures, t_res, aligner, feature_weights)
             loss = (cfg['loss_out'] * out + cfg['loss_detail'] * detail
                     + cfg['loss_feature'] * feat)
+            moe_aux = model.moe_aux_loss()                      # 在时序二次前向清统计前取
+            aux_val = float(moe_aux.detach())
+            if moe_aux.requires_grad:
+                z = model.moe_z_loss()
+                loss = loss + cfg.get('moe_aux', 0.1) * moe_aux
+                loss = loss + cfg.get('moe_z', 1e-3) * z
+                route = moe_route_metrics(model)                # 坍缩指标(Comet 上报)
+                route['aux'] = aux_val
+                route['z'] = float(z.detach())
+                for k, v in route.items():
+                    moe_tot[k] = moe_tot.get(k, 0.0) + v
             temporal = None
             if pair_mode and cfg['loss_temporal'] > 0:
                 # 时序损失(真接上):帧差残差匹配 L1((s_B - s_A) - (t_B - t_A)) ——
@@ -498,7 +621,7 @@ def main():
 
         if experiment is not None:
             n = max(1, len(psnrs))
-            experiment.log_metrics({
+            metrics = {
                 'loss/total': (totals['out'] + totals['detail'] + totals['feature']) / n,
                 'loss/out': totals['out'] / n,
                 'loss/detail': totals['detail'] / n,
@@ -506,7 +629,11 @@ def main():
                 'psnr/teacher': sum(psnrs) / n,
                 'train/lr': lr,
                 'train/ms': ms,
-            }, step=step)
+            }
+            if moe_tot:                                         # MoE 路由健康度(坍缩监控)
+                nb = max(1, len(psnrs))
+                metrics.update({f'moe/{k}': v / nb for k, v in moe_tot.items()})
+            experiment.log_metrics(metrics, step=step)
             if feat_detail:
                 experiment.log_metrics({f'feat/{k}': v for k, v in feat_detail.items()}, step=step)
 
@@ -523,7 +650,10 @@ def main():
             print(f"step {step:6d}  lr {lr:.2e}  out {totals['out'] / n:.5f}  "
                   f"detail {totals['detail'] / n:.5f}  feat {totals['feature'] / n:.5f}  "
                   f"temp {totals['temporal'] / n:.5f}  "
-                  f"psnr(t) {sum(psnrs) / len(psnrs):.2f}  {ms:.0f} ms")
+                  f"psnr(t) {sum(psnrs) / len(psnrs):.2f}"
+                  + (f"  moe_aux {aux_val:.3f} umax {moe_tot.get('util_worst', 0.0) / max(1, len(psnrs)):.2f}"
+                     if aux_val > 0 else "")
+                  + f"  {ms:.0f} ms")
 
         if cfg['vis_every'] and step % cfg['vis_every'] == 0 and step > 0:
             vis = os.path.join(args.out, f'vis-{step:06d}')

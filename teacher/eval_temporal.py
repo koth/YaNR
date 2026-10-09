@@ -28,54 +28,12 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nr_torch                                          # noqa: E402
 from nr_geometry import geometry_from_valid              # noqa: E402
-from nr_history import reproject_history, store_history  # noqa: E402
+from nr_history import (block_match_flow, reproject_history,  # noqa: E402
+                        store_history, warp_bilinear)
 from nr_model import Model                               # noqa: E402
 from nr_network import Network                           # noqa: E402
 from nr_student import StudentNetwork, load_student_shape  # noqa: E402
 from run_image import build_features                     # noqa: E402
-
-
-def block_match_flow(prev, cur, block=8, search=8):
-    """块匹配光流:cur 的每个 block 在 prev 里搜 SAD 最小偏移(uv,y 向下,像素单位)。
-
-    返回 motion [h][w][2]。暴力但向量化(逐搜索偏移整图算 SAD)。
-    """
-    h, w = cur.shape[:2]
-    nb_y, nb_x = h // block, w // block
-    best = np.full((nb_y, nb_x), np.inf, np.float64)
-    mv = np.zeros((nb_y, nb_x, 2), np.float32)
-    gray_p = prev.mean(2) if prev.ndim == 3 else prev
-    gray_c = cur.mean(2) if cur.ndim == 3 else cur
-    for dy in range(-search, search + 1):
-        for dx in range(-search, search + 1):
-            ps = np.roll(np.roll(gray_p, dy, 0), dx, 1)
-            sad = np.abs(gray_c - ps)
-            # 按块聚合 SAD
-            b = sad[:nb_y * block, :nb_x * block].reshape(nb_y, block, nb_x, block).sum((1, 3))
-            better = b < best
-            best[better] = b[better]
-            mv[..., 0][better] = dx
-            mv[..., 1][better] = dy
-    motion = np.repeat(np.repeat(mv, block, 0), block, 1)
-    return motion[:h, :w]
-
-
-def warp_bilinear(img, motion):
-    """按 motion [h][w][2](prev 坐标 = 当前 + motion)双线性采样 prev。"""
-    h, w = img.shape[:2]
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    sx = xx + motion[..., 0]
-    sy = yy + motion[..., 1]
-    sx = np.clip(sx, 0, w - 1.001)
-    sy = np.clip(sy, 0, h - 1.001)
-    x0 = sx.astype(np.int32)
-    y0 = sy.astype(np.int32)
-    fx = (sx - x0)[..., None]
-    fy = (sy - y0)[..., None]
-    x1 = np.minimum(x0 + 1, w - 1)
-    y1 = np.minimum(y0 + 1, h - 1)
-    return (img[y0, x0] * (1 - fx) * (1 - fy) + img[y0, x1] * fx * (1 - fy)
-            + img[y1, x0] * (1 - fx) * fy + img[y1, x1] * fx * fy)
 
 
 def composite(head_np, proxy, h, w, repro, blend_scale):
@@ -106,7 +64,10 @@ def run_sequence(paths, size, seed, network, student, tmodel, g, shape, vary_see
         result = {}
         for tag in ('t', 's'):
             htag = 't' if (tag == 's' and hist_src == 'teacher') else tag
-            repro = (reproject_history(hist[htag], motion)
+            # 块匹配返回像素单位,reproject_history 吃 UV(÷w/h)——两者不能混!
+            # (2026-10-10 修:此前像素运动被当 UV 喂给重投影,历史 lanes 全程错位。)
+            repro = (reproject_history(hist[htag], motion / np.array([proxy.shape[1],
+                                                                      proxy.shape[0]], np.float32))
                      if hist[htag] is not None and motion is not None else None)
             feats = build_features(proxy, g, fs, 1.5, 0.5, 0.35, -1.0, False, history=repro)
             f = torch.from_numpy(feats).to(nr_torch.DEVICE)

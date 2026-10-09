@@ -59,8 +59,11 @@ def load_student_shape(path):
     for level in spec['levels']:
         if level['channels'] % 32 or level['hidden'] % 32:
             raise ValueError(f"{level['level']}: channels/hidden must be multiples of 32")
-        if level['kind'] not in ('ffn', 'expert', 'split'):
+        if level['kind'] not in ('ffn', 'expert', 'split', 'moe'):
             raise ValueError(f"{level['level']}: unknown kind {level['kind']!r}")
+        if level['kind'] == 'moe':
+            if level.get('experts', 0) < 2:
+                raise ValueError(f"{level['level']}: moe needs experts >= 2")
         if level['kind'] == 'split':
             for key in ('branches', 'branch_channels', 'middle_channels'):
                 if key not in level:
@@ -346,6 +349,192 @@ class PostBlend(nn.Module):
         return merged.reshape(-1, merged.shape[-1])
 
 
+# ---------------------------------------------------------------- MoE(2026-10-10)
+# top-1 硬路由、窗级(UNet)/Token 级(ViT)分组,整块专家化(FFN expand/narrow 与注意力
+# qkv/proj 同一专家);计算量 = 单专家 = 与 dense 块逐像素相同,参数 ×E(容量杠杆)。
+# Switch 式门控:softmax 概率乘 FFN 输出,给路由器留梯度;负载均衡走辅助损失
+# (StudentNetwork.moe_aux_loss)。窗序布局不变 —— 引擎侧按窗分组 grouped GEMM 即可。
+
+def _moe_linear(x, weight, assign, gates=None):
+    """x [rows, in] · weight [E, in, out] 按 assign 分组;gates [rows] 乘输出。
+
+    dtype 语义对齐 nn.Linear(autocast 下 matmul 出 bf16):按 matmul 输出 dtype
+    懒分配,门控乘法升型后回目标 dtype。
+    """
+    out = None
+    for e in range(weight.shape[0]):
+        m = assign == e
+        if bool(m.any()):
+            y = x[m] @ weight[e]
+            if out is None:
+                out = x.new_zeros(x.shape[0], weight.shape[2], dtype=y.dtype)
+            if gates is not None:
+                y = y * gates[m].unsqueeze(1)
+            out[m] = y.to(out.dtype)
+    return out if out is not None else x.new_zeros(x.shape[0], weight.shape[2])
+
+
+def _balanced_pick(scores):
+    """配额平衡 top-1(塌缩的结构解):每专家名额 quota=⌈W/E⌉,均衡由构造保证。
+
+    初始 argmax 后,超载专家把"margin 最弱"的窗让给"该窗分数最高"的欠载专家;
+    W<E 的深块天然只用 ⌈W/E⌉ 个专家(结构,非塌缩)。确定性(stable 排序)。
+    2026-10-10:Switch aux 在小 logits 区间失明(p≈均匀 ⇒ aux≡1 ⇒ 零梯度),
+    用它防塌缩在数学上就不成立 —— 改为结构保证,专业化由分数驱动(梯度走门控)。
+    """
+    w_count, e_count = scores.shape
+    quota = -(-w_count // e_count)
+    pick = scores.argmax(-1)
+    count = torch.bincount(pick, minlength=e_count)
+    over = torch.nonzero(count > quota).flatten()
+    if over.numel() == 0:
+        return pick
+    alt = scores.scatter(1, pick[:, None], float('-inf'))
+    best_alt = alt.argmax(-1)
+    margin = (scores.gather(1, pick[:, None])
+              - scores.gather(1, best_alt[:, None])).squeeze(1)
+    victims = []
+    for e in over.tolist():
+        mine = torch.nonzero(pick == e).flatten()
+        k = int(count[e] - quota)
+        weak = mine[torch.argsort(margin[mine], stable=True)[:k]]
+        victims.append(weak)
+    victims = torch.cat(victims)
+    under = count < quota
+    under_list = torch.nonzero(under).flatten()
+    seats = torch.repeat_interleave(under_list, (quota - count[under_list]).clamp_min(0))
+    # 受害者 = margin 最弱的窗(对去处最不敏感),按座位表精确填充 -> 均衡严格保证
+    order = victims[torch.argsort(margin[victims], stable=True)]
+    n = min(order.numel(), seats.numel())
+    pick[order[:n]] = seats[:n]
+    return pick
+
+
+def _window_route(state, width, height, router):
+    """8x8 窗均值池化 -> router -> top-1;展开 rows 级 assign/gates。
+
+    深层尺寸只保证 4 对齐(20x20、12x12…),末窗不满:越界槽屏蔽、按有效槽求均值
+    (分组与 WindowAttention 的窗网格一致,但路由用不移位网格即可)。
+    训练期 logit 加抖动(±0.1)防赢家通吃塌缩;eval 确定性不受影响。
+    """
+    ch = state.shape[-1]
+    win = 8
+    nw = (width + win - 1) // win
+    nh = (height + win - 1) // win
+    device = state.device
+    ys = torch.arange(nh * win, device=device)
+    xs = torch.arange(nw * win, device=device)
+    vmask = ((ys < height).view(-1, 1) & (xs < width).view(1, -1)).view(nh, win, nw, win)
+    idx = (ys.clamp(0, height - 1).view(-1, 1) * width
+           + xs.clamp(0, width - 1).view(1, -1)).reshape(-1)
+    gathered = state[idx].view(nh, win, nw, win, ch)
+    count = vmask.sum((1, 3)).clamp_min(1).to(state.dtype).unsqueeze(-1)   # [nh, nw, 1]
+    pooled = (gathered * vmask.unsqueeze(-1)).sum((1, 3)) / count          # [nh, nw, ch]
+    logits = router(pooled.reshape(-1, ch))              # [nwin, E]
+    if router.training:
+        logits = logits + torch.rand_like(logits) * 0.2 - 0.1
+    probs = torch.softmax(logits, dim=-1)
+    pick = _balanced_pick(logits)                          # 配额平衡 top-1(结构防塌缩)
+    g = probs.gather(1, pick[:, None]).squeeze(1)        # 门控标量(×E 归一:均匀时=1)
+    win_id = ((torch.arange(height, device=device) // win).view(-1, 1) * nw
+              + (torch.arange(width, device=device) // win).view(1, -1)).reshape(-1)
+    return pick[win_id], g[win_id], probs, logits
+
+
+class MoEBlock(nn.Module):
+    """top-1 窗路由专家块:FFN(expand->SiLU->narrow,门控)+ 窗注意力(qkv/proj 同专家)。
+
+    外契约与 FFNBlock 一致:残差 + aux、注意力尾同 _AttentionTail 的数值路径。
+    """
+
+    def __init__(self, channels, hidden, experts=8, attn=True, window=WINDOW, phase_index=0):
+        super().__init__()
+        self.experts = experts
+        self.channels = channels
+        # router 前置 LayerNorm:logits 幅值有界,防 softmax 饱和(z 失控的根因之一)。
+        self.router = nn.Sequential(nn.LayerNorm(channels), nn.Linear(channels, experts, bias=False))
+        self.expand = nn.Parameter(torch.empty(experts, channels, hidden))
+        self.narrow = nn.Parameter(torch.empty(experts, hidden, channels))
+        nn.init.kaiming_uniform_(self.expand, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.narrow, a=math.sqrt(5))
+        self.aux_ffn = nn.Parameter(torch.ones(channels))
+        self.moe_stats = []
+        self.attn = attn
+        if attn:
+            self.qkv = nn.Parameter(torch.empty(experts, channels, channels * 3))
+            self.proj = nn.Parameter(torch.empty(experts, channels, channels))
+            nn.init.kaiming_uniform_(self.qkv, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.proj, a=math.sqrt(5))
+            self.attention = WindowAttention(channels, window, window_phase(phase_index))
+            self.aux_attn = nn.Parameter(torch.ones(channels))
+
+    def forward(self, state, width, height):
+        assign, gates, probs, logits = _window_route(state, width, height, self.router)
+        gates = gates * self.experts                        # 归一化门控:均匀路由时 = 1(dense 语义)
+        self.moe_stats.append((assign.detach(), probs, logits))
+        ffn = None
+        for e in range(self.experts):
+            m = assign == e
+            if bool(m.any()):
+                y = F.silu(state[m] @ self.expand[e]) @ self.narrow[e]
+                if ffn is None:
+                    ffn = state.new_zeros(state.shape[0], self.channels, dtype=y.dtype)
+                ffn[m] = (y * gates[m].unsqueeze(1)).to(ffn.dtype)
+        if ffn is None:
+            ffn = state.new_zeros(state.shape[0], self.channels)
+        out = ffn + state * self.aux_ffn
+        if self.attn:
+            qkv = _moe_linear(out, self.qkv, assign)
+            attended = self.attention(qkv, width, height)
+            out = out + _moe_linear(attended, self.proj, assign) * self.aux_attn
+        return out
+
+
+class MoEVitBlock(nn.Module):
+    """Token 级 top-1 专家 ViT 块(外契约同 VitBlock:FFN 残差 -> 全 token 注意力残差)。"""
+
+    def __init__(self, channels, ffn_channels, experts=8):
+        super().__init__()
+        self.experts = experts
+        self.channels = channels
+        self.router = nn.Sequential(nn.LayerNorm(channels), nn.Linear(channels, experts, bias=False))
+        self.expand = nn.Parameter(torch.empty(experts, channels, ffn_channels))
+        self.contract = nn.Parameter(torch.empty(experts, ffn_channels, channels))
+        nn.init.kaiming_uniform_(self.expand, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.contract, a=math.sqrt(5))
+        self.aux_ffn = nn.Parameter(torch.ones(channels))
+        self.qkv = nn.Parameter(torch.empty(experts, channels, channels * 3))
+        self.proj = nn.Parameter(torch.empty(experts, channels, channels))
+        nn.init.kaiming_uniform_(self.qkv, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.proj, a=math.sqrt(5))
+        self.attention = VitAttention(channels)
+        self.aux_attn = nn.Parameter(torch.ones(channels))
+        self.moe_stats = []
+
+    def forward(self, state, tokens, padded):
+        logits = self.router(state)                              # [rows, E] token 级
+        if self.router.training:
+            logits = logits + torch.rand_like(logits) * 0.2 - 0.1
+        probs = torch.softmax(logits, dim=-1)
+        pick = _balanced_pick(logits)                              # 配额平衡 top-1
+        gates = probs.gather(1, pick[:, None]).squeeze(1) * self.experts   # 归一化门控
+        self.moe_stats.append((pick.detach(), probs, logits))
+        ffn = None
+        for e in range(self.experts):
+            m = pick == e
+            if bool(m.any()):
+                y = F.silu(state[m] @ self.expand[e]) @ self.contract[e]
+                if ffn is None:
+                    ffn = state.new_zeros(state.shape[0], self.channels, dtype=y.dtype)
+                ffn[m] = (y * gates[m].unsqueeze(1)).to(ffn.dtype)
+        if ffn is None:
+            ffn = state.new_zeros(state.shape[0], self.channels)
+        out = ffn + state * self.aux_ffn
+        qkv = _moe_linear(out, self.qkv, pick)
+        attended = self.attention(qkv, tokens, padded)
+        return out + _moe_linear(attended, self.proj, pick) * self.aux_attn
+
+
 def make_block(level, phase_index):
     """按形状条目构造块(2.3-2.6);相位索引即教师的每级计数器值。"""
     kind = level['kind']
@@ -356,6 +545,9 @@ def make_block(level, phase_index):
         return FFNBlock(ch, level['hidden'], attn=attn, window=window, phase_index=phase_index)
     if kind == 'expert':
         return ExpertBlock(ch, level['hidden'], attn=attn, window=window, phase_index=phase_index)
+    if kind == 'moe':
+        return MoEBlock(ch, level['hidden'], experts=level['experts'], attn=attn,
+                        window=window, phase_index=phase_index)
     return SplitBlock(ch, level['branches'], level['branch_channels'],
                       level['middle_channels'], attn=attn, window=window,
                       phase_index=phase_index)
@@ -410,8 +602,10 @@ class StudentNetwork(nn.Module):
         vit_ch = shape['vit']['channels']
         self.vit_in = nn.Linear(self.channels['d4'], vit_ch)
         self.vit_out = nn.Linear(vit_ch, self.channels['d4'])
+        vit_experts = int(shape['vit'].get('experts', 0))
         self.vit_blocks = nn.ModuleList(
-            VitBlock(vit_ch, shape['vit']['ffn']) for _ in range(shape['vit']['blocks']))
+            (MoEVitBlock(vit_ch, shape['vit']['ffn'], experts=vit_experts) if vit_experts >= 2
+             else VitBlock(vit_ch, shape['vit']['ffn'])) for _ in range(shape['vit']['blocks']))
         self.post = PostBlend(self.channels['full'])
 
         self.captures = {}
@@ -421,7 +615,32 @@ class StudentNetwork(nn.Module):
         if self.capture_enabled:
             self.captures[name] = tensor
 
+    def moe_aux_loss(self):
+        """Switch 负载均衡辅助损失:E * Σ_e f_e * mean(p_e)(f 常数、p 可导);无 MoE 块=0。"""
+        stats = [s for m in self.modules() if hasattr(m, 'moe_stats') for s in m.moe_stats]
+        if not stats:
+            return torch.zeros((), device=self.blend_scale.device)
+        total = self.blend_scale.new_zeros(())
+        for assign, probs, _logits in stats:
+            e_count = probs.shape[-1]
+            f = torch.bincount(assign, minlength=e_count).to(probs.dtype) / assign.numel()
+            total = total + e_count * (f * probs.mean(0)).sum()
+        return total / len(stats)
+
+    def moe_z_loss(self):
+        """router z-loss(ST-MoE):mean(logits²),压 logits 幅值防 softmax 饱和。"""
+        stats = [s for m in self.modules() if hasattr(m, 'moe_stats') for s in m.moe_stats]
+        if not stats:
+            return torch.zeros((), device=self.blend_scale.device)
+        total = self.blend_scale.new_zeros(())
+        for _assign, _probs, logits in stats:
+            total = total + (logits ** 2).mean()
+        return total / len(stats)
+
     def forward(self, features):
+        for m in self.modules():
+            if hasattr(m, 'moe_stats'):
+                m.moe_stats.clear()
         g = self.g
         full_w, full_h = g['full_width'], g['full_height']
         order = ('full', 'd0', 'd1', 'd2', 'd3', 'd4')
