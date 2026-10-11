@@ -235,8 +235,8 @@ python3 sweep_shapes.py          # shape scanning (see STUDENT.md §7 for the ac
 python3 train_distill.py --teacher-weights $NR_WEIGHTS \
   --data <DIV2K> <DAVIS Full-Resolution> <proxy_proc> <Flickr2K> <GameIR-SR> <screenshots> <UHD> \
   --shape ../shapes/student_moe_v0.json --size 320,512 --size-weights 0.7,0.3 \
-  --batch 4 --steps 60000 --warmup 4000 --pair-fraction 0.5 --loss-temporal 1.0 \
-  --moe-aux 0.02 --moe-z 0.01 -o runs/run_final
+  --batch 8 --steps 60000 --warmup 4000 --pair-fraction 0.5 --loss-temporal 1.0 \
+  -o runs/run_final
 
 # acceptance (6.1-6.3): condition-knob fidelity vs teacher, quality, temporal stability
 python3 eval_conditions.py --images <5 images> --shape ../shapes/student_moe_v0.json \
