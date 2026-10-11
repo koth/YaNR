@@ -51,6 +51,7 @@ DEFAULTS = {
     'teacher_weights': os.environ.get('NR_WEIGHTS'),
     'size': 320, 'size_weights': None,
     'batch': 4,
+    'batch_rows': 4 * 512 * 512,  # 真 batch 前向的行数预算(≈ 4×512²;逐样本激活显存的上限)
     'steps': 200000,
     'overfit': 0,
     'lr': 2e-4, 'wd': 0.01, 'warmup': 2000, 'ema': 0.999, 'clip': 1.0,
@@ -96,7 +97,7 @@ def load_config(args):
             cfg.update(json.load(fh))
     for key in ('shape', 'teacher_weights', 'batch', 'steps', 'overfit', 'lr', 'wd',
                 'warmup', 'ema', 'clip', 'loss_out', 'loss_detail', 'loss_feature',
-                'loss_temporal', 'pair_fraction', 'seed',
+                'loss_temporal', 'pair_fraction', 'seed', 'batch_rows',
                 'lr_hold', 'lr_decay', 'lr_floor', 'loss_logit',
                 'action_floor', 'action_knee'):
         value = getattr(args, key, None)
@@ -416,6 +417,8 @@ def main():
     parser.add_argument('--size-weights', dest='size_weights', type=str,
                         help='per-size sampling weights, e.g. "0.7,0.3" for 7:3 mix')
     parser.add_argument('--batch', type=int)
+    parser.add_argument('--batch-rows', dest='batch_rows', type=int,
+                        help='真 batch 前向行数预算(默认 4×512²;显存紧可调小)')
     parser.add_argument('--steps', type=int)
     parser.add_argument('--overfit', type=int)
     parser.add_argument('--lr', type=float)
@@ -584,11 +587,11 @@ def main():
         t0 = time.perf_counter()
         totals = {'out': 0.0, 'detail': 0.0, 'feature': 0.0, 'temporal': 0.0}
         moe_tot = {}
-        feat_detail = {}
+        feat_detail_acc = {}
         psnrs = []
         optim.zero_grad()
-        pair_mode = (cfg['pair_fraction'] > 0 and
-                     np.random.default_rng([cfg['seed'], step, 7]).random() < cfg['pair_fraction'])
+        # ---- 批内逐样本准备(pair 的历史腿依赖教师上帧输出,仍逐样本走)。
+        prepared = []
         for bi in range(cfg['batch']):
             item = prep_futs.popleft().result()                 # 批内并行准备,按序取回
             _prep_submit()
@@ -598,7 +601,6 @@ def main():
                 _, prev_p, cur_p, motion, lane, seed_a, noise_seed, feats_a = item
                 s = cur_p.shape[0]
                 g_s, teacher_s = geo_for(s)
-                model.g = g_s
                 with torch.no_grad():
                     t_res_a = teacher_s.annotate(feats_a)
                     t_head_a = torch.from_numpy(t_res_a['head']).view(
@@ -607,72 +609,121 @@ def main():
                     t_neural_a = torch.clamp(prev_t + t_head_a[..., :3] / 4, 0, 1)
                     hist = store_history(t_neural_a.detach().cpu().numpy().astype(np.float32))
                     repro_np = reproject_history(hist, motion)
-                proxy = cur_p
                 features_np = build_features(cur_p, g_s, noise_seed, lane['style'], lane['tone'],
                                              lane['structure'], lane['skin'], lane['auto_mask'],
                                              history=repro_np)
+                prepared.append({'kind': 'pair', 's': s, 'feats': features_np, 'feats_a': feats_a,
+                                 'proxy': cur_p, 'prev_t': prev_t, 'repro': repro_np,
+                                 't_head_a': t_head_a, 't_neural_a': t_neural_a})
             else:
                 _, proxy, _, _, lane, _, noise_seed, features_np = item
-                repro_np = None
                 s = proxy.shape[0]
-                g_s, teacher_s = geo_for(s)
-                model.g = g_s                              # 学生算子与分辨率无关,换几何即换边长
-            with torch.no_grad():
-                t_res = teacher_s.annotate(features_np, capture=teacher_caps)
-            # head 是场分辨率(如 512² -> 场 576x512),裁到有效区再进损失。
-            t_head = torch.from_numpy(t_res['head']).view(
-                g_s['full_height'], g_s['full_width'], 4)[:s, :s].to(device)
-            proxy_t = torch.from_numpy(proxy).to(device)
-            repro_t = torch.from_numpy(repro_np).to(device) if repro_np is not None else None
+                prepared.append({'kind': 'single', 's': s, 'feats': features_np,
+                                 'proxy': proxy, 'repro': None})
 
-            with torch.autocast(device, dtype=torch.bfloat16):
-                s_head = model(torch.from_numpy(features_np).to(device))
-            s_head = s_head.view(g_s['full_height'], g_s['full_width'], 4)[:s, :s].float()
-            out, s_neural, t_neural = output_losses(
-                s_head, t_head, proxy_t, repro=repro_t,
-                s_scale=model.blend_scale, t_scale=teacher_s.blend_scale,
-                logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
-                act_knee=cfg['action_knee'])
-            # ^ s_scale 传张量而非 float:blend_scale 是 nn.Parameter,曾被 float(detach())
-            #   断梯度永远停在 1.0(教师实测 0.7397,历史混合量差 35%)。2026-10-10 修。
-            detail = laplacian_l1(s_neural, t_neural) + sobel_l1(s_neural, t_neural)
-            feat, feat_detail = feature_losses(model.captures, t_res, aligner, feature_weights)
-            loss = (cfg['loss_out'] * out + cfg['loss_detail'] * detail
-                    + cfg['loss_feature'] * feat)
-            moe_aux = model.moe_aux_loss()                      # 在时序二次前向清统计前取
-            aux_val = float(moe_aux.detach())
-            if moe_aux.requires_grad:
-                z = model.moe_z_loss()
-                loss = loss + cfg.get('moe_aux', 0.1) * moe_aux
-                loss = loss + cfg.get('moe_z', 1e-3) * z
-                route = moe_route_metrics(model)                # 坍缩指标(Comet 上报)
-                route['aux'] = aux_val
-                route['z'] = float(z.detach())
-                for k, v in route.items():
-                    moe_tot[k] = moe_tot.get(k, 0.0) + v
-            temporal = None
-            if pair_mode and cfg['loss_temporal'] > 0:
-                # 时序损失(真接上):帧差残差匹配 L1((s_B - s_A) - (t_B - t_A)) ——
-                # 正是 eval_temporal 的 flicker 口径(输入差分抵消后)。
-                with torch.no_grad():
-                    s_head_a = model(torch.from_numpy(feats_a).to(device))
-                s_head_a = s_head_a.view(g_s['full_height'], g_s['full_width'], 4)[:s, :s].float()
-                _, s_neural_a, _ = output_losses(
-                    s_head_a, t_head_a, prev_t,
-                    logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
-                    act_knee=cfg['action_knee'])
-                temporal = F.l1_loss(s_neural - s_neural_a, t_neural - t_neural_a.detach())
-                loss = loss + cfg['loss_temporal'] * temporal
-            if not torch.isfinite(loss):
-                print(f'step {step}: non-finite sample loss, skipped')
-                continue
-            (loss / cfg['batch']).backward()
-            totals['out'] += float(out.detach())
-            totals['detail'] += float(detail.detach())
-            totals['feature'] += float(feat.detach())
-            if temporal is not None:
-                totals['temporal'] += float(temporal.detach())
-            psnrs.append(psnr(s_neural.detach(), t_neural))
+        # ---- 按 (边长, 模式) 分桶 + rows 预算切块,桶内真 batch 前向(2026-10-12 吞吐改造)。
+        # 模型前向接受 batch 维行主序叠放(nr_student batch=1 与逐样本逐位一致;批量=逐样本
+        # fp32 等价见钉2/钉3,同批同样本逐位自洽见钉4)。教师仍逐样本(口径不动)。
+        buckets = {}
+        for p in prepared:
+            buckets.setdefault((p['s'], p['kind']), []).append(p)
+        for (s, kind), group in buckets.items():
+            g_s, teacher_s = geo_for(s)
+            model.g = g_s                              # 学生算子与分辨率无关,换几何即换边长
+            max_b = max(1, int(cfg.get('batch_rows', 4 * 512 * 512)) // (s * s))
+            for c0 in range(0, len(group), max_b):
+                chunk = group[c0:c0 + max_b]
+                cnb = len(chunk)
+                # 教师逐样本(口径不变);捕获按样本 stack 成整块布局喂特征损失。
+                for p in chunk:
+                    with torch.no_grad():
+                        t_res = teacher_s.annotate(p['feats'], capture=teacher_caps)
+                    p['t_head'] = torch.from_numpy(t_res['head']).view(
+                        g_s['full_height'], g_s['full_width'], 4)[:s, :s].to(device)
+                    p['t_res'] = t_res
+                t_res_stack = {}
+                for name in teacher_caps:
+                    arr = np.stack([p['t_res'][name] for p in chunk])
+                    t_res_stack[name] = arr.reshape(-1, arr.shape[-1])
+
+                x = torch.from_numpy(np.stack([p['feats'] for p in chunk])).reshape(-1, 16).to(device)
+                with torch.autocast(device, dtype=torch.bfloat16):
+                    s_head_all = model(x, batch=cnb)
+                s_head_all = s_head_all.view(
+                    cnb, g_s['full_height'], g_s['full_width'], 4)[:, :s, :s].float()
+
+                # 整块级损失:特征(整块捕获 ≈ 逐样本均值,行数同)与 MoE 均衡项 ——
+                # 必须在时序二次前向(清 moe_stats/captures)之前取。
+                feat, feat_detail = feature_losses(model.captures, t_res_stack,
+                                                   aligner, feature_weights)
+                moe_aux = model.moe_aux_loss()
+                aux_val = float(moe_aux.detach())
+                chunk_moe = 0.0
+                if moe_aux.requires_grad:
+                    z = model.moe_z_loss()
+                    chunk_moe = cfg.get('moe_aux', 0.1) * moe_aux + cfg.get('moe_z', 1e-3) * z
+                    route = moe_route_metrics(model)            # 坍缩指标(Comet 上报)
+                    route['aux'] = aux_val
+                    route['z'] = float(z.detach())
+                    for k, v in route.items():
+                        moe_tot[k] = moe_tot.get(k, 0.0) + v * cnb
+                totals['feature'] += float(feat.detach()) * cnb
+                for k, v in feat_detail.items():
+                    feat_detail_acc[k] = feat_detail_acc.get(k, 0.0) + v * cnb
+
+                # pair:上帧学生前向(teacher-forcing,no_grad)整块走,时序损失逐样本拼。
+                s_neural_a_all = None
+                if kind == 'pair' and cfg['loss_temporal'] > 0:
+                    xa = torch.from_numpy(
+                        np.stack([p['feats_a'] for p in chunk])).reshape(-1, 16).to(device)
+                    with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
+                        sa_all = model(xa, batch=cnb)
+                    sa_all = sa_all.view(
+                        cnb, g_s['full_height'], g_s['full_width'], 4)[:, :s, :s].float()
+                    s_neural_a_all = []
+                    for i, p in enumerate(chunk):
+                        _, s_na, _ = output_losses(
+                            sa_all[i], p['t_head_a'], p['prev_t'],
+                            logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
+                            act_knee=cfg['action_knee'])
+                        s_neural_a_all.append(s_na)
+
+                chunk_loss = 0.0
+                for i, p in enumerate(chunk):
+                    proxy_t = torch.from_numpy(p['proxy']).to(device)
+                    repro_t = (torch.from_numpy(p['repro']).to(device)
+                               if p['repro'] is not None else None)
+                    out, s_neural, t_neural = output_losses(
+                        s_head_all[i], p['t_head'], proxy_t, repro=repro_t,
+                        s_scale=model.blend_scale, t_scale=teacher_s.blend_scale,
+                        logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
+                        act_knee=cfg['action_knee'])
+                    # ^ s_scale 传张量而非 float:blend_scale 是 nn.Parameter,曾被 float(detach())
+                    #   断梯度永远停在 1.0(教师实测 0.7397,历史混合量差 35%)。2026-10-10 修。
+                    detail = laplacian_l1(s_neural, t_neural) + sobel_l1(s_neural, t_neural)
+                    sample_loss = cfg['loss_out'] * out + cfg['loss_detail'] * detail
+                    temporal = None
+                    if s_neural_a_all is not None:
+                        # 时序损失(真接上):帧差残差匹配 L1((s_B - s_A) - (t_B - t_A)) ——
+                        # 正是 eval_temporal 的 flicker 口径(输入差分抵消后)。
+                        temporal = F.l1_loss(s_neural - s_neural_a_all[i],
+                                             t_neural - p['t_neural_a'].detach())
+                        sample_loss = sample_loss + cfg['loss_temporal'] * temporal
+                    if not torch.isfinite(sample_loss):
+                        print(f'step {step}: non-finite sample loss, skipped')
+                        continue
+                    chunk_loss = chunk_loss + sample_loss / cfg['batch']
+                    totals['out'] += float(out.detach())
+                    totals['detail'] += float(detail.detach())
+                    if temporal is not None:
+                        totals['temporal'] += float(temporal.detach())
+                    psnrs.append(psnr(s_neural.detach(), t_neural))
+                chunk_loss = chunk_loss + (cfg['loss_feature'] * feat + chunk_moe) * (
+                    cnb / cfg['batch'])
+                if torch.isfinite(chunk_loss):
+                    chunk_loss.backward()
+                else:
+                    print(f'step {step}: non-finite chunk loss, skipped')
         torch.nn.utils.clip_grad_norm_(params, cfg['clip'])
         optim.step()
         if cfg['ema'] > 0:
@@ -700,8 +751,10 @@ def main():
                 nb = max(1, len(psnrs))
                 metrics.update({f'moe/{k}': v / nb for k, v in moe_tot.items()})
             experiment.log_metrics(metrics, step=step)
-            if feat_detail:
-                experiment.log_metrics({f'feat/{k}': v for k, v in feat_detail.items()}, step=step)
+            if feat_detail_acc:
+                nb2 = cfg['batch']
+                experiment.log_metrics({f'feat/{k}': v / nb2 for k, v in feat_detail_acc.items()},
+                                       step=step)
 
         if step % cfg['log_every'] == 0 or step == cfg['steps'] - 1:
             n = cfg['batch']

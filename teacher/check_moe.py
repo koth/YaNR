@@ -77,8 +77,8 @@ def main():
     ok &= hit4b
     print(f'4b. 配额平衡(64 窗 8 专家全偏好同一家):{bal.tolist()}  {"ok" if hit4b else "FAIL"}')
 
-    # ---- 5. 整网
-    shape_path = os.path.join(HERE, '..', 'shapes', 'student_moe.json')
+    # ---- 5. 整网(shipping 形状 student_moe_v0)
+    shape_path = os.path.join(HERE, '..', 'shapes', 'student_moe_v0.json')
     shape = load_student_shape(shape_path)
     torch.manual_seed(0)
     net = StudentNetwork(shape, geometry_from_valid(320, 320)).eval()
@@ -93,6 +93,22 @@ def main():
     print(f'5. 整网:{params / 1e6:.1f}M 参数  head {tuple(head.shape)}  '
           f'finite {finite}  moe_aux {float(aux_net):.3f}')
     ok &= params > 20_000_000                                  # 容量 ×8 口径(≥20M)
+
+    # ---- 6. 批量前向(2026-10-12 吞吐改造):批内同样本逐位自洽(无跨样本污染)+
+    # 批量 ≈ 逐样本(fp32 kernel 噪声级;梯度同口径已在离线钉3 验过,相对差 ~1e-5)。
+    torch.manual_seed(1)
+    f1 = torch.randn(320 * 320, 16)
+    f2 = torch.randn(320 * 320, 16)
+    with torch.no_grad():
+        dup = net(torch.stack([f1, f1]).reshape(-1, 16), batch=2).view(2, -1, 4)
+        single = net(f1)
+        pair_out = net(torch.stack([f1, f2]).reshape(-1, 16), batch=2).view(2, -1, 4)
+    hit6a = bool(torch.equal(dup[0], dup[1]))
+    d6 = (pair_out[0] - single).abs().max().item()
+    hit6b = d6 < 1e-5
+    ok &= hit6a and hit6b
+    print(f'6. 批量前向:批内自洽逐位 {"ok" if hit6a else "FAIL"}  '
+          f'批量vs单跑 max {d6:.2e}  {"ok" if hit6b else "FAIL"}')
 
     print('CHECK MOE PASS' if ok else 'CHECK MOE FAIL')
     return 0 if ok else 1

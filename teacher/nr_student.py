@@ -110,7 +110,10 @@ class WindowAttention(nn.Module):
         self.scale = nn.Parameter(torch.ones(self.heads))
         self.prior = nn.Parameter(torch.zeros(self.heads, self.slots, self.slots))
 
-    def forward(self, qkv, width, height):
+    def forward(self, qkv, width, height, batch=1):
+        """batch>1(2026-10-12 吞吐):样本按行主序叠放(rows = width*height 每样本,
+        总行数 batch*rows);窗索引加样本行偏移、valid 平铺,窗网格不跨样本。
+        batch=1 走原语义,数值逐位不变。"""
         rows = width * height
         heads = self.heads
         slots = self.slots
@@ -119,11 +122,6 @@ class WindowAttention(nn.Module):
         windows_x = (width + shift_x + win - 1) // win
         windows_y = (height + shift_y + win - 1) // win
         windows = windows_x * windows_y
-
-        qkv3 = qkv.view(rows, heads, 3, HEAD_DIM)
-        q = cosine_norm(qkv3[:, :, 0]) * self.scale.view(1, heads, 1)
-        k = cosine_norm(qkv3[:, :, 1])
-        v = qkv3[:, :, 2]
 
         win_x = torch.arange(windows_x, device=qkv.device) * win - shift_x
         win_y = torch.arange(windows_y, device=qkv.device) * win - shift_y
@@ -134,6 +132,17 @@ class WindowAttention(nn.Module):
         fy = (oy.view(-1, 1) + (slot // win).view(1, -1)).reshape(-1)
         valid = (fx >= 0) & (fx < width) & (fy >= 0) & (fy < height)
         index = fy.clamp(0, height - 1) * width + fx.clamp(0, width - 1)
+        if batch > 1:
+            off = (torch.arange(batch, device=qkv.device) * rows).view(-1, 1)
+            index = (index.view(1, -1) + off).reshape(-1)
+            valid = valid.view(1, -1).expand(batch, -1).reshape(-1)
+            windows = windows * batch
+            rows = rows * batch
+
+        qkv3 = qkv.view(rows, heads, 3, HEAD_DIM)
+        q = cosine_norm(qkv3[:, :, 0]) * self.scale.view(1, heads, 1)
+        k = cosine_norm(qkv3[:, :, 1])
+        v = qkv3[:, :, 2]
 
         def gather(t):     # [rows, heads, 32] -> [windows, heads, slots, 32]
             out = t[index].view(windows, slots, heads, HEAD_DIM).permute(0, 2, 1, 3)
@@ -200,8 +209,8 @@ class _AttentionTail(nn.Module):
         self.proj = nn.Linear(channels, channels)
         self.aux_attn = nn.Parameter(torch.ones(channels))
 
-    def forward(self, out, width, height):
-        attended = self.attention(self.qkv(out), width, height)
+    def forward(self, out, width, height, batch=1):
+        attended = self.attention(self.qkv(out), width, height, batch)
         return out + self.proj(attended) * self.aux_attn
 
 
@@ -216,10 +225,10 @@ class FFNBlock(nn.Module):
         self.tail = (_AttentionTail(channels, window, window_phase(phase_index))
                      if attn else None)
 
-    def forward(self, state, width, height):
+    def forward(self, state, width, height, batch=1):
         out = self.contract(F.silu(self.expand(state))) + state * self.aux_ffn
         if self.tail is not None:
-            out = self.tail(out, width, height)
+            out = self.tail(out, width, height, batch)
         return out
 
 
@@ -240,12 +249,12 @@ class ExpertBlock(nn.Module):
         self.tail = (_AttentionTail(channels, window, window_phase(phase_index))
                      if attn else None)
 
-    def forward(self, state, width, height):
+    def forward(self, state, width, height, batch=1):
         ffn = F.silu(torch.einsum('rc,ech->erh', state, self.expand))
         merged = torch.einsum('erh,ehc->erc', ffn, self.narrow).reshape(state.shape[0], -1)
         out = self.contract(merged) + state * self.aux_ffn
         if self.tail is not None:
-            out = self.tail(out, width, height)
+            out = self.tail(out, width, height, batch)
         return out
 
 
@@ -269,14 +278,14 @@ class SplitBlock(nn.Module):
         self.tail = (_AttentionTail(channels, window, window_phase(phase_index))
                      if attn else None)
 
-    def forward(self, state, width, height):
+    def forward(self, state, width, height, batch=1):
         rows = state.shape[0]
         b = self.branch(state).view(rows, self.branches, self.bc)
         mid = F.silu(torch.einsum('rbc,bcm->rbm', b, self.w2))
         narrow = torch.einsum('rbm,bmc->rbc', mid, self.w3).reshape(rows, -1)
         out = self.contract(narrow) + state * self.aux_ffn
         if self.tail is not None:
-            out = self.tail(out, width, height)
+            out = self.tail(out, width, height, batch)
         return out
 
 
@@ -301,14 +310,24 @@ class VitBlock(nn.Module):
 
 # ---------------------------------------------------------------- plumbing
 
-def box_downsample(x, in_w, in_h, out_w, out_h):
-    """2x2 box pool((a+b)+(c+d))*0.25,越界位 0 —— 教师 downsample 的自由数值版(2.7)。"""
-    x = x.view(in_h, in_w, -1)
+def box_downsample(x, in_w, in_h, out_w, out_h, batch=1):
+    """2x2 box pool((a+b)+(c+d))*0.25,越界位 0 —— 教师 downsample 的自由数值版(2.7)。
+
+    batch>1:样本按行主序叠放((batch*in_h*in_w, C)),输出同布局;batch=1 原路径逐位不变。
+    """
     sx = (torch.arange(out_w, device=x.device) * 2).clamp(max=max(in_w - 1, 0))
     sy = (torch.arange(out_h, device=x.device) * 2).clamp(max=max(in_h - 1, 0))
     sx1 = (sx + 1).clamp(max=in_w - 1)
     sy1 = (sy + 1).clamp(max=in_h - 1)
     valid = ((sx + 1 < in_w).view(1, -1)) & ((sy + 1 < in_h).view(-1, 1))
+    if batch > 1:
+        x4 = x.view(batch, in_h, in_w, -1)
+        top = x4[:, sy][:, :, sx] + x4[:, sy][:, :, sx1]
+        bottom = x4[:, sy1][:, :, sx] + x4[:, sy1][:, :, sx1]
+        values = (top + bottom) * 0.25
+        return torch.where(valid.view(1, out_h, out_w, 1), values,
+                           torch.zeros_like(values)).reshape(-1, x.shape[-1])
+    x = x.view(in_h, in_w, -1)
     top = x[sy][:, sx] + x[sy][:, sx1]
     bottom = x[sy1][:, sx] + x[sy1][:, sx1]
     values = (top + bottom) * 0.25
@@ -316,10 +335,13 @@ def box_downsample(x, in_w, in_h, out_w, out_h):
                        torch.zeros_like(values)).reshape(-1, x.shape[-1])
 
 
-def _upsample2(low, in_w, in_h, out_w, out_h):
-    base = low.view(in_h, in_w, -1)
+def _upsample2(low, in_w, in_h, out_w, out_h, batch=1):
     src_y = (torch.arange(out_h, device=low.device) >> 1).clamp(max=in_h - 1)
     src_x = (torch.arange(out_w, device=low.device) >> 1).clamp(max=in_w - 1)
+    if batch > 1:
+        base = low.view(batch, in_h, in_w, -1)
+        return base[:, src_y][:, :, src_x]
+    base = low.view(in_h, in_w, -1)
     return base[src_y][:, src_x]
 
 
@@ -330,8 +352,11 @@ class UpsampleMerge(nn.Module):
         super().__init__()
         self.aux = nn.Parameter(torch.ones(channels))
 
-    def forward(self, low, skip, in_w, in_h, out_w, out_h):
-        up = _upsample2(low, in_w, in_h, out_w, out_h)
+    def forward(self, low, skip, in_w, in_h, out_w, out_h, batch=1):
+        up = _upsample2(low, in_w, in_h, out_w, out_h, batch=batch)
+        if batch > 1:
+            merged = up + skip.view(batch, out_h, out_w, -1) * self.aux.view(1, 1, 1, -1)
+            return merged.reshape(-1, merged.shape[-1])
         merged = up + skip.view(out_h, out_w, -1) * self.aux.view(1, 1, -1)
         return merged.reshape(-1, merged.shape[-1])
 
@@ -343,7 +368,11 @@ class PostBlend(nn.Module):
         super().__init__()
         self.aux_pair = nn.Parameter(torch.ones(2, channels))
 
-    def forward(self, low, skip, in_w, in_h, out_w, out_h):
+    def forward(self, low, skip, in_w, in_h, out_w, out_h, batch=1):
+        if batch > 1:
+            up = _upsample2(low, in_w, in_h, out_w, out_h, batch=batch) * self.aux_pair[0].view(1, 1, 1, -1)
+            merged = up + skip.view(batch, out_h, out_w, -1) * self.aux_pair[1].view(1, 1, 1, -1)
+            return merged.reshape(-1, merged.shape[-1])
         up = _upsample2(low, in_w, in_h, out_w, out_h) * self.aux_pair[0].view(1, 1, -1)
         merged = up + skip.view(out_h, out_w, -1) * self.aux_pair[1].view(1, 1, -1)
         return merged.reshape(-1, merged.shape[-1])
@@ -411,12 +440,14 @@ def _balanced_pick(scores):
     return pick
 
 
-def _window_route(state, width, height, router):
+def _window_route(state, width, height, router, batch=1):
     """8x8 窗均值池化 -> router -> top-1;展开 rows 级 assign/gates。
 
     深层尺寸只保证 4 对齐(20x20、12x12…),末窗不满:越界槽屏蔽、按有效槽求均值
     (分组与 WindowAttention 的窗网格一致,但路由用不移位网格即可)。
     训练期 logit 加抖动(±0.1)防赢家通吃塌缩;eval 确定性不受影响。
+    batch>1:样本按行主序叠放;窗网格逐样本、配额平衡按样本内窗集统计(batch=1
+    口径逐窗一致,批大小不改路由语义)。
     """
     ch = state.shape[-1]
     win = 8
@@ -428,17 +459,33 @@ def _window_route(state, width, height, router):
     vmask = ((ys < height).view(-1, 1) & (xs < width).view(1, -1)).view(nh, win, nw, win)
     idx = (ys.clamp(0, height - 1).view(-1, 1) * width
            + xs.clamp(0, width - 1).view(1, -1)).reshape(-1)
-    gathered = state[idx].view(nh, win, nw, win, ch)
     count = vmask.sum((1, 3)).clamp_min(1).to(state.dtype).unsqueeze(-1)   # [nh, nw, 1]
-    pooled = (gathered * vmask.unsqueeze(-1)).sum((1, 3)) / count          # [nh, nw, ch]
-    logits = router(pooled.reshape(-1, ch))              # [nwin, E]
+    if batch > 1:
+        idx = (idx.view(1, -1)
+               + (torch.arange(batch, device=device) * (width * height)).view(-1, 1)).reshape(-1)
+        gathered = state[idx].view(batch, nh, win, nw, win, ch)
+        pooled = (gathered * vmask.view(1, nh, win, nw, win, 1)).sum((2, 4))
+        pooled = (pooled / count.view(1, nh, nw, 1)).reshape(-1, ch)
+    else:
+        gathered = state[idx].view(nh, win, nw, win, ch)
+        pooled = (gathered * vmask.unsqueeze(-1)).sum((1, 3)) / count          # [nh, nw, ch]
+    logits = router(pooled.reshape(-1, ch))              # [batch*nwin, E]
     if router.training:
         logits = logits + torch.rand_like(logits) * 0.2 - 0.1
     probs = torch.softmax(logits, dim=-1)
-    pick = _balanced_pick(logits)                          # 配额平衡 top-1(结构防塌缩)
+    if batch > 1:
+        # 配额平衡按样本内窗集统计(与 batch=1 口径逐窗一致,批大小不改路由语义)。
+        nwin = nh * nw
+        pick = torch.cat([_balanced_pick(logits[b * nwin:(b + 1) * nwin])
+                          for b in range(batch)], 0)
+    else:
+        pick = _balanced_pick(logits)                      # 配额平衡 top-1(结构防塌缩)
     g = probs.gather(1, pick[:, None]).squeeze(1)        # 门控标量(×E 归一:均匀时=1)
     win_id = ((torch.arange(height, device=device) // win).view(-1, 1) * nw
               + (torch.arange(width, device=device) // win).view(1, -1)).reshape(-1)
+    if batch > 1:
+        win_id = (win_id.view(1, -1)
+                  + (torch.arange(batch, device=device) * (nh * nw)).view(-1, 1)).reshape(-1)
     return pick[win_id], g[win_id], probs, logits
 
 
@@ -469,8 +516,8 @@ class MoEBlock(nn.Module):
             self.attention = WindowAttention(channels, window, window_phase(phase_index))
             self.aux_attn = nn.Parameter(torch.ones(channels))
 
-    def forward(self, state, width, height):
-        assign, gates, probs, logits = _window_route(state, width, height, self.router)
+    def forward(self, state, width, height, batch=1):
+        assign, gates, probs, logits = _window_route(state, width, height, self.router, batch)
         gates = gates * self.experts                        # 归一化门控:均匀路由时 = 1(dense 语义)
         self.moe_stats.append((assign.detach(), probs, logits))
         order, inv, bounds = _moe_group(assign, self.experts)
@@ -480,7 +527,7 @@ class MoEBlock(nn.Module):
         out = ffn[inv] + state * self.aux_ffn
         if self.attn:
             qkv = _moe_mm(out[order], self.qkv, bounds)[inv]
-            attended = self.attention(qkv, width, height)
+            attended = self.attention(qkv, width, height, batch)
             out = out + _moe_mm(attended[order], self.proj, bounds)[inv] * self.aux_attn
         return out
 
@@ -626,7 +673,10 @@ class StudentNetwork(nn.Module):
             total = total + (logits ** 2).mean()
         return total / len(stats)
 
-    def forward(self, features):
+    def forward(self, features, batch=1):
+        """batch>1(2026-10-12 吞吐):features 为样本行主序叠放 ((batch*rows, 16)),
+        输出同布局 ((batch*rows, 4));ViT 在瓶颈 token 数小,逐样本跑(全局注意力
+        跨样本互见的掩码复杂度不值当)。batch=1 与原实现逐位一致。"""
         for m in self.modules():
             if hasattr(m, 'moe_stats'):
                 m.moe_stats.clear()
@@ -640,22 +690,33 @@ class StudentNetwork(nn.Module):
         for i, name in enumerate(order):
             width, height = level_size(g, name)
             for j, block in enumerate(self.enc_blocks[name]):
-                state = block(state, width, height)
+                state = block(state, width, height, batch)
                 if j == len(self.enc_blocks[name]) - 1:
                     self.capture(f's-enc-{name}', state)
             skips[name] = state
             if name != 'd4':
                 next_name = order[i + 1]
                 nw, nh = level_size(g, next_name)
-                state = self.enc_trans[next_name](box_downsample(state, width, height, nw, nh))
+                state = self.enc_trans[next_name](
+                    box_downsample(state, width, height, nw, nh, batch=batch))
 
         # ---- ViT(d5 tokens)。
         tokens = g['vit_tokens']
         padded = g['padded_vit_tokens']
         dw, dh = level_size(g, 'd5')
-        state = self.vit_in(box_downsample(state, *level_size(g, 'd4'), dw, dh))
-        for block in self.vit_blocks:
-            state = block(state, tokens, padded)
+        state = self.vit_in(box_downsample(state, *level_size(g, 'd4'), dw, dh, batch=batch))
+        if batch > 1:
+            per_sample = state.view(batch, tokens, -1)
+            outs = []
+            for b in range(batch):
+                x = per_sample[b]
+                for block in self.vit_blocks:
+                    x = block(x, tokens, padded)
+                outs.append(x)
+            state = torch.cat(outs, 0)
+        else:
+            for block in self.vit_blocks:
+                state = block(state, tokens, padded)
         self.capture('s-vit', state)
 
         # ---- 解码:d5 -> d4 -> d3 -> d2 -> d1 -> d0 -> full。
@@ -665,15 +726,16 @@ class StudentNetwork(nn.Module):
             width, height = level_size(g, name)
             if prev_name != 'd5':
                 state = self.dec_trans[name](state)
-            state = self.merge[name](state, skips[name], prev_w, prev_h, width, height)
+            state = self.merge[name](state, skips[name], prev_w, prev_h, width, height,
+                                     batch=batch)
             for block in self.dec_blocks[name]:
-                state = block(state, width, height)
+                state = block(state, width, height, batch)
             self.capture(f's-dec-{name}', state)
             prev_name, prev_w, prev_h = name, width, height
 
-        state = self.post(state, skips['full'], prev_w, prev_h, full_w, full_h)
+        state = self.post(state, skips['full'], prev_w, prev_h, full_w, full_h, batch=batch)
         for block in self.dec_blocks['full']:
-            state = block(state, full_w, full_h)
+            state = block(state, full_w, full_h, batch)
         head = self.head(state)
         self.capture('s-head', head)
         return head
