@@ -355,23 +355,24 @@ class PostBlend(nn.Module):
 # Switch 式门控:softmax 概率乘 FFN 输出,给路由器留梯度;负载均衡走辅助损失
 # (StudentNetwork.moe_aux_loss)。窗序布局不变 —— 引擎侧按窗分组 grouped GEMM 即可。
 
-def _moe_linear(x, weight, assign, gates=None):
-    """x [rows, in] · weight [E, in, out] 按 assign 分组;gates [rows] 乘输出。
+def _moe_group(assign, experts):
+    """排序分组簿记:order(按专家聚序)、inv(还原置换)、bounds(逐专家段)。
+    2026-10-10:替换逐专家 mask/gather/scatter(每步上万微 kernel + 同步点,吃掉
+    GPU 一半利用率)-> 一次 argsort + 整段 matmul;逐行独立,结果与暴力参考一致。"""
+    order = torch.argsort(assign, stable=True)
+    counts = torch.bincount(assign, minlength=experts).tolist()
+    bounds, acc = [], 0
+    for n in counts:
+        bounds.append((acc, acc + n))
+        acc += n
+    inv = torch.empty_like(order)
+    inv[order] = torch.arange(order.numel(), device=order.device)
+    return order, inv, bounds
 
-    dtype 语义对齐 nn.Linear(autocast 下 matmul 出 bf16):按 matmul 输出 dtype
-    懒分配,门控乘法升型后回目标 dtype。
-    """
-    out = None
-    for e in range(weight.shape[0]):
-        m = assign == e
-        if bool(m.any()):
-            y = x[m] @ weight[e]
-            if out is None:
-                out = x.new_zeros(x.shape[0], weight.shape[2], dtype=y.dtype)
-            if gates is not None:
-                y = y * gates[m].unsqueeze(1)
-            out[m] = y.to(out.dtype)
-    return out if out is not None else x.new_zeros(x.shape[0], weight.shape[2])
+
+def _moe_mm(x_sorted, weight, bounds):
+    """分段 matmul(x 已按专家聚序):x[s:t] · weight[e];空段 [0,in]@[in,out] 无害。"""
+    return torch.cat([x_sorted[s:t] @ weight[e] for e, (s, t) in enumerate(bounds)], dim=0)
 
 
 def _balanced_pick(scores):
@@ -472,21 +473,15 @@ class MoEBlock(nn.Module):
         assign, gates, probs, logits = _window_route(state, width, height, self.router)
         gates = gates * self.experts                        # 归一化门控:均匀路由时 = 1(dense 语义)
         self.moe_stats.append((assign.detach(), probs, logits))
-        ffn = None
-        for e in range(self.experts):
-            m = assign == e
-            if bool(m.any()):
-                y = F.silu(state[m] @ self.expand[e]) @ self.narrow[e]
-                if ffn is None:
-                    ffn = state.new_zeros(state.shape[0], self.channels, dtype=y.dtype)
-                ffn[m] = (y * gates[m].unsqueeze(1)).to(ffn.dtype)
-        if ffn is None:
-            ffn = state.new_zeros(state.shape[0], self.channels)
-        out = ffn + state * self.aux_ffn
+        order, inv, bounds = _moe_group(assign, self.experts)
+        gs = gates[order]
+        h = F.silu(_moe_mm(state[order], self.expand, bounds))
+        ffn = (_moe_mm(h, self.narrow, bounds) * gs.unsqueeze(1)).to(h.dtype)
+        out = ffn[inv] + state * self.aux_ffn
         if self.attn:
-            qkv = _moe_linear(out, self.qkv, assign)
+            qkv = _moe_mm(out[order], self.qkv, bounds)[inv]
             attended = self.attention(qkv, width, height)
-            out = out + _moe_linear(attended, self.proj, assign) * self.aux_attn
+            out = out + _moe_mm(attended[order], self.proj, bounds)[inv] * self.aux_attn
         return out
 
 
@@ -519,20 +514,14 @@ class MoEVitBlock(nn.Module):
         pick = _balanced_pick(logits)                              # 配额平衡 top-1
         gates = probs.gather(1, pick[:, None]).squeeze(1) * self.experts   # 归一化门控
         self.moe_stats.append((pick.detach(), probs, logits))
-        ffn = None
-        for e in range(self.experts):
-            m = pick == e
-            if bool(m.any()):
-                y = F.silu(state[m] @ self.expand[e]) @ self.contract[e]
-                if ffn is None:
-                    ffn = state.new_zeros(state.shape[0], self.channels, dtype=y.dtype)
-                ffn[m] = (y * gates[m].unsqueeze(1)).to(ffn.dtype)
-        if ffn is None:
-            ffn = state.new_zeros(state.shape[0], self.channels)
-        out = ffn + state * self.aux_ffn
-        qkv = _moe_linear(out, self.qkv, pick)
+        order, inv, bounds = _moe_group(pick, self.experts)
+        gs = gates[order]
+        h = F.silu(_moe_mm(state[order], self.expand, bounds))
+        ffn = (_moe_mm(h, self.contract, bounds) * gs.unsqueeze(1)).to(h.dtype)
+        out = ffn[inv] + state * self.aux_ffn
+        qkv = _moe_mm(out[order], self.qkv, bounds)[inv]
         attended = self.attention(qkv, tokens, padded)
-        return out + _moe_linear(attended, self.proj, pick) * self.aux_attn
+        return out + _moe_mm(attended[order], self.proj, bounds)[inv] * self.aux_attn
 
 
 def make_block(level, phase_index):

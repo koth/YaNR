@@ -18,7 +18,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nr_geometry import geometry_from_valid                    # noqa: E402
-from nr_student import (MoEBlock, StudentNetwork, _moe_linear,  # noqa: E402
+from nr_student import (MoEBlock, StudentNetwork, _moe_group, _moe_mm,  # noqa: E402
                         _window_route, load_student_shape)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,17 +28,18 @@ def main():
     torch.manual_seed(0)
     ok = True
 
-    # ---- 1. _moe_linear 分发 == 逐行暴力
+    # ---- 1. 分段分发 == 逐行暴力
     rows, ch_in, ch_out, E = 64, 32, 48, 8
     x = torch.randn(rows, ch_in)
     w = torch.randn(E, ch_in, ch_out)
     assign = torch.randint(0, E, (rows,))
     gates = torch.rand(rows)
-    got = _moe_linear(x, w, assign, gates)
+    order, inv, bounds = _moe_group(assign, E)
+    got = (_moe_mm(x[order], w, bounds) * gates[order].unsqueeze(1))[inv]
     ref = torch.stack([x[i] @ w[assign[i]] * gates[i] for i in range(rows)])
     hit = bool(torch.allclose(got, ref, atol=1e-5))
     ok &= hit
-    print(f'1. moe_linear 分发 vs 暴力:{"ok" if hit else "MISMATCH"}')
+    print(f'1. 分段分发 vs 暴力:{"ok" if hit else "MISMATCH"}')
 
     # ---- 2/3/4. MoEBlock:梯度、均衡、确定性
     blk = MoEBlock(32, 32, experts=8, attn=True).eval()

@@ -1,0 +1,13 @@
+{
+  "name": "student_moe_v0",
+  "comment": "v0 宽度 + MoE(2026-10-10):slim_mixed+MoE 的 IN 档天花板被宽度(32-192)卡住,切回 v0 通道(32-256)/ViT 512/1024,全级 kind=moe E=8 top-1 配额平衡。逐像素计算量 = v0 dense(13.71 GMAC@512²),参数 ~60M(容量 ~7x)。速度代价:512² CPU ~125ms AVX2,VNNI+int8 预估 45-65ms;320² 档 ~20ms。",
+  "levels": [
+    {"level": "full", "kind": "moe", "channels": 32,  "hidden": 32, "blocks": 2, "attn": false, "experts": 8},
+    {"level": "d0",   "kind": "moe", "channels": 32,  "hidden": 32, "blocks": 4, "attn": true,  "experts": 8},
+    {"level": "d1",   "kind": "moe", "channels": 64,  "hidden": 64, "blocks": 4, "attn": true,  "experts": 8},
+    {"level": "d2",   "kind": "moe", "channels": 128, "hidden": 64, "blocks": 2, "attn": true,  "experts": 8},
+    {"level": "d3",   "kind": "moe", "channels": 256, "hidden": 64, "blocks": 2, "attn": true,  "experts": 8},
+    {"level": "d4",   "kind": "moe", "channels": 256, "hidden": 64, "blocks": 2, "attn": true,  "experts": 8}
+  ],
+  "vit": {"channels": 512, "ffn": 1024, "blocks": 3, "tokens_level": "d5", "experts": 8}
+}

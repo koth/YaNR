@@ -196,22 +196,27 @@ A small model distilled from the teacher's head contract: same 16-lane input (Bo
 centred proxy, the reprojected previous output, the conditioning lanes), same composite
 (`clamp(proxy + rgb/4)` + `clamp(sigmoid(logit) · blend_scale)`), **one deterministic feed-forward
 network — not a diffusion model**. Structure, acceptance numbers and the full rationale live in
-[`STUDENT.md`](STUDENT.md) and [`report_final.md`](report_final.md).
+[`STUDENT.md`](STUDENT.md), [`report_v2.md`](report_v2.md) (v2.0 acceptance) and
+[`report_final.md`](report_final.md) (v1.1).
 
-### Student structure (shipped shape: `shapes/student_slim_mixed.json`)
+### Student structure (shipped shape: `shapes/student_moe_v0.json`, v2.0)
 
 | level | channels | hidden | blocks (enc+dec) | kind | attention |
 | --- | --- | --- | --- | --- | --- |
-| full | 32 | 32 | 1+1 | FFN | none |
-| d0 | 32 | 32 | 3+3 | FFN | 8×8 window |
-| d1 | 64 | 64 | 3+3 | expert (E=2) | 8×8 window |
-| d2 | 128 | 64 | 2+2 | expert (E=2) | 8×8 window |
-| d3 | 192 | 64 | 2+2 | expert (E=2) | 8×8 window |
-| d4 | 192 | 64 (branch 32, middle 128) | 2+2 | split (6 branches) | 8×8 window |
-| ViT | 384 | FFN 768 | 2 | ViT (d5 tokens) | global |
+| full | 32 | 32 | 2+2 | MoE (E=8 top-1) | none |
+| d0 | 32 | 32 | 4+4 | MoE (E=8) | 8×8 window |
+| d1 | 64 | 64 | 4+4 | MoE (E=8) | 8×8 window |
+| d2 | 128 | 64 | 2+2 | MoE (E=8) | 8×8 window |
+| d3 | 256 | 64 | 2+2 | MoE (E=8) | 8×8 window |
+| d4 | 256 | 64 | 2+2 | MoE (E=8) | 8×8 window |
+| ViT | 512 | FFN 1024 | 3 | MoE (E=8, d5 tokens) | global |
 
-**4,286,790 parameters** (fp32 17.2 MB / f16 8.6 MB); **3.34 GMAC @320² / 9.32 GMAC @512²**.
-Alternate shapes in `shapes/`: `student_v0` (13.71 GMAC, the quality baseline), `student_slim_blocks`,
+**62,831,273 parameters** (fp32 251.3 MB); per-pixel compute stays on the dense v0 line:
+**13.71 GMAC @512²** (teacher ~69 GMAC). MoE = balanced top-1 window routing (quota ⌈W/E⌉, weak-margin
+yielding), normalized gate `gate=E·p`, router pre-LN, z-loss 1e-2 + aux 0.02; sorted grouped matmuls
+(`_moe_group`/`_moe_mm`) keep expert dispatch on the dense compute budget.
+Alternate shapes in `shapes/`: `student_slim_mixed` (v1.1 shipped: 4,286,790 params / 9.32 GMAC
+@512²), `student_v0` (13.71 GMAC dense baseline), `student_slim_blocks`,
 `student_slim_deep`, `student_alt_depth`, `student_alt_attn4x4`.
 
 ### Cost model / shape sweeps
@@ -224,34 +229,39 @@ python3 sweep_shapes.py          # shape scanning (see STUDENT.md §7 for the ac
 ### Training / evaluation / packaging
 
 ```sh
-# distillation (online teacher; 60K steps ≈ 20h on a 3090)
+# distillation (online teacher; v2.0 recipe: 60K steps ≈ 30h on a 3090; exact cfg = ckpt config,
+# see report_v2.md §5. Conditions are sampled full-range: style [0,127], tone/structure [0,1],
+# automask 0.3; data pool = 7 sources / 31K images, 64% game frames)
 python3 train_distill.py --teacher-weights $NR_WEIGHTS \
-  --data ../data/raw/DIV2K_train_HR ../data/raw/DAVIS/JPEGImages/Full-Resolution ../data/train/proxy_proc \
-  --shape ../shapes/student_slim_mixed.json --size 320,512 --size-weights 0.7,0.3 \
-  --batch 4 --steps 60000 --warmup 4000 --pair-fraction 0.3 --loss-temporal 0.5 -o runs/v11
+  --data <DIV2K> <DAVIS Full-Resolution> <proxy_proc> <Flickr2K> <GameIR-SR> <screenshots> <UHD> \
+  --shape ../shapes/student_moe_v0.json --size 320,512 --size-weights 0.7,0.3 \
+  --batch 4 --steps 60000 --warmup 4000 --pair-fraction 0.5 --loss-temporal 1.0 \
+  --moe-aux 0.02 --moe-z 0.01 -o runs/run_final
 
-# acceptance (6.1-6.3): quality vs teacher, temporal stability
-python3 eval_quality.py  --teacher-weights $NR_WEIGHTS --shape ../shapes/student_slim_mixed.json \
-  --sizes 320,512 --checkpoint runs/v11/ckpt.pt --images '...' -o eval_v11
-python3 eval_temporal.py --teacher-weights $NR_WEIGHTS --shape ../shapes/student_slim_mixed.json \
-  --seq '.../*.jpg' --checkpoint runs/v11/ckpt.pt --size 512 --max-frames 4 -o eval_v11_t
+# acceptance (6.1-6.3): condition-knob fidelity vs teacher, quality, temporal stability
+python3 eval_conditions.py --images <5 images> --shape ../shapes/student_moe_v0.json \
+  --checkpoint runs/run_final/ckpt.pt --base-style 1.5 -o eval_final_60k
+python3 eval_quality.py  --teacher-weights $NR_WEIGHTS --shape ../shapes/student_moe_v0.json \
+  --sizes 512 --checkpoint runs/run_final/ckpt.pt --images '...' -o eval_quality_60k
+python3 eval_temporal.py --teacher-weights $NR_WEIGHTS --shape ../shapes/student_moe_v0.json \
+  --seq '.../*.jpg' --checkpoint runs/run_final/ckpt.pt --size 512 --max-frames 8 -o eval_temporal_60k
 #   --hist-src teacher = open-loop diagnostic (isolates the feedback loop)
 
 # figures (6.5) and the C++ CPU engine parity + bench (8.4/8.8; NR_INT8=1, NR_PROFILE=1)
-python3 quad_compare.py --image ... --size 512 --shape ../shapes/student_slim_mixed.json \
-  --checkpoint runs/v11/ckpt.pt --teacher-weights $NR_WEIGHTS -o samples
-python3 check_engine.py --image ... --size 512 --shape ../shapes/student_slim_mixed.json \
-  --checkpoint runs/v11/ckpt.pt --bench
+python3 quad_compare.py --image ... --size 512 --shape ../shapes/student_moe_v0.json \
+  --checkpoint runs/run_final/ckpt.pt --teacher-weights $NR_WEIGHTS -o samples
+python3 check_engine.py --image ... --size 512 --shape ../shapes/student_moe_v0.json \
+  --checkpoint runs/run_final/ckpt.pt --bench
 
 # package (7.1) + bit-exact round-trip check (7.3)
-python3 convert_weights.py --shape student runs/v11/ckpt.pt -o weights/student_mixed
-python3 check_package.py --package weights/student_mixed --checkpoint runs/v11/ckpt.pt
+python3 convert_weights.py --shape student runs/run_final/ckpt.pt -o weights/student_moe_v0
+python3 check_package.py --package weights/student_moe_v0 --checkpoint runs/run_final/ckpt.pt
 
 # run a packaged student (7.2): the shape is auto-detected from the manifest
 # (the PNG outputs carry the model version in their tEXt metadata)
 python3 run_image.py samples/lake.png --width 512 --height 512 \
-  --weights weights/student_mixed --shape student -o out
-python3 run_nr.py --width 512 --height 512 --frames 5 --weights weights/student_mixed
+  --weights weights/student_moe_v0 --shape student -o out
+python3 run_nr.py --width 512 --height 512 --frames 5 --weights weights/student_moe_v0
 ```
 
 The student package has the teacher's shape (`manifest.json` + `model/stages/s*.bin`, per-stage sha256
@@ -260,11 +270,14 @@ loading needs no external files (`nr_package.load_student_package`).
 
 ### Hardware requirements
 
-* **Training**: a CUDA GPU; 60K steps ≈ 20h on a 3090. Dataset: DIV2K + DAVIS frames + the preprocessed
-  proxy corpus (see `train_distill.py --help`).
+* **Training**: a CUDA GPU; v2.0's 60K steps ≈ 30h on a 3090 (batch 4, teacher on the same GPU). Data
+  pool: 7 sources / 31K images, 64% game frames (DIV2K / DAVIS / the preprocessed proxy corpus /
+  Flickr2K / GameIR-SR frames / game screenshots / UHD; see `train_distill.py --help`).
 * **torch runtime** (evaluation / rendering): CUDA or CPU; needs torch, numpy, Pillow.
 * **CPU engine** (`../engine`): x86-64 AVX2 + OpenMP (CMake; MSVC `/O2 /arch:AVX2` supported). Eight
-  threads measured optimal on an i9-10850K (512² end-to-end 91.5 ms, 320² 28.4 ms, fp32). The int8 path
+  threads measured optimal on an i9-10850K (512² end-to-end 91.5 ms, 320² 28.4 ms, fp32, v1.1 slim
+  shape). The v2.0 MoE student needs the grouped-GEMM engine path (in progress) before the same
+  numbers apply; `shapes/student_moe_v0.json`'s comment carries the estimates. The int8 path
   (`NR_INT8=1`, quality-identical) only pays on VNNI-class hardware — that is the 512²/30ms acceptance
   target (task 8.7).
 
