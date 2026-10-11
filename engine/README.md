@@ -34,7 +34,10 @@ engine/build/Release/cpu_engine.exe photo.jpg --width 512 --height 320 -o out/ph
 只传图片也可以：权重默认 `weights/student_mixed`（相对于当前目录），
 输出默认是输入图片旁的 `<stem>_nr.png`。
 `--size` 将图片缩放为正方形；`--width/--height` 指定各轴尺寸，未指定的轴保持原尺寸。
-`--style` 控制 style ID/强度，合法范围为 `0..127`，默认 `0`；数值越大条件输入越强。
+`--style` 是 style ID/条件值，名义范围为 `0..127`，默认 `0`，不是后处理强度旋钮。
+`student_mixed` 是旧 checkpoint，训练覆盖的 style 范围是 `0..3`；较大的值会把模型推到
+训练分布外，可能出现背景噪声、颜色溢出或结构伪影。需要使用大范围 style 时请改用
+`weights/student_moe_v0`，它按 `0..127` 全量程训练。
 `--tone` 和 `--structure` 会直接写入条件 lane；`--skin` 只有和 `--automask` 一起使用时才生效，
 这是 Python 教师入口的既定语义。使用 `--features` 时输入 lane 已经预先生成，命令行条件参数不会重建它。
 有效尺寸至少 33，各轴上限 8192，d0 网格必须满足模型的 8 倍数约束。
