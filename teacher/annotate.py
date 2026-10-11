@@ -52,11 +52,16 @@ class TeacherAnnotator:
         self.blend_scale = float(self.model.blend_scale())
 
     def forward(self, features_np):
-        """跑一次教师,返回 (head [rows,4] f32 torch, boundaries dict 名->张量)。"""
+        """跑一次教师,返回 (head [rows,4] f32 torch, boundaries dict 名->张量)。
+
+        2026-10-12:torch.cuda.synchronize()(全设备)改为流本地同步 —— 训练把教师标注
+        放预取线程的独立 CUDA 流,与学生前向流水重叠;全设备同步会等满学生内核、
+        把重叠打回串行。单流调用(评测等)语义不变。
+        """
         features = torch.from_numpy(np.ascontiguousarray(features_np, dtype=np.float32))
         features = features.to(nr_torch.DEVICE)
         head = self.network.record(features)
-        torch.cuda.synchronize()
+        torch.cuda.current_stream().synchronize()
         return head, self.network.boundaries
 
     def annotate(self, features_np, capture=()):

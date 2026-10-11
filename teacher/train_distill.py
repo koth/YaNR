@@ -24,6 +24,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 try:
     import comet_ml                                                        # noqa: F401  在 torch 前导入
@@ -52,6 +53,7 @@ DEFAULTS = {
     'size': 320, 'size_weights': None,
     'batch': 4,
     'batch_rows': 4 * 512 * 512,  # 真 batch 前向的行数预算(≈ 4×512²;逐样本激活显存的上限)
+    'teacher_workers': 2,        # 教师标注预取线程数(线程本地实例 + 独立 CUDA 流,与学生重叠)
     'steps': 200000,
     'overfit': 0,
     'lr': 2e-4, 'wd': 0.01, 'warmup': 2000, 'ema': 0.999, 'clip': 1.0,
@@ -97,7 +99,7 @@ def load_config(args):
             cfg.update(json.load(fh))
     for key in ('shape', 'teacher_weights', 'batch', 'steps', 'overfit', 'lr', 'wd',
                 'warmup', 'ema', 'clip', 'loss_out', 'loss_detail', 'loss_feature',
-                'loss_temporal', 'pair_fraction', 'seed', 'batch_rows',
+                'loss_temporal', 'pair_fraction', 'seed', 'batch_rows', 'teacher_workers',
                 'lr_hold', 'lr_decay', 'lr_floor', 'loss_logit',
                 'action_floor', 'action_knee'):
         value = getattr(args, key, None)
@@ -419,6 +421,8 @@ def main():
     parser.add_argument('--batch', type=int)
     parser.add_argument('--batch-rows', dest='batch_rows', type=int,
                         help='真 batch 前向行数预算(默认 4×512²;显存紧可调小)')
+    parser.add_argument('--teacher-workers', dest='teacher_workers', type=int,
+                        help='教师标注预取线程数(默认 2;显存紧调 1)')
     parser.add_argument('--steps', type=int)
     parser.add_argument('--overfit', type=int)
     parser.add_argument('--lr', type=float)
@@ -472,15 +476,36 @@ def main():
     g = geometry_from_valid(sizes[0], sizes[0])
     shape = load_student_shape(cfg['shape'])
     geo_cache = {}
+    _tls = threading.local()
+    _teacher_lock = threading.Lock()
 
     def geo_for(size):
-        """每种训练边长一套 geometry + 在线教师(多尺度采样;教师模型按需懒加载)。"""
+        """每种训练边长一套 geometry(纯 CPU 数值,共享只读)。"""
         found = geo_cache.get(size)
         if found is None:
-            g_s = geometry_from_valid(size, size)
-            found = (g_s, TeacherAnnotator(cfg['teacher_weights'], g_s))
+            found = geometry_from_valid(size, size)
             geo_cache[size] = found
         return found
+
+    def teacher_for(size):
+        """线程本地在线教师 + 线程本地 CUDA 流(2026-10-12 流水重叠)。
+
+        annotate 内部会写 network.boundaries(可变状态),实例不能跨线程共享;
+        教师核走独立流,与主循环学生前向/反向并发,重叠掉教师时间。
+        """
+        cache = getattr(_tls, 'teachers', None)
+        if cache is None:
+            cache = {}
+            _tls.teachers = cache
+        hit = cache.get(size)
+        if hit is None:
+            g_s = geo_for(size)
+            with _teacher_lock:              # 串行加载:防 loader 竞态 + 显存尖峰
+                teacher_s = TeacherAnnotator(cfg['teacher_weights'], g_s)
+            stream = torch.cuda.Stream() if device == 'cuda' else None
+            hit = (teacher_s, stream)
+            cache[size] = hit
+        return hit
 
     model = StudentNetwork(shape, g).to(device)
     model.capture_enabled = True
@@ -537,10 +562,12 @@ def main():
           f"{cfg['steps']} steps, device {device}")
     model.train()
     def prep_item(step, bi):
-        """纯 CPU 数据准备(预取线程):采样/裁剪/退化/块匹配/特征构造。
+        """样本全量准备(预取线程):采样/裁剪/退化/块匹配/特征构造/**教师标注**。
 
-        逐 (step,bi) 独立种子,与执行顺序无关 -> 结果确定;不碰模型/教师状态(零竞态)。
-        帧对的 feats_b 依赖教师上帧输出,留在主循环。
+        逐 (step,bi) 独立种子,与执行顺序无关 -> 结果确定;教师实例线程本地、前向走
+        线程本地 CUDA 流,与主循环学生前向/反向流水重叠(2026-10-12 吞吐)。返回
+        dict:feats/proxy/repro/t_head(s×s×4)/t_res(捕获)/t_scale,pair 另有
+        feats_a/prev/t_head_a/t_neural_a。
         """
         item_pair = (cfg['pair_fraction'] > 0 and
                      np.random.default_rng([cfg['seed'], step, 7]).random() < cfg['pair_fraction'])
@@ -548,15 +575,41 @@ def main():
             prev_p, cur_p, motion, lane, _ = source.sample_pair(step * cfg['batch'] + bi)
             seed_a = int(np.random.default_rng([cfg['seed'], step, bi, 1]).integers(1 << 30))
             noise_seed = int(np.random.default_rng([cfg['seed'], step, bi, 2]).integers(1 << 30))
-            g_s = geometry_from_valid(cur_p.shape[0], cur_p.shape[1])
+            s = cur_p.shape[0]
+            g_s = geo_for(s)
+            teacher_s, stream = teacher_for(s)
             feats_a = build_features(prev_p, g_s, seed_a, lane['style'], lane['tone'],
                                      lane['structure'], lane['skin'], lane['auto_mask'])
-            return ('pair', prev_p, cur_p, motion, lane, seed_a, noise_seed, feats_a)
+            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                t_res_a = teacher_s.annotate(feats_a)
+            t_head_a = t_res_a['head'].reshape(
+                g_s['full_height'], g_s['full_width'], 4)[:s, :s]
+            t_neural_a = np.clip(prev_p + t_head_a[..., :3] / 4, 0, 1).astype(np.float32)
+            hist = store_history(t_neural_a)
+            repro_np = reproject_history(hist, motion)
+            features_np = build_features(cur_p, g_s, noise_seed, lane['style'], lane['tone'],
+                                         lane['structure'], lane['skin'], lane['auto_mask'],
+                                         history=repro_np)
+            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                t_res = teacher_s.annotate(features_np, capture=teacher_caps)
+            t_head = t_res['head'].reshape(
+                g_s['full_height'], g_s['full_width'], 4)[:s, :s]
+            return {'kind': 'pair', 's': s, 'feats': features_np, 'proxy': cur_p,
+                    'repro': repro_np, 't_res': t_res, 't_head': t_head,
+                    't_scale': teacher_s.blend_scale, 'feats_a': feats_a, 'prev': prev_p,
+                    't_head_a': t_head_a, 't_neural_a': t_neural_a}
         proxy, noise_seed, lane, _ = source.sample(step * cfg['batch'] + bi)
-        g_s = geometry_from_valid(proxy.shape[0], proxy.shape[1])
+        s = proxy.shape[0]
+        g_s = geo_for(s)
+        teacher_s, stream = teacher_for(s)
         features_np = build_features(proxy, g_s, noise_seed, lane['style'], lane['tone'],
                                      lane['structure'], lane['skin'], lane['auto_mask'])
-        return ('single', proxy, None, None, lane, None, noise_seed, features_np)
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            t_res = teacher_s.annotate(features_np, capture=teacher_caps)
+        t_head = t_res['head'].reshape(g_s['full_height'], g_s['full_width'], 4)[:s, :s]
+        return {'kind': 'single', 's': s, 'feats': features_np, 'proxy': proxy,
+                'repro': None, 't_res': t_res, 't_head': t_head,
+                't_scale': teacher_s.blend_scale}
 
     # 批内并行准备(2026-10-10):prep_item 是 (step,bi) 独立种子的纯函数,4 线程并行算、
     # 按 (step,bi) 顺序取回 -> 训练语义与串行版逐位一致;GPU 利用率 45% -> 75%+。
@@ -590,57 +643,26 @@ def main():
         feat_detail_acc = {}
         psnrs = []
         optim.zero_grad()
-        # ---- 批内逐样本准备(pair 的历史腿依赖教师上帧输出,仍逐样本走)。
+        # ---- 批内取回已备样本(预取线程已含教师标注,与学生前向流水重叠)。
         prepared = []
         for bi in range(cfg['batch']):
-            item = prep_futs.popleft().result()                 # 批内并行准备,按序取回
+            prepared.append(prep_futs.popleft().result())       # 按序取回,保确定性
             _prep_submit()
-            if item[0] == 'pair':
-                # 历史腿:上帧教师输出(teacher-forcing)-> truncate_half 存史 ->
-                # 已知运动重投影 -> 当前帧带真实历史 lanes(与部署管线同口径)。
-                _, prev_p, cur_p, motion, lane, seed_a, noise_seed, feats_a = item
-                s = cur_p.shape[0]
-                g_s, teacher_s = geo_for(s)
-                with torch.no_grad():
-                    t_res_a = teacher_s.annotate(feats_a)
-                    t_head_a = torch.from_numpy(t_res_a['head']).view(
-                        g_s['full_height'], g_s['full_width'], 4)[:s, :s].to(device)
-                    prev_t = torch.from_numpy(prev_p).to(device)
-                    t_neural_a = torch.clamp(prev_t + t_head_a[..., :3] / 4, 0, 1)
-                    hist = store_history(t_neural_a.detach().cpu().numpy().astype(np.float32))
-                    repro_np = reproject_history(hist, motion)
-                features_np = build_features(cur_p, g_s, noise_seed, lane['style'], lane['tone'],
-                                             lane['structure'], lane['skin'], lane['auto_mask'],
-                                             history=repro_np)
-                prepared.append({'kind': 'pair', 's': s, 'feats': features_np, 'feats_a': feats_a,
-                                 'proxy': cur_p, 'prev_t': prev_t, 'repro': repro_np,
-                                 't_head_a': t_head_a, 't_neural_a': t_neural_a})
-            else:
-                _, proxy, _, _, lane, _, noise_seed, features_np = item
-                s = proxy.shape[0]
-                prepared.append({'kind': 'single', 's': s, 'feats': features_np,
-                                 'proxy': proxy, 'repro': None})
 
         # ---- 按 (边长, 模式) 分桶 + rows 预算切块,桶内真 batch 前向(2026-10-12 吞吐改造)。
         # 模型前向接受 batch 维行主序叠放(nr_student batch=1 与逐样本逐位一致;批量=逐样本
-        # fp32 等价见钉2/钉3,同批同样本逐位自洽见钉4)。教师仍逐样本(口径不动)。
+        # fp32 等价见钉2/钉3,同批同样本逐位自洽见钉4)。
         buckets = {}
         for p in prepared:
             buckets.setdefault((p['s'], p['kind']), []).append(p)
         for (s, kind), group in buckets.items():
-            g_s, teacher_s = geo_for(s)
+            g_s = geo_for(s)
             model.g = g_s                              # 学生算子与分辨率无关,换几何即换边长
             max_b = max(1, int(cfg.get('batch_rows', 4 * 512 * 512)) // (s * s))
             for c0 in range(0, len(group), max_b):
                 chunk = group[c0:c0 + max_b]
                 cnb = len(chunk)
-                # 教师逐样本(口径不变);捕获按样本 stack 成整块布局喂特征损失。
-                for p in chunk:
-                    with torch.no_grad():
-                        t_res = teacher_s.annotate(p['feats'], capture=teacher_caps)
-                    p['t_head'] = torch.from_numpy(t_res['head']).view(
-                        g_s['full_height'], g_s['full_width'], 4)[:s, :s].to(device)
-                    p['t_res'] = t_res
+                # 教师捕获按样本 stack 成整块布局喂特征损失。
                 t_res_stack = {}
                 for name in teacher_caps:
                     arr = np.stack([p['t_res'][name] for p in chunk])
@@ -682,8 +704,10 @@ def main():
                         cnb, g_s['full_height'], g_s['full_width'], 4)[:, :s, :s].float()
                     s_neural_a_all = []
                     for i, p in enumerate(chunk):
+                        t_head_a_t = torch.from_numpy(p['t_head_a']).to(device)
+                        prev_t = torch.from_numpy(p['prev']).to(device)
                         _, s_na, _ = output_losses(
-                            sa_all[i], p['t_head_a'], p['prev_t'],
+                            sa_all[i], t_head_a_t, prev_t,
                             logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
                             act_knee=cfg['action_knee'])
                         s_neural_a_all.append(s_na)
@@ -693,9 +717,10 @@ def main():
                     proxy_t = torch.from_numpy(p['proxy']).to(device)
                     repro_t = (torch.from_numpy(p['repro']).to(device)
                                if p['repro'] is not None else None)
+                    t_head_t = torch.from_numpy(p['t_head']).to(device)
                     out, s_neural, t_neural = output_losses(
-                        s_head_all[i], p['t_head'], proxy_t, repro=repro_t,
-                        s_scale=model.blend_scale, t_scale=teacher_s.blend_scale,
+                        s_head_all[i], t_head_t, proxy_t, repro=repro_t,
+                        s_scale=model.blend_scale, t_scale=p['t_scale'],
                         logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
                         act_knee=cfg['action_knee'])
                     # ^ s_scale 传张量而非 float:blend_scale 是 nn.Parameter,曾被 float(detach())
@@ -706,8 +731,9 @@ def main():
                     if s_neural_a_all is not None:
                         # 时序损失(真接上):帧差残差匹配 L1((s_B - s_A) - (t_B - t_A)) ——
                         # 正是 eval_temporal 的 flicker 口径(输入差分抵消后)。
+                        t_na_t = torch.from_numpy(p['t_neural_a']).to(device)
                         temporal = F.l1_loss(s_neural - s_neural_a_all[i],
-                                             t_neural - p['t_neural_a'].detach())
+                                             t_neural - t_na_t)
                         sample_loss = sample_loss + cfg['loss_temporal'] * temporal
                     if not torch.isfinite(sample_loss):
                         print(f'step {step}: non-finite sample loss, skipped')
