@@ -3,9 +3,10 @@
 
 在线教师(D7:每 step 现跑,不缓存激活)提供 head 与逐级特征目标;学生在自己
 的真实推理数值(bf16 AMP 训练 / f16 推理,无 QAT)下对齐。四类损失(5.3-5.6):
-输出 L1(rgb/4 + blend logit SmoothL1 + 合成图)、细节(拉普拉斯 + Sobel 高频)、
+输出 L1(rgb/4 + blend logit SmoothL1 + 合成图,**按教师改动幅度加权** —— 强改动区
+满权、弱改动区压到 action_floor,低水平修改不学)、细节(拉普拉斯 + Sobel 高频)、
 特征(逐级 cosine+L2,形状不匹配处过 1x1 投影,投影随训练走)、时序(帧差一致,
-序列模式)。
+序列模式)。LR:warmup -> 平段 -> 余弦降到 lr_floor 封底(lr_at)。
 
     python3 train_distill.py --data <dir> --size 320 --steps 2000 --overfit 8 -o runs/of1
     python3 train_distill.py --config config.json --resume runs/v1/ckpt.pt
@@ -53,7 +54,13 @@ DEFAULTS = {
     'steps': 200000,
     'overfit': 0,
     'lr': 2e-4, 'wd': 0.01, 'warmup': 2000, 'ema': 0.999, 'clip': 1.0,
+    'lr_hold': 0.5,              # LR:warmup 后平段长度(占总步数;2026-10-12 起不再一降到底)
+    'lr_decay': 0.25,            # 平段后余弦降到 lr_floor 的窗口(占总步数)
+    'lr_floor': 1e-5,            # 尾段常数下限(降到这里就不降了,不归零)
     'loss_out': 1.0, 'loss_detail': 0.5, 'loss_feature': 0.5, 'loss_temporal': 1.0,
+    'loss_logit': 1.0,           # blend logit 对齐权重(幅度阀专项;原 0.5 内联)
+    'action_floor': 0.1,         # 教师改动加权:零改动处权重下限(低水平修改压到地板,不学)
+    'action_knee': 0.02,         # 权重半衰点(教师 |合成−输入| 幅度 ≈ 5/255;改动越大权重越满)
     'pair_fraction': 0.5,        # 时序对采样比例(历史腿:上帧教师输出 -> truncate_half -> 重投影)
     'crop_prob': 0.5,            # 随机原生裁剪(尺度抖动 1-2x);其余整图 resize
     'degrade_prob': 0.5,         # 在线退化(degrade.py 链;proxy_proc 已预退化的跳过)
@@ -89,7 +96,9 @@ def load_config(args):
             cfg.update(json.load(fh))
     for key in ('shape', 'teacher_weights', 'batch', 'steps', 'overfit', 'lr', 'wd',
                 'warmup', 'ema', 'clip', 'loss_out', 'loss_detail', 'loss_feature',
-                'loss_temporal', 'pair_fraction', 'seed'):
+                'loss_temporal', 'pair_fraction', 'seed',
+                'lr_hold', 'lr_decay', 'lr_floor', 'loss_logit',
+                'action_floor', 'action_knee'):
         value = getattr(args, key, None)
         if value is not None:
             cfg[key] = value
@@ -273,24 +282,40 @@ def sobel_l1(a, b):
     return (gxa - gxb).abs().mean() + (gya - gyb).abs().mean()
 
 
-def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0):
-    """输出损失(5.3):rgb/4 L1 + blend logit SmoothL1 + 合成图 L1。
+def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
+                  logit_w=1.0, act_floor=0.1, act_knee=0.02):
+    """输出损失(5.3):rgb/4 L1 + blend logit SmoothL1 + 合成图 L1,按教师改动幅度加权。
+
+    2026-10-12 损失改造(用户口径:低水平修改不需要学习,学就学改动较大的):
+    逐像素权重 w = floor + (1-floor)·Δ²/(Δ²+knee²),Δ = 教师 |合成 − 输入| 幅度 ——
+    强改动区满权重,弱改动区压到 floor;**不做 w.mean() 归一化**(归一化会把整样本的
+    弱改动再拉回满权,与"不学弱改动"相反),跨样本/跨像素的梯度占比就是改动幅度占比。
+    blend logit 单独升为 loss_logit 项(幅度总阀,原 0.5 内联),同样吃 w。
 
     有历史(repro 非空)时合成走 temporal blend(run_image 语义:权重
     clamp(sigmoid(logit)*blend_scale)),blend logit 的监督此时才有意义;
     返回的 neural 是部署口径合成图(时序损失吃它)。
     """
     s_rgb, t_rgb = s_head[..., :3] / 4.0, t_head[..., :3] / 4.0
-    out = F.l1_loss(s_rgb, t_rgb) + 0.5 * F.smooth_l1_loss(s_head[..., 3], t_head[..., 3])
     s_neural = torch.clamp(proxy + s_rgb, 0, 1)
     t_neural = torch.clamp(proxy + t_rgb, 0, 1)
-    out = out + F.l1_loss(s_neural, t_neural)
+    with torch.no_grad():
+        delta = (t_neural - proxy).abs().mean(dim=2, keepdim=True)
+        w = act_floor + (1.0 - act_floor) * delta.pow(2) / (delta.pow(2) + act_knee ** 2)
+
+    def wl1(a, b, wm=None):
+        ww = w if wm is None else wm
+        return ((a - b).abs() * ww).mean()
+
+    out = wl1(s_rgb, t_rgb) + logit_w * (
+        F.smooth_l1_loss(s_head[..., 3], t_head[..., 3], reduction='none') * w[..., 0]).mean()
+    out = out + wl1(s_neural, t_neural)
     if repro is not None:
         s_w = torch.clamp(torch.sigmoid(s_head[..., 3]) * s_scale, 0, 1)
         t_w = torch.clamp(torch.sigmoid(t_head[..., 3]) * t_scale, 0, 1)
         s_neural = s_neural + (repro - s_neural) * s_w[..., None]
         t_neural = t_neural + (repro - t_neural) * t_w[..., None]
-        out = out + F.l1_loss(s_neural, t_neural)
+        out = out + wl1(s_neural, t_neural)
     return out, s_neural, t_neural
 
 
@@ -336,11 +361,22 @@ def feature_losses(student_caps, teacher_caps, aligner, weights):
 # ---------------------------------------------------------------- training
 
 def lr_at(step, cfg):
-    if step < cfg['warmup']:
-        return cfg['lr'] * (step + 1) / cfg['warmup']
-    span = max(1, cfg['steps'] - cfg['warmup'])
-    t = (step - cfg['warmup']) / span
-    return cfg['lr'] * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+    """LR(2026-10-12 定型):warmup 线性升 -> 平段(lr_hold 占比)-> 余弦降到 lr_floor
+    (lr_decay 占比)-> 常数 lr_floor 封底不归零(用户口径:warmup 后先平一阵,
+    降低到 1e-5 就不降了)。"""
+    warm = max(1, cfg['warmup'])
+    if step < warm:
+        return cfg['lr'] * (step + 1) / warm
+    steps = max(warm + 1, cfg['steps'])
+    hold_end = max(warm + 1, int(cfg.get('lr_hold', 0.5) * steps))
+    floor_end = max(hold_end + 1, hold_end + int(cfg.get('lr_decay', 0.25) * steps))
+    floor = cfg.get('lr_floor', 1e-5)
+    if step < hold_end:
+        return cfg['lr']
+    if step < floor_end:
+        t = (step - hold_end) / (floor_end - hold_end)
+        return floor + (cfg['lr'] - floor) * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+    return floor
 
 
 def moe_route_metrics(model):
@@ -391,6 +427,18 @@ def main():
     parser.add_argument('--loss-detail', dest='loss_detail', type=float)
     parser.add_argument('--loss-feature', dest='loss_feature', type=float)
     parser.add_argument('--loss-temporal', dest='loss_temporal', type=float)
+    parser.add_argument('--loss-logit', dest='loss_logit', type=float,
+                        help='blend logit 对齐权重(幅度阀专项,默认 1.0)')
+    parser.add_argument('--action-floor', dest='action_floor', type=float,
+                        help='教师改动加权下限(默认 0.1;低水平修改压到地板)')
+    parser.add_argument('--action-knee', dest='action_knee', type=float,
+                        help='改动加权半衰点(默认 0.02 ≈ 5/255)')
+    parser.add_argument('--lr-hold', dest='lr_hold', type=float,
+                        help='warmup 后平段长度(占总步数,默认 0.5)')
+    parser.add_argument('--lr-decay', dest='lr_decay', type=float,
+                        help='降到 lr_floor 的余弦窗口(占总步数,默认 0.25)')
+    parser.add_argument('--lr-floor', dest='lr_floor', type=float,
+                        help='尾段常数 LR 下限(默认 1e-5)')
     parser.add_argument('--pair-fraction', dest='pair_fraction', type=float,
                         help='时序对采样比例(0 关闭历史腿)')
     parser.add_argument('--seed', type=int)
@@ -582,7 +630,9 @@ def main():
             s_head = s_head.view(g_s['full_height'], g_s['full_width'], 4)[:s, :s].float()
             out, s_neural, t_neural = output_losses(
                 s_head, t_head, proxy_t, repro=repro_t,
-                s_scale=model.blend_scale, t_scale=teacher_s.blend_scale)
+                s_scale=model.blend_scale, t_scale=teacher_s.blend_scale,
+                logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
+                act_knee=cfg['action_knee'])
             # ^ s_scale 传张量而非 float:blend_scale 是 nn.Parameter,曾被 float(detach())
             #   断梯度永远停在 1.0(教师实测 0.7397,历史混合量差 35%)。2026-10-10 修。
             detail = laplacian_l1(s_neural, t_neural) + sobel_l1(s_neural, t_neural)
@@ -607,7 +657,10 @@ def main():
                 with torch.no_grad():
                     s_head_a = model(torch.from_numpy(feats_a).to(device))
                 s_head_a = s_head_a.view(g_s['full_height'], g_s['full_width'], 4)[:s, :s].float()
-                _, s_neural_a, _ = output_losses(s_head_a, t_head_a, prev_t)
+                _, s_neural_a, _ = output_losses(
+                    s_head_a, t_head_a, prev_t,
+                    logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
+                    act_knee=cfg['action_knee'])
                 temporal = F.l1_loss(s_neural - s_neural_a, t_neural - t_neural_a.detach())
                 loss = loss + cfg['loss_temporal'] * temporal
             if not torch.isfinite(loss):
