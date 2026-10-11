@@ -714,6 +714,7 @@ def main():
 
                 chunk_loss = 0.0
                 for i, p in enumerate(chunk):
+                    proxy = p['proxy']                     # vis 块取图用(重构后保持旧名)
                     proxy_t = torch.from_numpy(p['proxy']).to(device)
                     repro_t = (torch.from_numpy(p['repro']).to(device)
                                if p['repro'] is not None else None)
@@ -801,19 +802,23 @@ def main():
                   + f"  {ms:.0f} ms")
 
         if cfg['vis_every'] and step % cfg['vis_every'] == 0 and step > 0:
-            vis = os.path.join(args.out, f'vis-{step:06d}')
-            os.makedirs(vis, exist_ok=True)
-            save_png(os.path.join(vis, 'proxy.png'), proxy)
-            save_png(os.path.join(vis, 'teacher.png'), t_neural.detach().cpu().numpy())
-            save_png(os.path.join(vis, 'student.png'), s_neural.detach().cpu().numpy())
-            diff = np.abs(s_neural.detach().cpu().numpy()
-                          - t_neural.detach().cpu().numpy()) * 12
-            save_png(os.path.join(vis, 'diff_x12.png'), diff)
-            if experiment is not None:
-                experiment.log_image(proxy, 'proxy', step=step)
-                experiment.log_image(t_neural.detach().cpu().numpy(), 'teacher', step=step)
-                experiment.log_image(s_neural.detach().cpu().numpy(), 'student', step=step)
-                experiment.log_image(np.clip(diff, 0, 1), 'diff_x12', step=step)
+            # 可视化只许看不许杀:2026-10-12 vis 块 NameError 杀过一次 28h 跑,套保险。
+            try:
+                vis = os.path.join(args.out, f'vis-{step:06d}')
+                os.makedirs(vis, exist_ok=True)
+                save_png(os.path.join(vis, 'proxy.png'), proxy)
+                save_png(os.path.join(vis, 'teacher.png'), t_neural.detach().cpu().numpy())
+                save_png(os.path.join(vis, 'student.png'), s_neural.detach().cpu().numpy())
+                diff = np.abs(s_neural.detach().cpu().numpy()
+                              - t_neural.detach().cpu().numpy()) * 12
+                save_png(os.path.join(vis, 'diff_x12.png'), diff)
+                if experiment is not None:
+                    experiment.log_image(proxy, 'proxy', step=step)
+                    experiment.log_image(t_neural.detach().cpu().numpy(), 'teacher', step=step)
+                    experiment.log_image(s_neural.detach().cpu().numpy(), 'student', step=step)
+                    experiment.log_image(np.clip(diff, 0, 1), 'diff_x12', step=step)
+            except Exception as exc:                            # noqa: BLE001
+                print(f'step {step}: vis failed ({exc!r}), skipped')
 
         if cfg['ckpt_every'] and step % cfg['ckpt_every'] == 0 and step > 0:
             torch.save({'step': step, 'model': model.state_dict(), 'aligner': aligner.state_dict(),
