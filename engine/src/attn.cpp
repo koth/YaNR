@@ -156,7 +156,8 @@ void attn_profile_reset() { for (double& v : g_aprof) v = 0.0; g_aprof_on = true
 
 void attn_window_head(float* qkv, int row_stride, const int* index,
                       const unsigned char* valid, int slots, float scale,
-                      const float* prior, float* scores, float* out, int out_stride) {
+                      const float* prior, float* scores, float* out, int out_stride,
+                      const int* output_map) {
     std::chrono::steady_clock::time_point t0, t1, t2, t3;
     if (g_aprof_on) t0 = std::chrono::steady_clock::now();
     for (int s = 0; s < slots; s++) {
@@ -300,12 +301,14 @@ void attn_window_head(float* qkv, int row_stride, const int* index,
                 }
             }
             if (valid[s]) {
-                float* orow = out + (size_t)index[s] * out_stride;
+                int out_row = output_map ? output_map[index[s]] : index[s];
+                float* orow = out + (size_t)out_row * out_stride;
                 _mm256_storeu_ps(orow, a0); _mm256_storeu_ps(orow + 8, a1);
                 _mm256_storeu_ps(orow + 16, a2); _mm256_storeu_ps(orow + 24, a3);
             }
             if (valid[s + 1]) {
-                float* orow = out + (size_t)index[s + 1] * out_stride;
+                int out_row = output_map ? output_map[index[s + 1]] : index[s + 1];
+                float* orow = out + (size_t)out_row * out_stride;
                 _mm256_storeu_ps(orow, b0); _mm256_storeu_ps(orow + 8, b1);
                 _mm256_storeu_ps(orow + 16, b2); _mm256_storeu_ps(orow + 24, b3);
             }
@@ -316,7 +319,8 @@ void attn_window_head(float* qkv, int row_stride, const int* index,
             float den = 0.0f;
             for (int j = 0; j < slots; j++) den += sr[j];
             float inv = den > 0.0f ? 1.0f / den : 0.0f;
-            av32(sr, slots, inv, vrows_buf.data(), out + (size_t)index[s] * out_stride);
+            int out_row = output_map ? output_map[index[s]] : index[s];
+            av32(sr, slots, inv, vrows_buf.data(), out + (size_t)out_row * out_stride);
         }
 #else
         for (int s = 0; s < slots; s++) {
@@ -325,7 +329,8 @@ void attn_window_head(float* qkv, int row_stride, const int* index,
             float den = 0.0f;
             for (int j = 0; j < slots; j++) den += sr[j];
             float inv = den > 0.0f ? 1.0f / den : 0.0f;
-            av32(sr, slots, inv, vrows_buf.data(), out + (size_t)index[s] * out_stride);
+            int out_row = output_map ? output_map[index[s]] : index[s];
+            av32(sr, slots, inv, vrows_buf.data(), out + (size_t)out_row * out_stride);
         }
 #endif
     }
@@ -336,7 +341,8 @@ void attn_window_head(float* qkv, int row_stride, const int* index,
 }
 
 void attn_vit_head(float* qkv, int row_stride, int tokens, int padded, float scale,
-                   float* scores, float* out, int out_stride) {
+                   float* scores, float* out, int out_stride,
+                   const int* output_map) {
     // k 的 cosine 归一只做一次(见 attn.h;原实现逐查询重复归一同一原始 k)。
     for (int t2 = 0; t2 < tokens; t2++) {
         cosine_norm32(qkv + (size_t)t2 * row_stride + 32);
@@ -381,6 +387,7 @@ void attn_vit_head(float* qkv, int row_stride, int tokens, int padded, float sca
         float den = 0.0f;
         for (int t2 = 0; t2 < tokens; t2++) den += sr[t2];
         float inv = den > 0.0f ? 1.0f / den : 0.0f;
-        av32(sr, tokens, inv, vrows_buf.data(), out + (size_t)ti * out_stride);
+        int out_row = output_map ? output_map[ti] : ti;
+        av32(sr, tokens, inv, vrows_buf.data(), out + (size_t)out_row * out_stride);
     }
 }

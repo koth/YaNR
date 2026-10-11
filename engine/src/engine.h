@@ -9,9 +9,10 @@
 #include <vector>
 
 #include "geometry.h"
+#include "gemm.h"
 
 struct BlockCfg {
-    std::string kind;              // ffn / expert / split / vit
+    std::string kind;              // ffn / expert / moe / split / vit / moe_vit
     bool attn = false;
     int hidden = 0, experts = 0, narrow = 0;
     int branches = 0, bc = 0, mc = 0;
@@ -23,11 +24,26 @@ struct Tensor {
     const float* data = nullptr;   // points into the mapped bin
 };
 
-// 帧间复用暂存(M3 arena):容量只增不减,steady-state 前向零 malloc。
+// Track the logical length separately: std::vector::resize after shrinking
+// would zero the growing suffix at every level/frame, even when capacity fits.
+class FloatBuffer {
+public:
+    void resize(size_t n) { if (n > storage_.size()) storage_.resize(n); used_ = n; }
+    size_t size() const { return used_; }
+    float* data() { return storage_.data(); }
+    const float* data() const { return storage_.data(); }
+    void swap(FloatBuffer& other) { storage_.swap(other.storage_); std::swap(used_, other.used_); }
+    std::vector<float> snapshot() const { return {data(), data() + used_}; }
+private:
+    std::vector<float> storage_;
+    size_t used_ = 0;
+};
+
+// 帧间复用暂存(M3 arena):容量只增不减,steady-state 前向不 malloc/重复清零。
 // ffn_block/vit_block 用 tmp/aux/merge/res/qkv/att/proj;forward 用 sk/x 等槽位。
 struct Scratch {
-    std::vector<float> tmp, aux, merge, res, qkv, att, proj;
-    std::vector<float> sk[6], x, pooled, vstate, up;
+    FloatBuffer tmp, aux, merge, res, qkv, att, proj;
+    FloatBuffer sk[6], x, pooled, vstate, up;
 };
 
 // int8 权重(任务 8.2):[N][Kp] int8 + 每输出通道 scale;专家 3D 张量扁平存
@@ -35,12 +51,14 @@ struct Scratch {
 struct Wq {
     std::vector<int8_t> w;
     std::vector<float> sw;
+    std::vector<I8VnniWeights> vnni; // one panel per expert; one for a Linear
     int N = 0, Kp = 0;
 };
 
 class Engine {
 public:
     explicit Engine(const std::string& idx_path);   // loads <idx> + sibling .bin
+    Engine(const std::string& package_dir, int width, int height); // manifest + shape + stages
     ~Engine();
 
     // features: [full_rows][16] -> head: [full_rows][4]
@@ -51,8 +69,9 @@ public:
     const std::map<std::string, std::vector<float>>& debug() const { return debug_; }
 
     // 粗粒度剖析(M3):gemm / silu / attn / attn-gather 累计毫秒;其余 = 总时间 - 之和。
-    void set_profile(bool on) { prof_on_ = on; for (double& v : prof_) v = 0.0; }
+    void set_profile(bool on) { prof_on_ = on; for (double& v : prof_) v = 0.0; layer_prof_.clear(); }
     const double* profile() const { return prof_; }
+    const std::map<std::string, double>& layer_profile() const { return layer_prof_; }
 
     // int8 GEMM 路径(任务 8.2):动态 A 量化 + per-channel 权重量化。
     void set_int8(bool on) { int8_ = on; }
@@ -64,6 +83,7 @@ public:
     const std::vector<BlockCfg>& dec_blocks(const std::string& level) const;
 
 private:
+    void pack_weights();
     const Tensor& t(const std::string& name) const;
     const float* w(const std::string& name) const { return t(name).data; }
     int dim(const std::string& name, int i) const { return t(name).shape[i]; }
@@ -77,13 +97,20 @@ private:
                      const int* row_map = nullptr) const;
     void ffn_block(const BlockCfg& cfg, const std::string& prefix, float* state,
                    int rows, int width, int height) const;
+    void ffn_window_block(const BlockCfg& cfg, const std::string& prefix, float* state,
+                          int width, int height) const;
     void vit_block(const BlockCfg& cfg, const std::string& prefix, float* state,
                    int tokens, int padded) const;
+    void moe_block(const BlockCfg& cfg, const std::string& prefix, float* state,
+                   int rows, int width, int height) const;
+    void moe_vit_block(const BlockCfg& cfg, const std::string& prefix, float* state,
+                       int tokens, int padded) const;
     // qkv 可写:注意力核心直接在行上就地归一(掩码/复刻语义见 attn.h)。
     void window_attention(float* qkv, float* out, int rows, int width, int height,
-                          int heads, const BlockCfg& cfg, const std::string& prefix) const;
+                          int heads, const BlockCfg& cfg, const std::string& prefix,
+                          const int* output_map = nullptr) const;
     void vit_attention(float* qkv, float* out, int tokens, int padded, int heads,
-                       const std::string& prefix) const;
+                       const std::string& prefix, const int* output_map = nullptr) const;
     void box_downsample(const float* x, float* out, int in_w, int in_h, int out_w,
                         int out_h, int ch) const;
     void upsample2(const float* x, float* out, int in_w, int in_h, int out_w,
@@ -112,5 +139,6 @@ private:
     bool debug_on_ = false;
     bool prof_on_ = false;
     mutable double prof_[4] = {0, 0, 0, 0};         // gemm / silu / attn / attn-gather
+    mutable std::map<std::string, double> layer_prof_;
     mutable std::map<std::string, std::vector<float>> debug_;   // mutable:ffn_block 里也埋点
 };

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -78,11 +79,14 @@ inline bool write_rgb8(const std::string& path, int w, int h, const uint8_t* rgb
     chunk(out, "IHDR", ihdr);
     chunk(out, "IDAT", z);
     chunk(out, "IEND", {});
+#ifdef _WIN32
+    FILE* f = _wfopen(std::filesystem::u8path(path).c_str(), L"wb");
+#else
     FILE* f = std::fopen(path.c_str(), "wb");
+#endif
     if (!f) return false;
-    std::fwrite(out.data(), 1, out.size(), f);
-    std::fclose(f);
-    return true;
+    bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size();
+    return std::fclose(f) == 0 && ok;
 }
 
 }  // namespace pngw

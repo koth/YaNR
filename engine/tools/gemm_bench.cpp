@@ -33,6 +33,7 @@ struct Case {
     std::vector<int8_t> Wq;
     std::vector<float> sW;
     int Kp;
+    I8VnniWeights vnni;
 };
 
 void run_f32(void* p) {
@@ -43,7 +44,8 @@ void run_f32(void* p) {
 void run_i8(void* p) {
     Case* c = (Case*)p;
     gemm_kn_i8(c->A.data(), c->M, c->K, c->N, c->Wq.data(), c->Kp,
-               c->sW.data(), c->C.data(), c->bias.data());
+               c->sW.data(), c->C.data(), c->bias.data(), false, nullptr, nullptr,
+               c->vnni.w.empty() ? nullptr : &c->vnni);
 }
 
 }  // namespace
@@ -53,6 +55,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--repeats") == 0) repeats = std::atoi(argv[++i]);
     }
+    std::printf("INT8 backend: %s\n", gemm_i8_backend());
     const int shapes[][3] = {
         {102400, 32, 32},    // full 级 expand/contract
         {30720, 32, 96},     // d0 级 qkv
@@ -85,6 +88,7 @@ int main(int argc, char** argv) {
         for (auto& v : Wf) v = dist(rng) * 0.1f;
         pack_weight_kn(Wf.data(), c.N, c.K, c.Bp.data());
         quantize_w_nk(Wf.data(), c.N, c.K, c.Kp, c.Wq.data(), c.sW.data());
+        if (gemm_vnni_available()) c.vnni = pack_weight_i8_vnni(c.Wq.data(), c.N, c.Kp);
 
         double tf = time_ms(run_f32, &c, repeats);
         double ti = time_ms(run_i8, &c, repeats);

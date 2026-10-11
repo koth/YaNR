@@ -95,7 +95,7 @@ def main():
     feat_path = os.path.join(tmp, 'features.bin')
     features.astype(np.float32).tofile(feat_path)
     head_path = os.path.join(tmp, 'head.bin')
-    tool = os.path.join(args.engine_build, 'cpu_engine')
+    tool = os.path.join(args.engine_build, 'cpu_engine.exe' if os.name == 'nt' else 'cpu_engine')
     if args.bench:
         bench_cmd = [tool, '--idx', prefix + '.idx', '--features', feat_path,
                      '--bench', '--repeats', '30']

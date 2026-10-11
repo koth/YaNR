@@ -1,166 +1,299 @@
-// cpu_engine: run the student forward from a features dump (parity/bench tool).
-//
+// cpu_engine: image inference and forward-only benchmark, plus the original parity CLI.
+//   cpu_engine photo.jpg --weights weights/student_mixed --png photo_nr.png --bench
 //   cpu_engine --idx student512.idx --features feat.bin --out head.bin
-//   cpu_engine --idx student512.idx --features feat.bin --bench --repeats 30
-//
-// features: raw f32 [full_rows][16]; head: raw f32 [full_rows][4].
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
+#include <omp.h>
 
 #include "engine.h"
+#include "gemm.h"
+#include "lanes.h"
 #include "png_write.h"
-#include "../src/attn.h"
+#include "attn.h"
+#include "image_read.h"
 
-int main(int argc, char** argv) {
-    std::string idx_path, feat_path, out_path, dump_dir;
-    std::string proxy_path, png_path, blend_path;
-    int repeats = 30;
+namespace fs = std::filesystem;
+namespace {
+void usage() {
+    std::puts(
+        "usage: cpu_engine IMAGE [--weights weights/student_mixed] [--png OUTPUT.png]\n"
+        "                  [--size N | --width W --height H] [--bench] [--repeats 30]\n"
+        "                  [--warmup 5] [--threads 8] [--seed 12345] [--style 0..127]\n"
+        "                  [--tone 0.5] [--structure 0.5] [--skin -1] [--automask]\n"
+        "                  [--blend-png blend.png] [--proxy-png proxy.png]\n"
+        "       cpu_engine --idx MODEL.idx --features INPUT.bin [--out HEAD.bin | --bench]\n"
+        "                  [--proxy PROXY.bin --png OUTPUT.png] [--dump-dir DIR]\n"
+        "Image size defaults to the input size. -o aliases --png; --out writes raw f32 head.\n"
+        "Threads default to OMP_NUM_THREADS when set, otherwise 8.\n"
+        "--style controls the style ID/intensity (0 keeps the default; valid range 0..127).\n"
+        "--tone/--structure control lanes directly; --skin is used only with --automask.\n"
+        "With --features, lane options are ignored because the input lanes are prebuilt.\n"
+        "--weights can also be combined with --features (default size 512x512).\n"
+        "Benchmark times only Engine::forward after warmup, without image/lane/I/O work.\n"
+        "NR_INT8=1 enables mixed int8; NR_VNNI=0 disables VNNI auto-dispatch;\n"
+        "NR_PROFILE=1 enables diagnostic profiling.");
+}
+int integer(const std::string& text, int low, int high) {
+    size_t end;
+    long long v = std::stoll(text, &end);
+    if (end != text.size() || v < low || v > high) throw std::runtime_error("invalid integer: " + text);
+    return static_cast<int>(v);
+}
+double real(const std::string& text) {
+    size_t end;
+    double v = std::stod(text, &end);
+    if (end != text.size() || !std::isfinite(v)) throw std::runtime_error("invalid number: " + text);
+    return v;
+}
+void mkdir_parent(const std::string& path) {
+    auto parent = fs::u8path(path).parent_path();
+    if (!parent.empty()) fs::create_directories(parent);
+}
+void read_f32(const std::string& path, std::vector<float>& data) {
+    auto p = fs::u8path(path);
+    if (fs::file_size(p) != data.size() * sizeof(float)) throw std::runtime_error("size mismatch: " + path);
+    std::ifstream file(p, std::ios::binary);
+    if (!file.read(reinterpret_cast<char*>(data.data()), data.size() * sizeof(float)))
+        throw std::runtime_error("cannot read " + path);
+}
+void write_f32(const std::string& path, const std::vector<float>& data) {
+    mkdir_parent(path);
+    std::ofstream file(fs::u8path(path), std::ios::binary);
+    if (!file.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float)))
+        throw std::runtime_error("cannot write " + path);
+    file.close();
+    if (!file) throw std::runtime_error("cannot finish writing " + path);
+}
+void write_png(const std::string& path, int width, int height, const uint8_t* rgb) {
+    mkdir_parent(path);
+    if (!pngw::write_rgb8(path, width, height, rgb)) throw std::runtime_error("cannot write " + path);
+    std::printf("wrote %s\n", path.c_str());
+}
+double elapsed(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+int run(const std::vector<std::string>& args) {
+    std::string idx_path, weights_path, image_path, feat_path, out_path, dump_dir;
+    std::string proxy_path, png_path, blend_path, proxy_png, dump_features;
+    int repeats = 30, warmup = 5, threads = 0, width = 0, height = 0;
     bool bench = false;
-    for (int i = 1; i < argc; i++) {
-        std::string a = argv[i];
-        auto next = [&]() { return argv[++i]; };
-        if (a == "--idx") idx_path = next();
+    LaneParams lanes;
+    lanes.seed = 12345;
+    for (size_t i = 1; i < args.size(); ++i) {
+        const auto& a = args[i];
+        auto next = [&]() -> const std::string& {
+            if (++i == args.size()) throw std::runtime_error("missing value after " + a);
+            return args[i];
+        };
+        if (a == "--help" || a == "-h") { usage(); return 0; }
+        else if (a == "--idx") idx_path = next();
+        else if (a == "--weights") weights_path = next();
+        else if (a == "--image") image_path = next();
         else if (a == "--features") feat_path = next();
         else if (a == "--out") out_path = next();
         else if (a == "--dump-dir") dump_dir = next();
-        else if (a == "--proxy") proxy_path = next();      // 有效区 proxy raw f32 [h][w][3]
-        else if (a == "--png") png_path = next();          // composite PNG 输出(8.4)
-        else if (a == "--blend-png") blend_path = next();  // blend 权重图 PNG
+        else if (a == "--dump-features") dump_features = next();
+        else if (a == "--proxy") proxy_path = next();
+        else if (a == "--png" || a == "-o") png_path = next();
+        else if (a == "--blend-png") blend_path = next();
+        else if (a == "--proxy-png") proxy_png = next();
         else if (a == "--bench") bench = true;
-        else if (a == "--repeats") repeats = std::atoi(next());
-        else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
+        else if (a == "--repeats") repeats = integer(next(), 1, 10000);
+        else if (a == "--warmup") warmup = integer(next(), 1, 10000);
+        else if (a == "--threads") threads = integer(next(), 1, 256);
+        else if (a == "--size") width = height = integer(next(), 33, 8192);
+        else if (a == "--width") width = integer(next(), 33, 8192);
+        else if (a == "--height") height = integer(next(), 33, 8192);
+        else if (a == "--seed") {
+            auto seed = next(); size_t end;
+            auto n = std::stoull(seed, &end);
+            if (end != seed.size() || n > UINT32_MAX) throw std::runtime_error("invalid seed: " + seed);
+            lanes.seed = static_cast<uint32_t>(n);
+        }
+        else if (a == "--style") {
+            lanes.style = real(next());
+            if (lanes.style < 0.0 || lanes.style > 127.0)
+                throw std::runtime_error("--style must be between 0 and 127");
+        }
+        else if (a == "--tone") lanes.tone = real(next());
+        else if (a == "--structure") lanes.structure = real(next());
+        else if (a == "--skin") lanes.skin = real(next());
+        else if (a == "--automask") lanes.auto_mask = true;
+        else if (!a.empty() && a[0] != '-' && image_path.empty()) image_path = a;
+        else throw std::runtime_error("unknown argument: " + a);
     }
-    if (idx_path.empty() || feat_path.empty() || (!bench && out_path.empty())) {
-        std::fprintf(stderr, "usage: cpu_engine --idx m.idx --features f.bin --out h.bin | --bench\n");
-        return 2;
-    }
+    if (args.size() == 1) { usage(); return 2; }
+    if ((!image_path.empty()) == (!feat_path.empty())) throw std::runtime_error("specify one of IMAGE or --features");
+    if (!idx_path.empty() && !weights_path.empty()) throw std::runtime_error("specify one of --idx or --weights");
+    if (bench && !dump_dir.empty()) throw std::runtime_error("--dump-dir copies tensors; run it separately from --bench");
+    if (!image_path.empty() && !proxy_path.empty()) throw std::runtime_error("--image already provides the proxy");
+    if (!idx_path.empty() && (width || height)) throw std::runtime_error("--idx fixes the geometry; use --weights to resize");
+    if (weights_path.empty() && idx_path.empty()) weights_path = "weights/student_mixed";
+    if (!threads) threads = std::getenv("OMP_NUM_THREADS") ? omp_get_max_threads() : 8;
+    omp_set_dynamic(0);
+    omp_set_num_threads(threads);
 
-    Engine engine(idx_path);
-    const Geometry& g = engine.geometry();
-    std::vector<float> features((size_t)g.full_rows * 16);
-    FILE* f = std::fopen(feat_path.c_str(), "rb");
-    if (!f) { std::fprintf(stderr, "cannot open %s\n", feat_path.c_str()); return 1; }
-    size_t got = std::fread(features.data(), 4, features.size(), f);
-    std::fclose(f);
-    if (got != features.size()) {
-        std::fprintf(stderr, "features size mismatch: %zu / %zu\n", got, features.size());
-        return 1;
+    std::unique_ptr<Engine> engine;
+    auto t0 = std::chrono::steady_clock::now();
+    if (!idx_path.empty()) engine = std::make_unique<Engine>(idx_path);
+    double load_ms = elapsed(t0);
+    if (engine && !image_path.empty()) {
+        width = engine->geometry().valid_width; height = engine->geometry().valid_height;
     }
-    std::vector<float> head((size_t)g.full_rows * 4);
-    engine.set_debug(!dump_dir.empty());
-    engine.set_profile(std::getenv("NR_PROFILE") != nullptr);
-    engine.set_int8(std::getenv("NR_INT8") != nullptr);
+    std::vector<float> proxy;
+    double image_ms = 0;
+    if (!image_path.empty()) {
+        t0 = std::chrono::steady_clock::now();
+        auto image = read_image(image_path, width, height);
+        width = image.width; height = image.height; proxy = std::move(image.rgb);
+        image_ms = elapsed(t0);
+        if (png_path.empty()) {
+            auto p = fs::u8path(image_path);
+            png_path = (p.parent_path() / fs::u8path(p.stem().u8string() + "_nr.png")).u8string();
+        }
+    }
+    if (!engine) {
+        if (!width) width = 512;
+        if (!height) height = 512;
+        t0 = std::chrono::steady_clock::now();
+        engine = std::make_unique<Engine>(weights_path, width, height);
+        load_ms = elapsed(t0);
+    }
+    const Geometry& g = engine->geometry();
+    width = g.valid_width; height = g.valid_height;
+    if (image_path.empty() && !proxy_path.empty()) {
+        proxy.resize(static_cast<size_t>(width) * height * 3);
+        read_f32(proxy_path, proxy);
+    }
+    if (proxy.empty() && (!png_path.empty() || !blend_path.empty() || !proxy_png.empty()))
+        throw std::runtime_error("PNG output needs IMAGE or --proxy");
+    if (!bench && out_path.empty() && png_path.empty()) throw std::runtime_error("specify --out or --png");
+    std::vector<float> features(static_cast<size_t>(g.full_rows) * 16);
+    t0 = std::chrono::steady_clock::now();
+    if (!image_path.empty()) build_lanes(proxy.data(), width, height, g, lanes, features.data());
+    else read_f32(feat_path, features);
+    double features_ms = elapsed(t0);
+    if (!dump_features.empty()) write_f32(dump_features, features);
+    std::vector<float> head(static_cast<size_t>(g.full_rows) * 4);
+    const bool profile = std::getenv("NR_PROFILE") != nullptr;
+    engine->set_debug(!dump_dir.empty());
+    engine->set_profile(profile);
+    engine->set_int8(std::getenv("NR_INT8") != nullptr);
+    std::printf("model %s  valid %dx%d  field %dx%d  threads %d  style %.3g tone %.3g structure %.3g skin %.3g automask %d  mode %s\n",
+                idx_path.empty() ? weights_path.c_str() : idx_path.c_str(), width, height,
+                g.full_width, g.full_height, omp_get_max_threads(), lanes.style, lanes.tone,
+                lanes.structure, lanes.skin, lanes.auto_mask ? 1 : 0,
+                std::getenv("NR_INT8") ? (std::string("mixed-int8/") + gemm_i8_backend()).c_str() : "fp32");
 
     if (bench) {
-        engine.forward(features.data(), head.data());                 // warmup
-        engine.set_profile(std::getenv("NR_PROFILE") != nullptr);     // 清零,只统计计时段
-        attn_profile_reset();
+        for (int i = 0; i < warmup; ++i) engine->forward(features.data(), head.data());
+        engine->set_profile(profile);
+        // Only enable attention's internal timers for explicit diagnostic profiling.
+        if (profile && std::getenv("NR_ATTN_PROFILE")) attn_profile_reset();
         std::vector<double> times;
-        for (int i = 0; i < repeats; i++) {
-            auto t0 = std::chrono::steady_clock::now();
-            engine.forward(features.data(), head.data());
-            auto t1 = std::chrono::steady_clock::now();
-            times.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        times.reserve(repeats);
+        for (int i = 0; i < repeats; ++i) {
+            auto start = std::chrono::steady_clock::now();
+            engine->forward(features.data(), head.data());
+            times.push_back(elapsed(start));
         }
         std::sort(times.begin(), times.end());
-        std::printf("cpu_engine %dx%d  median %.2f ms  min %.2f ms  p90 %.2f ms\n",
-                    g.full_width, g.full_height, times[times.size() / 2],
-                    times.front(), times[(int)(times.size() * 0.9)]);
-        if (std::getenv("NR_PROFILE")) {
-            const double* p = engine.profile();
-            const double* ap = attn_profile();
+        double median = (times[(repeats - 1) / 2] + times[repeats / 2]) * 0.5;
+        double p90 = times[static_cast<size_t>(std::ceil(repeats * 0.9)) - 1];
+        std::printf("forward only: median %.3f ms  min %.3f ms  p90 %.3f ms  (%d warmup, %d repeats)\n",
+                    median, times.front(), p90, warmup, repeats);
+        if (profile) {
+            const double* p = engine->profile();
             double inv = 1.0 / repeats;
-            std::printf("profile:  gemm %6.2f ms  silu %6.2f ms  attn %6.2f ms "
-                        "(gather %5.2f)  other %6.2f ms\n",
+            std::printf("profile: gemm %.2f  silu %.2f  attn %.2f (gather %.2f)  other %.2f ms\n",
                         p[0] * inv, p[1] * inv, p[2] * inv, p[3] * inv,
-                        times[times.size() / 2] - (p[0] + p[1] + p[2]) * inv);
-            std::printf("attn-core(累加口径): norms %6.2f  scores %6.2f  softmax %6.2f "
-                        " av %6.2f\n", ap[0] * inv, ap[1] * inv, ap[2] * inv, ap[3] * inv);
+                        median - (p[0] + p[1] + p[2]) * inv);
+            if (std::getenv("NR_ATTN_PROFILE")) {
+                const double* ap = attn_profile();
+                std::printf("attn-core accumulated: norms %.2f  scores %.2f  softmax %.2f  av %.2f ms\n",
+                            ap[0] * inv, ap[1] * inv, ap[2] * inv, ap[3] * inv);
+            }
+            std::vector<std::pair<double, std::string>> layers;
+            for (const auto& kv : engine->layer_profile()) layers.emplace_back(kv.second * inv, kv.first);
+            std::sort(layers.rbegin(), layers.rend());
+            std::puts("top layers (block: timings include their child operations):");
+            for (size_t i = 0; i < std::min<size_t>(30, layers.size()); ++i)
+                std::printf("  %7.3f ms  %s\n", layers[i].first, layers[i].second.c_str());
         }
     } else {
-        auto t0 = std::chrono::steady_clock::now();
-        engine.forward(features.data(), head.data());
-        auto t1 = std::chrono::steady_clock::now();
-        FILE* o = std::fopen(out_path.c_str(), "wb");
-        std::fwrite(head.data(), 4, head.size(), o);
-        std::fclose(o);
-        for (const auto& kv : engine.debug()) {
-            std::string path = dump_dir + "/" + kv.first + ".bin";
-            FILE* d = std::fopen(path.c_str(), "wb");
-            std::fwrite(kv.second.data(), 4, kv.second.size(), d);
-            std::fclose(d);
-        }
-        std::printf("wrote %s  forward %.2f ms  blend_scale %.4f\n", out_path.c_str(),
-                    std::chrono::duration<double, std::milli>(t1 - t0).count(),
-                    engine.blend_scale());
+        t0 = std::chrono::steady_clock::now();
+        engine->forward(features.data(), head.data());
+        std::printf("forward (first call, includes scratch/cache initialization): %.3f ms\n", elapsed(t0));
     }
+    if (!out_path.empty()) write_f32(out_path, head);
+    for (const auto& kv : engine->debug())
+        write_f32((fs::u8path(dump_dir) / (kv.first + ".bin")).u8string(), kv.second);
+    std::printf("outside forward: weights+packing %.2f ms  image %.2f ms  features %.2f ms\n",
+                load_ms, image_ms, features_ms);
 
-    // composite + PNG + 统计段(8.4):neural = clamp(proxy + head_rgb/4),
-    // blend = clamp(sigmoid(logit) * blend_scale)。口径同 run_image/run_student。
-    if (!proxy_path.empty()) {
-        const Geometry& gg = engine.geometry();
-        const int vs = engine.valid_size();
-        std::vector<float> proxy((size_t)vs * vs * 3);
-        FILE* pf = std::fopen(proxy_path.c_str(), "rb");
-        if (!pf) { std::fprintf(stderr, "cannot open %s\n", proxy_path.c_str()); return 1; }
-        size_t got = std::fread(proxy.data(), 4, proxy.size(), pf);
-        std::fclose(pf);
-        if (got != proxy.size()) {
-            std::fprintf(stderr, "proxy size mismatch: %zu / %zu\n", got, proxy.size());
-            return 1;
-        }
-        std::vector<uint8_t> rgb((size_t)vs * vs * 3), bw((size_t)vs * vs * 3);
-        double rmin = 0, rmax = 0, rsum = 0, lmin = 0, lmax = 0, bsum = 0;
-        std::vector<double> ctimes;
-        const int creps = bench ? repeats : 1;
-        for (int rep = 0; rep < creps; rep++) {
-        auto c0 = std::chrono::steady_clock::now();
-        rmin = 1e30; rmax = -1e30; rsum = 0.0; lmin = 1e30; lmax = -1e30; bsum = 0.0;
-        for (int y = 0; y < vs; y++) {
-            for (int x = 0; x < vs; x++) {
-                const float* hv = head.data() + ((size_t)y * gg.full_width + x) * 4;
-                for (int c = 0; c < 3; c++) {
-                    double r = hv[c] / 4.0;
-                    double v = proxy[((size_t)y * vs + x) * 3 + c] + r;
-                    v = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
-                    rgb[((size_t)y * vs + x) * 3 + c] = (uint8_t)(v * 255.0 + 0.5);
-                    if (r < rmin) rmin = r;
-                    if (r > rmax) rmax = r;
-                    rsum += r;
-                }
-                double lg = hv[3];
-                double bl = 1.0 / (1.0 + std::exp(-lg)) * engine.blend_scale();
-                bl = bl < 0.0 ? 0.0 : (bl > 1.0 ? 1.0 : bl);
-                uint8_t b = (uint8_t)(bl * 255.0 + 0.5);
-                for (int c = 0; c < 3; c++) bw[((size_t)y * vs + x) * 3 + c] = b;
-                if (lg < lmin) lmin = lg;
-                if (lg > lmax) lmax = lg;
-                bsum += bl;
+    // First-frame composite: neural = clamp(proxy + head_rgb/4). The fourth
+    // channel is the temporal history blend; without history it does not mix proxy back in.
+    if (!proxy.empty()) {
+        t0 = std::chrono::steady_clock::now();
+        std::vector<uint8_t> rgb(proxy.size()), bw(proxy.size());
+        double rmin = 1e30, rmax = -1e30, rsum = 0, lmin = 1e30, lmax = -1e30, bsum = 0;
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+            const float* hv = head.data() + (static_cast<size_t>(y) * g.full_width + x) * 4;
+            size_t offset = (static_cast<size_t>(y) * width + x) * 3;
+            for (int c = 0; c < 3; ++c) {
+                double r = hv[c] / 4.0;
+                double v = std::clamp(proxy[offset + c] + r, 0.0, 1.0);
+                rgb[offset + c] = static_cast<uint8_t>(v * 255.0 + 0.5);
+                rmin = std::min(rmin, r); rmax = std::max(rmax, r); rsum += r;
             }
+            double lg = hv[3];
+            double bl = std::clamp(1.0 / (1.0 + std::exp(-lg)) * engine->blend_scale(), 0.0, 1.0);
+            for (int c = 0; c < 3; ++c) bw[offset + c] = static_cast<uint8_t>(bl * 255.0 + 0.5);
+            lmin = std::min(lmin, lg); lmax = std::max(lmax, lg); bsum += bl;
         }
-        auto c1 = std::chrono::steady_clock::now();
-        if (bench) ctimes.push_back(std::chrono::duration<double, std::milli>(c1 - c0).count());
-        }
-        std::sort(ctimes.begin(), ctimes.end());
-        double cmed = ctimes.empty() ? 0.0 : ctimes[ctimes.size() / 2];
-        double n3 = (double)vs * vs * 3, n1 = (double)vs * vs;
-        std::printf("composite %dx%d  %s%.3f ms: rgb/4 min %+.3f max %+.3f mean %+.3f | "
-                    "blend logit min %+.3f max %+.3f | blend applied mean %.3f\n",
-                    vs, vs, bench ? "median " : "", cmed, rmin, rmax, rsum / n3,
-                    lmin, lmax, bsum / n1);
-        if (!png_path.empty()) {
-            pngw::write_rgb8(png_path, vs, vs, rgb.data());
-            std::printf("wrote %s\n", png_path.c_str());
-        }
-        if (!blend_path.empty()) {
-            pngw::write_rgb8(blend_path, vs, vs, bw.data());
-            std::printf("wrote %s\n", blend_path.c_str());
+        std::printf("composite %.3f ms (outside forward): rgb/4 min %+.3f max %+.3f mean %+.3f | "
+                    "blend logit min %+.3f max %+.3f | blend mean %.3f\n",
+                    elapsed(t0), rmin, rmax, rsum / proxy.size(), lmin, lmax,
+                    bsum / (static_cast<double>(width) * height));
+        if (!png_path.empty()) write_png(png_path, width, height, rgb.data());
+        if (!blend_path.empty()) write_png(blend_path, width, height, bw.data());
+        if (!proxy_png.empty()) {
+            for (size_t i = 0; i < proxy.size(); ++i) rgb[i] = static_cast<uint8_t>(proxy[i] * 255.0 + 0.5);
+            write_png(proxy_png, width, height, rgb.data());
         }
     }
     return 0;
+}
+}  // namespace
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) {
+#else
+int main(int argc, char** argv) {
+#endif
+    try {
+        // Keep benchmark output visible when launched with redirected Windows pipes.
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        std::vector<std::string> args;
+        for (int i = 0; i < argc; ++i) {
+#ifdef _WIN32
+            args.push_back(fs::path(argv[i]).u8string());
+#else
+            args.emplace_back(argv[i]);
+#endif
+        }
+        return run(args);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "cpu_engine: %s\n", e.what());
+        return 1;
+    }
 }

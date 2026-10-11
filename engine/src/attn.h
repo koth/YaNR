@@ -15,12 +15,14 @@
 // (valid[s]=0 的槽不访问、不写);prior/scores: [slots][slots]。
 void attn_window_head(float* qkv, int row_stride, const int* index,
                       const unsigned char* valid, int slots, float scale,
-                      const float* prior, float* scores, float* out, int out_stride);
+                      const float* prior, float* scores, float* out, int out_stride,
+                      const int* output_map = nullptr);
 
 // qkv: [tokens][row_stride] gather 缓冲(可写);scores: [tokens][padded];
 // out: token ti 写到 out + ti*out_stride;scale 含 sqrt(d) 因子(调用方乘好)。
 void attn_vit_head(float* qkv, int row_stride, int tokens, int padded, float scale,
-                   float* scores, float* out, int out_stride);
+                   float* scores, float* out, int out_stride,
+                   const int* output_map = nullptr);
 
 // 核心内部微剖析(norms/scores/softmax/av 累计毫秒;多线程粗累加,只看占比)。
 const double* attn_profile();

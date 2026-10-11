@@ -52,7 +52,7 @@ def main():
     g = geometry_from_valid(size, size)
     proxy = np.asarray(Image.open(args.image).convert('RGB').resize((size, size), Image.LANCZOS),
                        dtype=np.float32) / 255.0
-    tool = os.path.join(args.build, 'cpu_lanes')
+    tool = os.path.join(args.build, 'cpu_lanes.exe' if os.name == 'nt' else 'cpu_lanes')
     if not os.path.exists(tool):
         raise SystemExit(f'build the engine first: {tool} not found')
 
