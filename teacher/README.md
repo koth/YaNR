@@ -196,7 +196,8 @@ A small model distilled from the teacher's head contract: same 16-lane input (Bo
 centred proxy, the reprojected previous output, the conditioning lanes), same composite
 (`clamp(proxy + rgb/4)` + `clamp(sigmoid(logit) · blend_scale)`), **one deterministic feed-forward
 network — not a diffusion model**. Structure, acceptance numbers and the full rationale live in
-[`STUDENT.md`](STUDENT.md), [`report_v2.md`](report_v2.md) (v2.0 acceptance) and
+[`STUDENT.md`](STUDENT.md), [`report_v3.md`](report_v3.md) (v3.0 recipe retrain: teacher-action-weighted
+loss + LR plateau-to-floor, flicker ×1.44), [`report_v2.md`](report_v2.md) (v2.0) and
 [`report_final.md`](report_final.md) (v1.1).
 
 ### Student structure (shipped shape: `shapes/student_moe_v0.json`, v2.0)
