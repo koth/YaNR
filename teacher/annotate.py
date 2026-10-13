@@ -51,23 +51,25 @@ class TeacherAnnotator:
         self.network = Network(self.model, g)
         self.blend_scale = float(self.model.blend_scale())
 
-    def forward(self, features_np):
+    def forward(self, features_np, batch=1):
         """跑一次教师,返回 (head [rows,4] f32 torch, boundaries dict 名->张量)。
 
         2026-10-12:torch.cuda.synchronize()(全设备)改为流本地同步 —— 训练把教师标注
         放预取线程的独立 CUDA 流,与学生前向流水重叠;全设备同步会等满学生内核、
         把重叠打回串行。单流调用(评测等)语义不变。
+        2026-10-13:batch>1 为样本行主序叠放([batch*rows][16]),head/captures 同布局
+        (教师批量,GEMM 全程批量、窗注意力/ViT 批内逐样本;batch=1 逐位不变)。
         """
         features = torch.from_numpy(np.ascontiguousarray(features_np, dtype=np.float32))
         features = features.to(nr_torch.DEVICE)
-        head = self.network.record(features)
+        head = self.network.record(features, batch=batch)
         torch.cuda.current_stream().synchronize()
         return head, self.network.boundaries
 
-    def annotate(self, features_np, capture=()):
+    def annotate(self, features_np, capture=(), batch=1):
         """head f32 numpy + 捕获点激活(原 buffer dtype,通常 f16)。"""
-        head, boundaries = self.forward(features_np)
-        out = {'head': head.float().cpu().numpy().reshape(self.g['full_rows'], 4)}
+        head, boundaries = self.forward(features_np, batch=batch)
+        out = {'head': head.float().cpu().numpy().reshape(-1, 4)}
         for name in capture:
             tensor = boundaries.get(name)
             if tensor is None:

@@ -563,12 +563,10 @@ def main():
           f"{cfg['steps']} steps, device {device}")
     model.train()
     def prep_item(step, bi):
-        """样本全量准备(预取线程):采样/裁剪/退化/块匹配/特征构造/**教师标注**。
+        """样本 CPU 准备(预取线程):采样/裁剪/退化/块匹配/上帧特征构造。
 
-        逐 (step,bi) 独立种子,与执行顺序无关 -> 结果确定;教师实例线程本地、前向走
-        线程本地 CUDA 流,与主循环学生前向/反向流水重叠(2026-10-12 吞吐)。返回
-        dict:feats/proxy/repro/t_head(s×s×4)/t_res(捕获)/t_scale,pair 另有
-        feats_a/prev/t_head_a/t_neural_a。
+        逐 (step,bi) 独立种子,与执行顺序无关 -> 结果确定。教师标注移出本函数
+        (2026-10-13 教师批量):见 prepare_step,整步成批走教师,与学生前向流水重叠。
         """
         item_pair = (cfg['pair_fraction'] > 0 and
                      np.random.default_rng([cfg['seed'], step, 7]).random() < cfg['pair_fraction'])
@@ -578,44 +576,81 @@ def main():
             noise_seed = int(np.random.default_rng([cfg['seed'], step, bi, 2]).integers(1 << 30))
             s = cur_p.shape[0]
             g_s = geo_for(s)
-            teacher_s, stream = teacher_for(s)
             feats_a = build_features(prev_p, g_s, seed_a, lane['style'], lane['tone'],
                                      lane['structure'], lane['skin'], lane['auto_mask'])
-            with torch.cuda.stream(stream) if stream is not None else nullcontext():
-                t_res_a = teacher_s.annotate(feats_a)
-            t_head_a = t_res_a['head'].reshape(
-                g_s['full_height'], g_s['full_width'], 4)[:s, :s]
-            t_neural_a = np.clip(prev_p + t_head_a[..., :3] / 4, 0, 1).astype(np.float32)
-            hist = store_history(t_neural_a)
-            repro_np = reproject_history(hist, motion)
-            features_np = build_features(cur_p, g_s, noise_seed, lane['style'], lane['tone'],
-                                         lane['structure'], lane['skin'], lane['auto_mask'],
-                                         history=repro_np)
-            with torch.cuda.stream(stream) if stream is not None else nullcontext():
-                t_res = teacher_s.annotate(features_np, capture=teacher_caps)
-            t_head = t_res['head'].reshape(
-                g_s['full_height'], g_s['full_width'], 4)[:s, :s]
-            return {'kind': 'pair', 's': s, 'feats': features_np, 'proxy': cur_p,
-                    'repro': repro_np, 't_res': t_res, 't_head': t_head,
-                    't_scale': teacher_s.blend_scale, 'feats_a': feats_a, 'prev': prev_p,
-                    't_head_a': t_head_a, 't_neural_a': t_neural_a}
+            return {'kind': 'pair', 's': s, 'proxy': cur_p, 'prev': prev_p, 'motion': motion,
+                    'lane': lane, 'noise_seed': noise_seed, 'feats_a': feats_a}
         proxy, noise_seed, lane, _ = source.sample(step * cfg['batch'] + bi)
         s = proxy.shape[0]
         g_s = geo_for(s)
-        teacher_s, stream = teacher_for(s)
         features_np = build_features(proxy, g_s, noise_seed, lane['style'], lane['tone'],
                                      lane['structure'], lane['skin'], lane['auto_mask'])
-        with torch.cuda.stream(stream) if stream is not None else nullcontext():
-            t_res = teacher_s.annotate(features_np, capture=teacher_caps)
-        t_head = t_res['head'].reshape(g_s['full_height'], g_s['full_width'], 4)[:s, :s]
-        return {'kind': 'single', 's': s, 'feats': features_np, 'proxy': proxy,
-                'repro': None, 't_res': t_res, 't_head': t_head,
-                't_scale': teacher_s.blend_scale}
+        return {'kind': 'single', 's': s, 'proxy': proxy, 'noise_seed': noise_seed,
+                'lane': lane, 'feats': features_np, 'repro': None}
+
+    def prepare_step(raw_items):
+        """整步教师批量标注(单线程执行器 + 线程本地 CUDA 流,与学生前向流水重叠)。
+
+        2026-10-13 教师批量:教师 GEMM 行主序批量、窗注意力/ViT 批内逐样本(nr_network
+        batch 维)。pair 的历史链:上帧整批标注 -> 逐样本重投影 + 当前帧特征(CPU) ->
+        当前帧整批标注(head + 特征捕获)。按尺寸分桶批处理,桶内顺序 = 输入顺序。
+        返回逐样本 dict(键同旧版,消费者不动)。
+        """
+        def annotate_group(grp, s, key='feats', capture=()):
+            g_s = geo_for(s)
+            teacher_s, stream = teacher_for(s)
+            x = np.stack([p[key] for p in grp]).reshape(-1, 16)
+            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                res = teacher_s.annotate(x, capture=capture, batch=len(grp))
+            return g_s, teacher_s, res
+
+        by_size = {}
+        for p in raw_items:
+            if p['kind'] == 'pair':
+                by_size.setdefault(p['s'], []).append(p)
+        for s, grp in by_size.items():
+            g_s, _, res = annotate_group(grp, s, key='feats_a')    # 上帧整批
+            heads = res['head'].reshape(len(grp), g_s['full_height'], g_s['full_width'], 4)
+            for i, p in enumerate(grp):
+                h = heads[i][:s, :s]
+                t_neural_a = np.clip(p['prev'] + h[..., :3] / 4, 0, 1).astype(np.float32)
+                hist = store_history(t_neural_a)
+                repro_np = reproject_history(hist, p['motion'])
+                p['repro'] = repro_np
+                p['t_head_a'] = h
+                p['t_neural_a'] = t_neural_a
+                p['feats'] = build_features(p['proxy'], g_s, p['noise_seed'], p['lane']['style'],
+                                            p['lane']['tone'], p['lane']['structure'],
+                                            p['lane']['skin'], p['lane']['auto_mask'],
+                                            history=repro_np)
+
+        out = []
+        by_size = {}
+        for p in raw_items:
+            by_size.setdefault(p['s'], []).append(p)
+        for s, grp in by_size.items():
+            g_s, teacher_s, res = annotate_group(grp, s, capture=teacher_caps)   # 当前帧整批
+            heads = res['head'].reshape(len(grp), g_s['full_height'], g_s['full_width'], 4)
+            for i, p in enumerate(grp):
+                p['t_head'] = heads[i][:s, :s]
+                p['t_scale'] = teacher_s.blend_scale
+                per = {}
+                for name in teacher_caps:
+                    arr = res[name]
+                    n = arr.shape[0] // len(grp)
+                    per[name] = arr[i * n:(i + 1) * n]
+                p['t_res'] = per
+                out.append(p)
+        return out
 
     # 批内并行准备(2026-10-10):prep_item 是 (step,bi) 独立种子的纯函数,4 线程并行算、
     # 按 (step,bi) 顺序取回 -> 训练语义与串行版逐位一致;GPU 利用率 45% -> 75%+。
+    # 2026-10-13 教师批量:CPU 原料与教师标注分两段 —— 教师段整步成批(单线程执行器,
+    # 线程本地实例/流),与上/下一步的学生计算流水重叠;实例 2 套(320/512)而非 6 套。
     prep_pool = ThreadPoolExecutor(max_workers=4)
+    teach_pool = ThreadPoolExecutor(max_workers=1)
     prep_futs = deque()
+    step_futs = deque()
     prep_lock = threading.Lock()
     prep_seq = {'step': start, 'bi': 0}
 
@@ -630,9 +665,18 @@ def main():
         prep_futs.append(prep_pool.submit(prep_item, s_, b_))
         return True
 
+    def _collect_raw():
+        """取回一步的 CPU 原料并补交预取;返回原料列表(顺序 = (step,bi) 序)。"""
+        raw = []
+        for _ in range(cfg['batch']):
+            raw.append(prep_futs.popleft().result())
+            _prep_submit()
+        return raw
+
     for _ in range(8):
         if not _prep_submit():
             break
+    step_futs.append(teach_pool.submit(prepare_step, _collect_raw()))
 
     for step in range(start, cfg['steps']):
         lr = lr_at(step, cfg)
@@ -644,11 +688,11 @@ def main():
         feat_detail_acc = {}
         psnrs = []
         optim.zero_grad()
-        # ---- 批内取回已备样本(预取线程已含教师标注,与学生前向流水重叠)。
-        prepared = []
-        for bi in range(cfg['batch']):
-            prepared.append(prep_futs.popleft().result())       # 按序取回,保确定性
-            _prep_submit()
+        # ---- 取回本步已备样本(教师批量段在上一步末尾提交,与上一步学生计算重叠),
+        # 并把下一步的教师段压进流水(与本步学生计算重叠;末步不预取,防越界取料)。
+        prepared = step_futs.popleft().result()
+        if step + 1 < cfg['steps']:
+            step_futs.append(teach_pool.submit(prepare_step, _collect_raw()))
 
         # ---- 按 (边长, 模式) 分桶 + rows 预算切块,桶内真 batch 前向(2026-10-12 吞吐改造)。
         # 模型前向接受 batch 维行主序叠放(nr_student batch=1 与逐样本逐位一致;批量=逐样本

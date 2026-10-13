@@ -150,39 +150,63 @@ class Network:
     # The elementwise kernels (shaders/ops.wgsl).
     # ------------------------------------------------------------------------------------------------
 
-    def downsample(self, in_f16, channels, in_w, in_h, out_w, out_h):
-        """The 2x2 box pool: three half adds as (a+b)+(c+d), one half multiply by 0.25, E4M3 publication."""
-        x = in_f16.view(in_h, in_w, channels)
+    def downsample(self, in_f16, channels, in_w, in_h, out_w, out_h, batch=1):
+        """The 2x2 box pool: three half adds as (a+b)+(c+d), one half multiply by 0.25, E4M3 publication.
+        batch>1(2026-10-13 教师批量):样本行主序叠放;batch=1 原路径逐位不变。"""
         sx = (torch.arange(out_w, device=DEVICE) * 2).clamp(max=max(in_w - 1, 0))
         sy = (torch.arange(out_h, device=DEVICE) * 2).clamp(max=max(in_h - 1, 0))
         sx1 = (sx + 1).clamp(max=in_w - 1)
         sy1 = (sy + 1).clamp(max=in_h - 1)
         valid = ((sx + 1 < in_w).view(1, -1)) & ((sy + 1 < in_h).view(-1, 1))
-
+        if batch > 1:
+            x = in_f16.view(batch, in_h, in_w, channels)
+            top = x[:, sy][:, :, sx] + x[:, sy][:, :, sx1]
+            bottom = x[:, sy1][:, :, sx] + x[:, sy1][:, :, sx1]
+            values = ((top + bottom) * 0.25).to(torch.float16)
+            values = torch.where(valid.view(1, out_h, out_w, 1), values, torch.zeros_like(values))
+            return fp8_quant(values.reshape(-1, channels))
+        x = in_f16.view(in_h, in_w, channels)
         top = x[sy][:, sx] + x[sy][:, sx1]
         bottom = x[sy1][:, sx] + x[sy1][:, sx1]
         values = ((top + bottom) * 0.25).to(torch.float16)
         values = torch.where(valid.unsqueeze(-1), values, torch.zeros_like(values))
         return fp8_quant(values.reshape(-1, channels))
 
-    def upsample_residual(self, in_f16, skip_e4, aux, channels, in_w, in_h, out_w, out_h, dual=False):
+    def upsample_residual(self, in_f16, skip_e4, aux, channels, in_w, in_h, out_w, out_h, dual=False,
+                          batch=1):
         """The decoder entry: the level below, doubled, plus the encoder skip times a learned scale. The
         residual product is not published before the add - the whole expression rounds once."""
-        base = in_f16.view(in_h, in_w, channels)
         src_y = (torch.arange(out_h, device=DEVICE) >> 1).clamp(max=in_h - 1)
         src_x = (torch.arange(out_w, device=DEVICE) >> 1).clamp(max=in_w - 1)
+        if batch > 1:
+            base = in_f16.view(batch, in_h, in_w, channels)
+            low = base[:, src_y][:, :, src_x]
+            skip = skip_e4.view(batch, out_h, out_w, channels)
+            values = (low.float() + skip.float() * aux.view(1, 1, 1, -1).float()).to(torch.float16)
+            flat = values.reshape(-1, channels)
+            return fp8_quant(flat), (flat if dual else None)
+        base = in_f16.view(in_h, in_w, channels)
         low = base[src_y][:, src_x]
         skip = skip_e4.view(out_h, out_w, channels)
         values = (low.float() + skip.float() * aux.view(1, 1, -1).float()).to(torch.float16)
         flat = values.reshape(-1, channels)
         return fp8_quant(flat), (flat if dual else None)
 
-    def post_blend(self, in_e4, skip_e4, aux_pair, channels, in_w, in_h, out_w, out_h):
+    def post_blend(self, in_e4, skip_e4, aux_pair, channels, in_w, in_h, out_w, out_h, batch=1):
         """The last merge before block 70: the level-0 decoder output doubled and scaled, plus block 0's
         own output scaled. The first product is published to half, the second is folded into the rounding."""
-        base = in_e4.view(in_h, in_w, channels)
         src_y = (torch.arange(out_h, device=DEVICE) >> 1).clamp(max=in_h - 1)
         src_x = (torch.arange(out_w, device=DEVICE) >> 1).clamp(max=in_w - 1)
+        if batch > 1:
+            base = in_e4.view(batch, in_h, in_w, channels)
+            low = base[:, src_y][:, :, src_x]
+            skip = skip_e4.view(batch, out_h, out_w, channels)
+            upsampled = round_f16_t(low.float() * aux_pair[0].view(1, 1, 1, -1).float())
+            values = (upsampled.float()
+                      + skip.float() * aux_pair[1].view(1, 1, 1, -1).float()).to(torch.float16)
+            flat = values.reshape(-1, channels)
+            return fp8_quant(flat), flat
+        base = in_e4.view(in_h, in_w, channels)
         low = base[src_y][:, src_x]
         skip = skip_e4.view(out_h, out_w, channels)
         upsampled = round_f16_t(low.float() * aux_pair[0].view(1, 1, -1).float())
@@ -223,8 +247,18 @@ class Network:
         odd = ((pairs[..., 1:2] + pairs[..., 3:4]) + pairs[..., 5:6]) + pairs[..., 7:8]
         return (even + odd).squeeze(-1)
 
-    def window_attention(self, qkv, prior, scales, width, height, heads, phase):
-        """One shifted-window attention; the cosine normalization is part of it, off the raw qkv."""
+    def window_attention(self, qkv, prior, scales, width, height, heads, phase, batch=1):
+        """One shifted-window attention; the cosine normalization is part of it, off the raw qkv.
+
+        batch>1(2026-10-13 教师批量):窗注意力 kernel 按 (width,height) 内部编窗,批内逐样本
+        调用(kernel 本体未改),输出行主序拼回;GEMM 全程批量。batch=1 原路径逐位不变。
+        """
+        if batch > 1:
+            rows_one = width * height
+            outs = [self.window_attention(qkv[b * rows_one:(b + 1) * rows_one], prior, scales,
+                                          width, height, heads, phase)
+                    for b in range(batch)]
+            return torch.cat(outs, 0)
         rows = width * height
         shift_x, shift_y = window_phase(phase)
         windows_x = (width + shift_x + 7) // 8
@@ -367,7 +401,7 @@ class Network:
         }
 
     def block(self, block, channels, width, height, layout, tensor, state,
-              out_e4=True, out_half=False, ffn_skip_override=None, phase=None):
+              out_e4=True, out_half=False, ffn_skip_override=None, phase=None, batch=1):
         """FFN -> QKV -> window attention -> projection, with the two scaled skips."""
         model = self.model
         residual = ffn_skip_override if ffn_skip_override is not None else state
@@ -398,7 +432,7 @@ class Network:
                 attended = self.window_attention(
                     qkv, model.relative_bias(tensor, layout['relative'], layout['heads']),
                     model.head_scales(tensor, layout['scale'], layout['heads']),
-                    width, height, layout['heads'], phase)
+                    width, height, layout['heads'], phase, batch)
                 return self.gemm(
                     attended, model.fp8_matrix(tensor, layout['projection'], channels, channels),
                     k=channels, n=channels, residual=ffn_quantized,
@@ -429,7 +463,7 @@ class Network:
             attended = self.window_attention(
                 qkv, model.relative_bias(tensor, layout['relative'], layout['heads']),
                 model.head_scales(tensor, layout['scale'], layout['heads']),
-                width, height, layout['heads'], phase)
+                width, height, layout['heads'], phase, batch)
             return self.gemm(
                 attended, model.fp8_matrix(tensor, layout['projection'], channels, channels),
                 k=channels, n=channels, residual=ffn_residual,
@@ -449,7 +483,7 @@ class Network:
         attended = self.window_attention(
             qkv, model.relative_bias(tensor, layout['relative'], layout['heads']),
             model.head_scales(tensor, layout['scale'], layout['heads']),
-            width, height, layout['heads'], phase)
+            width, height, layout['heads'], phase, batch)
 
         return self.gemm(
             attended, model.fp8_matrix(tensor, layout['projection'], channels, channels),
@@ -458,7 +492,8 @@ class Network:
             aux=self.np16(model.aux_vector(tensor, layout['attn_cos_skip'], channels)),
             e4=out_e4, half=out_half)
 
-    def split_block(self, block, width, height, state, out_e4=True, out_half=False, phase=None):
+    def split_block(self, block, width, height, state, out_e4=True, out_half=False, phase=None,
+                    batch=1):
         """The 512 stage: eight independent 64-wide branches widened to 256 and back, over one 512 -> 512."""
         model = self.model
         channels, branches, branch_channels, middle_channels, heads = 512, 8, 64, 256, 16
@@ -489,7 +524,7 @@ class Network:
                            k=channels, n=channels * 3, e4=False, half=True)
         attended = self.window_attention(
             qkv, model.relative_bias(qkv_tensor, qkv_relative, heads),
-            model.head_scales(qkv_tensor, qkv_scale, heads), width, height, heads, phase)
+            model.head_scales(qkv_tensor, qkv_scale, heads), width, height, heads, phase, batch)
         return self.gemm(
             attended, model.fp8_matrix(projection, 0, channels, channels),
             k=channels, n=channels, residual=ffn_residual,
@@ -541,7 +576,9 @@ class Network:
     # The whole network. `features` is f32 [fullRows][16]; the head is f32 [fullRows][4].
     # ------------------------------------------------------------------------------------------------
 
-    def record(self, features):
+    def record(self, features, batch=1):
+        """features f32 [rows][16] 行主序;batch>1 时为样本行主序叠放([batch*rows][16]),
+        输出同布局 [batch*rows][4](2026-10-13 教师批量;batch=1 原路径逐位不变)。"""
         self.phases = WindowPhases()
         self.boundaries = {}
         g = self.g
@@ -559,26 +596,28 @@ class Network:
                                                    e4=True, half=True)
         block0, block0_raw = self.block(
             0, 32, g['full_width'], g['full_height'], pre_layout, pre_tensor, adapter_e4,
-            out_e4=True, out_half=True, ffn_skip_override=adapter_f16, phase=self.phases.take(6))
+            out_e4=True, out_half=True, ffn_skip_override=adapter_f16, phase=self.phases.take(6),
+            batch=batch)
         self.capture('block-0', block0)
 
         # ---- Down to level 0 and the four 32-channel blocks there.
         state = self.downsample(block0_raw, 32, g['full_width'], g['full_height'],
-                                d0['width'], d0['height'])
+                                d0['width'], d0['height'], batch=batch)
         self.capture('transition-0-1', state)
         level0_raw = None
         layout0 = fused_layout(32)
         for block in range(1, 5):
             state, raw = self.block(
                 block, 32, d0['width'], d0['height'], layout0, model.tensor(block), state,
-                out_e4=True, out_half=block == 4, phase=self.phases.take(0))
+                out_e4=True, out_half=block == 4, phase=self.phases.take(0), batch=batch)
             if block == 4:
                 level0_raw = raw
             self.capture(f'block-{block}', state)
         skip32 = state
 
         # ---- Encoder stages 64 / 128 / 256, each ending in a pool and a widening transition.
-        pooled32 = self.downsample(level0_raw, 32, d0['width'], d0['height'], d1['width'], d1['height'])
+        pooled32 = self.downsample(level0_raw, 32, d0['width'], d0['height'], d1['width'], d1['height'],
+                                   batch=batch)
         self.capture('pooled-4-5', pooled32)
         stage_input, _ = self.gemm(
             pooled32, model.fp8_matrix(model.tensor(4), layout0['end_without_padding'], 32, 64),
@@ -599,14 +638,14 @@ class Network:
                 st, r = self.block(
                     block, stage['channels'], stage['level']['width'], stage['level']['height'],
                     layout, model.tensor(block), st, out_e4=True, out_half=block == stage['last'],
-                    phase=self.phases.take(stage['level_index']))
+                    phase=self.phases.take(stage['level_index']), batch=batch)
                 if block == stage['last']:
                     raw = r
                 self.capture(f'block-{block}', st)
             skips.append(st)
             pooled = self.downsample(raw, stage['channels'], stage['level']['width'],
                                      stage['level']['height'], stage['next']['width'],
-                                     stage['next']['height'])
+                                     stage['next']['height'], batch=batch)
             self.capture(f"pooled-{stage['last']}-{stage['last'] + 1}", pooled)
             stage_input, _ = self.gemm(
                 pooled, model.fp8_matrix(model.tensor(stage['last']), layout['end_without_padding'],
@@ -620,27 +659,44 @@ class Network:
         raw = None
         for block in range(23, 31):
             st, r = self.split_block(block, d4['width'], d4['height'], st, out_e4=True,
-                                     out_half=block == 30, phase=self.phases.take(4))
+                                     out_half=block == 30, phase=self.phases.take(4), batch=batch)
             if block == 30:
                 raw = r
             self.capture(f'block-{block}', st)
         skip512 = st
         tokens = g['vit_tokens']
-        pooled = self.downsample(raw, 512, d4['width'], d4['height'], d5['width'], d5['height'])
+        pooled = self.downsample(raw, 512, d4['width'], d4['height'], d5['width'], d5['height'],
+                                 batch=batch)
         vit_state, _ = self.gemm(pooled, model.fp8_matrix(model.tensor(30, 4), 0, 512, 1024),
                                  k=512, n=1024)
-        vit_state = self.vit(vit_state, tokens)
+        if batch > 1:
+            # ViT 逐样本跑;其 capture 写在循环体里,会被后一样本覆盖 —— 逐样本暂存后
+            # 按样本堆回(2026-10-13:否则特征损失拿到末样本形状,rows 对不上)。
+            per_sample = vit_state.view(batch, tokens, -1)
+            outs = []
+            stash = {}
+            for b in range(batch):
+                outs.append(self.vit(per_sample[b], tokens))
+                for nm in [f'block-{n}' for n in range(31, 39)]:
+                    got = self.boundaries.pop(nm, None)
+                    if got is not None:
+                        stash.setdefault(nm, []).append(got)
+            for nm, parts in stash.items():
+                self.boundaries[nm] = torch.cat(parts, 0)
+            vit_state = torch.cat(outs, 0)
+        else:
+            vit_state = self.vit(vit_state, tokens)
 
         # ---- Decoder 512: the ViT output projected, doubled, and merged onto the encoder skip.
         _, projected = self.gemm(vit_state, model.fp8_matrix(model.tensor(39), 0, 1024, 512),
                                  k=1024, n=512, partition=256, e4=False, half=True)
         dst = self.upsample_residual(
             projected, skip512, self.np16(model.aux_vector(model.tensor(39), 1024 * 512, 512)),
-            512, d5['width'], d5['height'], d4['width'], d4['height'])[0]
+            512, d5['width'], d5['height'], d4['width'], d4['height'], batch=batch)[0]
         self.capture('block-39', dst)
         for block in range(40, 48):
             dst, _ = self.split_block(block, d4['width'], d4['height'], dst, out_e4=True,
-                                      phase=self.phases.take(4))
+                                      phase=self.phases.take(4), batch=batch)
             self.capture(f'block-{block}', dst)
 
         # ---- Decoder stages 256 / 128 / 64 / 32.
@@ -667,14 +723,14 @@ class Network:
                 projection, stage['skip'],
                 self.np16(model.aux_vector(transition, layout['transition_scale'], channels)),
                 channels, stage['low']['width'], stage['low']['height'],
-                stage['high']['width'], stage['high']['height'], dual=channels == 32)
+                stage['high']['width'], stage['high']['height'], dual=channels == 32, batch=batch)
             for block in range(stage['first'], stage['last'] + 1):
                 st, _ = self.block(
                     block, channels, stage['high']['width'], stage['high']['height'],
                     layout if block == stage['first'] else fused_layout(channels),
                     model.tensor(block), st, out_e4=True,
                     ffn_skip_override=merged_raw if block == stage['first'] else None,
-                    phase=self.phases.take(stage['level_index']))
+                    phase=self.phases.take(stage['level_index']), batch=batch)
                 self.capture(f'block-{block}', st)
             dst = st
 
@@ -685,10 +741,12 @@ class Network:
             raise ValueError('unexpected block 70 layout')
         aux_pair = self.np16(model.aux_pair(tensor, layout['input_scale'], layout['adapter_scale'], 32))
         merged, merged_raw = self.post_blend(
-            dst, block0, aux_pair, 32, d0['width'], d0['height'], g['full_width'], g['full_height'])
+            dst, block0, aux_pair, 32, d0['width'], d0['height'], g['full_width'], g['full_height'],
+            batch=batch)
         _, block_raw = self.block(
             70, 32, g['full_width'], g['full_height'], layout, tensor, merged,
-            out_e4=False, out_half=True, ffn_skip_override=merged_raw, phase=self.phases.take(6))
+            out_e4=False, out_half=True, ffn_skip_override=merged_raw, phase=self.phases.take(6),
+            batch=batch)
         head_w = model.f16_matrix(tensor, layout['post_weights'], 32, 4)
         _, _, head = self.gemm_f16(block_raw, head_w, 32, 4, e4=False, half=False, f32=True)
         return head
