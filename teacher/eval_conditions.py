@@ -69,6 +69,8 @@ def sweep_plan(base_style):
         plan.append((f'skin={skin}+am', dict(style=base_style, skin=skin, automask=True)))
     plan.append(('all-min', dict(style=0.0, tone=0.0, structure=0.0, skin=0.0)))
     plan.append(('all-max', dict(style=127.0, tone=1.0, structure=1.0, skin=1.0)))
+    plan.append(('fixed64', dict(style=64.0, tone=1.0, structure=1.0, skin=1.0,
+                                 automask=True)))      # 2026-10-13 固定旋钮配方的工作点
     return plan
 
 

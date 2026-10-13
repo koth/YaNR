@@ -74,7 +74,8 @@ DEFAULTS = {
     'style_range': [0.0, 127.0], 'tone_range': [0.0, 1.0], 'structure_range': [0.0, 1.0],
     # v1.2 条件全覆盖(2026-10-10):style 是 ID(lane = ID/128,真实量程 [0,1));
     # v1.1 只采 [0,3] -> lane ≤0.023,导致高档失控(见 eval_conditions 探针)。
-    'automask_prob': 0.3,        # automask 开时 skin ~ U[0,1](lane 13/14 分支),关时 skin=-1
+    'automask_prob': 0.3,        # automask 开时 skin ~ skin_range(lane 13/14 分支),关时 skin=-1
+    'skin_range': [0.0, 1.0],    # skin 采样区间(置 [1,1] 即钉死 skin=1;2026-10-13 固定旋钮配方)
     'comet_project': 'dlss-student', 'comet_workspace': None, 'comet_key': None,
 }
 
@@ -201,7 +202,7 @@ class FrameSource:
             'style': float(rng.uniform(*self.cfg['style_range'])),
             'tone': float(rng.uniform(*self.cfg['tone_range'])),
             'structure': float(rng.uniform(*self.cfg['structure_range'])),
-            'skin': float(rng.uniform(0.0, 1.0)) if auto_mask else -1.0,
+            'skin': float(rng.uniform(*self.cfg.get('skin_range', (0.0, 1.0)))) if auto_mask else -1.0,
             'auto_mask': auto_mask,
         }
         noise_seed = int(rng.integers(1 << 30))
@@ -246,7 +247,7 @@ class FrameSource:
             'style': float(rng.uniform(*self.cfg['style_range'])),
             'tone': float(rng.uniform(*self.cfg['tone_range'])),
             'structure': float(rng.uniform(*self.cfg['structure_range'])),
-            'skin': float(rng.uniform(0.0, 1.0)) if auto_mask else -1.0,
+            'skin': float(rng.uniform(*self.cfg.get('skin_range', (0.0, 1.0)))) if auto_mask else -1.0,
             'auto_mask': auto_mask,
         }
         return prev_p, cur_p, motion, lane, path_cur
