@@ -47,6 +47,89 @@ engine/build/Release/cpu_engine.exe photo.jpg --width 512 --height 320 -o out/ph
 缩放使用 WIC Fant，与 Python 工具的 PIL Lanczos 缩放结果可能不同。
 Linux 上仍可使用发布包 + `--features` 或原有 `.idx` 接口，图片入口目前仅支持 Windows。
 
+## Windows GPU 加速（NVIDIA CUDA）
+
+`NR_CUDA=ON` 添加原生 CUDA / cuBLAS 后端，支持 `ffn`、`expert`、`split`、`moe`
+和 ViT / MoE ViT，可直接加载现有 `student_mixed`、`student_moe_v0` 权重包或 `.idx`。
+不需要 Python、PyTorch、ONNX 或额外的权重导出。CUDA 为可选依赖，默认 CPU 构建不需要它。
+
+安装 NVIDIA 驱动、CUDA Toolkit、Visual Studio C++ 工具链和 CMake（至少 3.18）。
+在 **x64 Native Tools Command Prompt for VS 2022** 中进入仓库根目录执行：
+
+```bat
+cmake -S engine -B engine/build-cuda -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release -DNR_CUDA=ON
+cmake --build engine/build-cuda --target gpu_engine cpu_engine
+```
+
+本机 CUDA 12.4 / MSVC 14.38 / RTX 3080 已验证。若使用同样的安装位置，可先在 CMD 执行
+`"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.38`。
+Toolkit 不在默认位置时，配置命令加上 `-DCUDAToolkit_ROOT=D:/CUDA/v12.4`
+和 `-DCMAKE_CUDA_COMPILER=D:/CUDA/v12.4/bin/nvcc.exe`。
+默认生成 75 / 86 架构；只为本机 RTX 3080 构建可加 `-DCMAKE_CUDA_ARCHITECTURES=86`。
+安装了 CUDA 的 VS 集成组件时，也可以使用 Visual Studio 生成器和 `--config Release`；
+这种情况下可执行文件在 `engine/build-cuda/Release/`。
+
+运行时需让 CUDA Toolkit 的 `bin` 目录位于 `PATH`（cuBLAS / CUDA runtime DLL）：
+
+```powershell
+engine/build-cuda/gpu_engine.exe photo.jpg --weights weights/student_moe_v0 `
+    --style 1.5 --size 512 -o out/photo_gpu.png
+
+engine/build-cuda/gpu_engine.exe teacher/samples/lake.png --weights weights/student_moe_v0 `
+    --size 512 --bench --warmup 10 --repeats 50 -o out/lake_gpu.png
+
+# 同一入口显式选后端；选择第 0 张 CUDA 显卡
+engine/build-cuda/cpu_engine.exe photo.jpg --backend cuda --device 0 `
+    --weights weights/student_moe_v0 -o out/photo_gpu.png
+```
+
+`gpu_engine` 默认 CUDA，`cpu_engine` 默认 CPU；两个入口共用图片、条件参数和 PNG 管线。
+没有编译 CUDA 时请求 `--backend cuda` 会报告构建提示。CUDA 初始化失败会报告错误。
+当前是 NVIDIA CUDA 支持，AMD / Intel 显卡使用 CPU 后端。
+
+GPU 前向采用 FP32 cuBLAS GEMM、GPU LayerNorm/窗口池化、稳定排序的配额平衡路由、
+按专家分组的 batched GEMM，以及融合的余弦窗口/全局注意力和残差算子。
+窗口的 query 掩码、边界零填充、旧 expert-major reshape 及 static-image composite 语义沿用 CPU。
+TF32 关闭，保持路由和输出精度；`NR_INT8` / `NR_PROFILE` 是 CPU 专用，CUDA 入口遇到它们会提示移除。
+当前窗口边长支持 1..8，ViT padding token 上限 8192，路由通道上限 1024；
+大图片还需足够的显存。
+
+权重、输入和 scratch 驻留显存；预热后用 CUDA Graph 回放，前向没有路由回传或动态分配。
+`--bench` 用同步的 CUDA event 报告全网络前向 median/min/p90，包含路由与所有网络算子，
+排除 H2D/D2H、图片、lane、composite、PNG、CUDA 初始化和 Graph 构建。
+H2D/D2H 单独报告；整个图片处理的耗时还需加上这些步骤。
+`--dump-dir` 切换到逐步执行并转储与 CPU 相同的中间量，诊断模式不用于测速。
+
+数值校验使用 uv 创建的现有 `.venv`，仅需要 CPU 版 PyTorch 作参考：
+
+```powershell
+$env:OMP_NUM_THREADS = '8'
+.venv/Scripts/python.exe teacher/check_gpu.py --build engine/build-cuda --cpu-build engine/build/Release
+```
+
+两种真实权重的 320×320、512×512、320×512 和 137×201 均通过逐层 CPU / CUDA
+及 PyTorch head 对账，包含 style 0、1.5、3/127。最大 head 误差不超过 `1.8e-5`
+（阈值 `2e-3`）；CUDA eager 与 Graph 回放、独立重复运行的 head 逐位一致。
+CUDA Compute Sanitizer 的 MoE 320×320 内存检查与线程竞争检查均通过（0 errors / 0 hazards）。
+
+### CUDA 前向 benchmark
+
+2026-10-13 本机实测：RTX 3080 10GB、NVIDIA 驱动 566.36、CUDA 12.4、MSVC Release；
+CPU 对照为 i9-10900K / AVX2 / 8 个 OpenMP 线程。输入 `teacher/samples/lake.png`，
+style 0、tone/structure 0.5、seed 12345，两种后端均预热 10 次、测量 50 次。
+Windows 桌面应用在运行，GPU 承担显示任务，后台负载会影响结果。
+
+| 权重 | 有效尺寸 | 实际 field | CPU median | GPU median | GPU p90 | 前向加速 |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| `student_mixed` | 320×320 | 320×320 | 28.143 ms | 4.923 ms | 5.766 ms | 5.7× |
+| `student_mixed` | 512×512 | 576×512 | 80.180 ms | 11.177 ms | 11.629 ms | 7.2× |
+| `student_moe_v0` | 320×320 | 320×320 | 84.497 ms | 8.374 ms | 8.818 ms | 10.1× |
+| `student_moe_v0` | 512×512 | 576×512 | 228.584 ms | 17.276 ms | 17.965 ms | 13.2× |
+
+MoE 的 320 / 512 H2D 输入约 1.31 / 3.29 ms，D2H head 约 0.34 / 0.75 ms，
+均在上表前向时间之外。CUDA 上下文与权重上传也另计；反复启动进程会重复加载。
+目前所有前向算子都是 FP32，以上结果没有采用 FP16 或 TF32 近似。
+
 ## 前向计时
 
 `--bench` 仅对 `Engine::forward(features, head)` 计时，报告 median、min、p90。

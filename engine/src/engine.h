@@ -57,8 +57,8 @@ struct Wq {
 
 class Engine {
 public:
-    explicit Engine(const std::string& idx_path);   // loads <idx> + sibling .bin
-    Engine(const std::string& package_dir, int width, int height); // manifest + shape + stages
+    explicit Engine(const std::string& idx_path, bool cpu_pack = true);   // loads <idx> + sibling .bin
+    Engine(const std::string& package_dir, int width, int height, bool cpu_pack = true);
     ~Engine();
 
     // features: [full_rows][16] -> head: [full_rows][4]
@@ -83,6 +83,7 @@ public:
     const std::vector<BlockCfg>& dec_blocks(const std::string& level) const;
 
 private:
+    friend class CudaEngine;
     void pack_weights();
     const Tensor& t(const std::string& name) const;
     const float* w(const std::string& name) const { return t(name).data; }

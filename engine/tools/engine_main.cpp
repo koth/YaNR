@@ -20,17 +20,26 @@
 #include "png_write.h"
 #include "attn.h"
 #include "image_read.h"
+#ifdef NR_HAS_CUDA
+#include "engine_cuda.h"
+#endif
 
 namespace fs = std::filesystem;
+#ifdef NR_DEFAULT_CUDA
+#define NR_CLI_NAME "gpu_engine"
+#else
+#define NR_CLI_NAME "cpu_engine"
+#endif
 namespace {
 void usage() {
     std::puts(
-        "usage: cpu_engine IMAGE [--weights weights/student_mixed] [--png OUTPUT.png]\n"
+        "usage: " NR_CLI_NAME " IMAGE [--weights weights/student_mixed] [--png OUTPUT.png]\n"
         "                  [--size N | --width W --height H] [--bench] [--repeats 30]\n"
         "                  [--warmup 5] [--threads 8] [--seed 12345] [--style 0..127]\n"
         "                  [--tone 0.5] [--structure 0.5] [--skin -1] [--automask]\n"
         "                  [--blend-png blend.png] [--proxy-png proxy.png]\n"
-        "       cpu_engine --idx MODEL.idx --features INPUT.bin [--out HEAD.bin | --bench]\n"
+        "                  [--backend cpu|cuda] [--device 0]\n"
+        "       " NR_CLI_NAME " --idx MODEL.idx --features INPUT.bin [--out HEAD.bin | --bench]\n"
         "                  [--proxy PROXY.bin --png OUTPUT.png] [--dump-dir DIR]\n"
         "Image size defaults to the input size. -o aliases --png; --out writes raw f32 head.\n"
         "Threads default to OMP_NUM_THREADS when set, otherwise 8.\n"
@@ -39,9 +48,14 @@ void usage() {
         "--tone/--structure control lanes directly; --skin is used only with --automask.\n"
         "With --features, lane options are ignored because the input lanes are prebuilt.\n"
         "--weights can also be combined with --features (default size 512x512).\n"
-        "Benchmark times only Engine::forward after warmup, without image/lane/I/O work.\n"
+        "Benchmark times only the network forward after warmup, without image/lane/I/O work.\n"
         "NR_INT8=1 enables mixed int8; NR_VNNI=0 disables VNNI auto-dispatch;\n"
         "NR_PROFILE=1 enables diagnostic profiling.");
+#ifdef NR_HAS_CUDA
+    std::puts("CUDA is available: gpu_engine defaults to CUDA; cpu_engine defaults to CPU.\n"
+              "CUDA benchmarks use resident inputs and CUDA events; transfers are reported separately.\n"
+              "CUDA uses FP32 (TF32 disabled); NR_INT8/NR_PROFILE are CPU-only.");
+#endif
 }
 int integer(const std::string& text, int low, int high) {
     size_t end;
@@ -87,6 +101,12 @@ int run(const std::vector<std::string>& args) {
     std::string proxy_path, png_path, blend_path, proxy_png, dump_features;
     int repeats = 30, warmup = 5, threads = 0, width = 0, height = 0;
     bool bench = false;
+    int device = 0;
+#ifdef NR_DEFAULT_CUDA
+    std::string backend = "cuda";
+#else
+    std::string backend = "cpu";
+#endif
     LaneParams lanes;
     lanes.seed = 12345;
     for (size_t i = 1; i < args.size(); ++i) {
@@ -108,6 +128,8 @@ int run(const std::vector<std::string>& args) {
         else if (a == "--blend-png") blend_path = next();
         else if (a == "--proxy-png") proxy_png = next();
         else if (a == "--bench") bench = true;
+        else if (a == "--backend") backend = next();
+        else if (a == "--device") device = integer(next(), 0, 255);
         else if (a == "--repeats") repeats = integer(next(), 1, 10000);
         else if (a == "--warmup") warmup = integer(next(), 1, 10000);
         else if (a == "--threads") threads = integer(next(), 1, 256);
@@ -133,6 +155,13 @@ int run(const std::vector<std::string>& args) {
         else throw std::runtime_error("unknown argument: " + a);
     }
     if (args.size() == 1) { usage(); return 2; }
+    if (backend != "cpu" && backend != "cuda") throw std::runtime_error("--backend must be cpu or cuda");
+    const bool use_cuda = backend == "cuda";
+#ifndef NR_HAS_CUDA
+    if (use_cuda) throw std::runtime_error("CUDA was not built; configure with -DNR_CUDA=ON");
+#endif
+    if (use_cuda && (std::getenv("NR_INT8") || std::getenv("NR_PROFILE")))
+        throw std::runtime_error("NR_INT8/NR_PROFILE are CPU-only; unset them for CUDA inference");
     if ((!image_path.empty()) == (!feat_path.empty())) throw std::runtime_error("specify one of IMAGE or --features");
     if (!idx_path.empty() && !weights_path.empty()) throw std::runtime_error("specify one of --idx or --weights");
     if (bench && !dump_dir.empty()) throw std::runtime_error("--dump-dir copies tensors; run it separately from --bench");
@@ -145,7 +174,7 @@ int run(const std::vector<std::string>& args) {
 
     std::unique_ptr<Engine> engine;
     auto t0 = std::chrono::steady_clock::now();
-    if (!idx_path.empty()) engine = std::make_unique<Engine>(idx_path);
+    if (!idx_path.empty()) engine = std::make_unique<Engine>(idx_path, !use_cuda);
     double load_ms = elapsed(t0);
     if (engine && !image_path.empty()) {
         width = engine->geometry().valid_width; height = engine->geometry().valid_height;
@@ -166,7 +195,7 @@ int run(const std::vector<std::string>& args) {
         if (!width) width = 512;
         if (!height) height = 512;
         t0 = std::chrono::steady_clock::now();
-        engine = std::make_unique<Engine>(weights_path, width, height);
+        engine = std::make_unique<Engine>(weights_path, width, height, !use_cuda);
         load_ms = elapsed(t0);
     }
     const Geometry& g = engine->geometry();
@@ -189,23 +218,43 @@ int run(const std::vector<std::string>& args) {
     engine->set_debug(!dump_dir.empty());
     engine->set_profile(profile);
     engine->set_int8(std::getenv("NR_INT8") != nullptr);
+#ifdef NR_HAS_CUDA
+    std::unique_ptr<CudaEngine> gpu;
+    double gpu_load_ms = 0, upload_ms = 0, download_ms = 0;
+    if (use_cuda) {
+        t0 = std::chrono::steady_clock::now();
+        gpu = std::make_unique<CudaEngine>(*engine, device);
+        gpu_load_ms = elapsed(t0);
+        t0 = std::chrono::steady_clock::now();
+        gpu->upload(features.data());
+        upload_ms = elapsed(t0);
+        std::printf("CUDA device %d: %s  FP32 (TF32 off), resident weights/features, CUDA Graph\n",
+                    device, gpu->device_name().c_str());
+    }
+#endif
+    auto forward = [&]() {
+#ifdef NR_HAS_CUDA
+        if (gpu) return gpu->forward(!dump_dir.empty());
+#endif
+        auto start = std::chrono::steady_clock::now();
+        engine->forward(features.data(), head.data());
+        return elapsed(start);
+    };
     std::printf("model %s  valid %dx%d  field %dx%d  threads %d  style %.3g tone %.3g structure %.3g skin %.3g automask %d  mode %s\n",
                 idx_path.empty() ? weights_path.c_str() : idx_path.c_str(), width, height,
                 g.full_width, g.full_height, omp_get_max_threads(), lanes.style, lanes.tone,
                 lanes.structure, lanes.skin, lanes.auto_mask ? 1 : 0,
-                std::getenv("NR_INT8") ? (std::string("mixed-int8/") + gemm_i8_backend()).c_str() : "fp32");
+                use_cuda ? "cuda-fp32" : (std::getenv("NR_INT8") ? (std::string("mixed-int8/") + gemm_i8_backend()).c_str() : "fp32"));
 
     if (bench) {
-        for (int i = 0; i < warmup; ++i) engine->forward(features.data(), head.data());
+        for (int i = 0; i < warmup; ++i) forward();
         engine->set_profile(profile);
         // Only enable attention's internal timers for explicit diagnostic profiling.
         if (profile && std::getenv("NR_ATTN_PROFILE")) attn_profile_reset();
         std::vector<double> times;
         times.reserve(repeats);
         for (int i = 0; i < repeats; ++i) {
-            auto start = std::chrono::steady_clock::now();
-            engine->forward(features.data(), head.data());
-            times.push_back(elapsed(start));
+            times.push_back(forward());
         }
         std::sort(times.begin(), times.end());
         double median = (times[(repeats - 1) / 2] + times[repeats / 2]) * 0.5;
@@ -232,14 +281,25 @@ int run(const std::vector<std::string>& args) {
         }
     } else {
         t0 = std::chrono::steady_clock::now();
-        engine->forward(features.data(), head.data());
+        forward();
         std::printf("forward (first call, includes scratch/cache initialization): %.3f ms\n", elapsed(t0));
     }
+#ifdef NR_HAS_CUDA
+    if (gpu) {
+        t0 = std::chrono::steady_clock::now();
+        gpu->download(head.data());
+        download_ms = elapsed(t0);
+        std::printf("outside forward: CUDA init+weight upload %.2f ms  H2D features %.2f ms  D2H head %.2f ms\n",
+                    gpu_load_ms, upload_ms, download_ms);
+        for (const auto& kv : gpu->debug())
+            write_f32((fs::u8path(dump_dir) / (kv.first + ".bin")).u8string(), kv.second);
+    }
+#endif
     if (!out_path.empty()) write_f32(out_path, head);
     for (const auto& kv : engine->debug())
         write_f32((fs::u8path(dump_dir) / (kv.first + ".bin")).u8string(), kv.second);
-    std::printf("outside forward: weights+packing %.2f ms  image %.2f ms  features %.2f ms\n",
-                load_ms, image_ms, features_ms);
+    std::printf("outside forward: weights%s %.2f ms  image %.2f ms  features %.2f ms\n",
+                use_cuda ? " load" : "+packing", load_ms, image_ms, features_ms);
 
     // First-frame composite: neural = clamp(proxy + head_rgb/4). The fourth
     // channel is the temporal history blend; without history it does not mix proxy back in.
@@ -294,7 +354,7 @@ int main(int argc, char** argv) {
         }
         return run(args);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "cpu_engine: %s\n", e.what());
+        std::fprintf(stderr, NR_CLI_NAME ": %s\n", e.what());
         return 1;
     }
 }

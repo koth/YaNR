@@ -147,7 +147,7 @@ struct ProfTimer {
 
 }  // namespace
 
-Engine::Engine(const std::string& idx_path) {
+Engine::Engine(const std::string& idx_path, bool cpu_pack) {
     std::ifstream in(std::filesystem::u8path(idx_path));
     if (!in) throw std::runtime_error("cannot open " + idx_path);
     std::string bin_name;
@@ -214,7 +214,7 @@ Engine::Engine(const std::string& idx_path) {
         t.data = reinterpret_cast<const float*>(bin_.data() + kv.second.offset);
         tensors_[kv.first] = t;
     }
-    pack_weights();
+    if (cpu_pack) pack_weights();
 }
 
 void Engine::pack_weights() {

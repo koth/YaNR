@@ -18,6 +18,7 @@ out_student*/
 *.onnx
 engine/weights/
 engine/build/
+engine/build-*/
 **/dumps/
 
 # ============================================================

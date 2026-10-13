@@ -18,7 +18,7 @@ fs::path relative_file(const fs::path& root, const std::string& name) {
 }
 }
 
-Engine::Engine(const std::string& package_dir, int width, int height) {
+Engine::Engine(const std::string& package_dir, int width, int height, bool cpu_pack) {
     if (width < 33 || height < 33 || width > 8192 || height > 8192)
         throw std::runtime_error("image dimensions must be between 33 and 8192");
     const auto root = fs::u8path(package_dir);
@@ -119,5 +119,5 @@ Engine::Engine(const std::string& package_dir, int width, int height) {
     cfg.attn = true; cfg.hidden = vit.at("ffn").positive();
     cfg.experts = vit.has("experts") ? vit.at("experts").positive() : 0;
     vit_blocks_.assign(vit.at("blocks").positive(), cfg);
-    pack_weights();
+    if (cpu_pack) pack_weights();
 }
