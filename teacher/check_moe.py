@@ -94,8 +94,11 @@ def main():
           f'finite {finite}  moe_aux {float(aux_net):.3f}')
     ok &= params > 20_000_000                                  # 容量 ×8 口径(≥20M)
 
-    # ---- 6. 批量前向(2026-10-12 吞吐改造):批内同样本逐位自洽(无跨样本污染)+
+    # ---- 6. 批量前向(2026-10-12 吞吐改造):批内同样本自洽(无跨样本污染)+
     # 批量 ≈ 逐样本(fp32 kernel 噪声级;梯度同口径已在离线钉3 验过,相对差 ~1e-5)。
+    # 口径注:自洽判相对 1e-5 而非逐位 —— 训练后权重量级下,GEMM 行块归约序对批内
+    # 两份相同输入产出 ~1e-7 相对差(kernel 噪声,2026-10-12 实测 7.8e-7);跨样本
+    # 污染是信号量级,该口径足以分辨。
     torch.manual_seed(1)
     f1 = torch.randn(320 * 320, 16)
     f2 = torch.randn(320 * 320, 16)
@@ -103,11 +106,13 @@ def main():
         dup = net(torch.stack([f1, f1]).reshape(-1, 16), batch=2).view(2, -1, 4)
         single = net(f1)
         pair_out = net(torch.stack([f1, f2]).reshape(-1, 16), batch=2).view(2, -1, 4)
-    hit6a = bool(torch.equal(dup[0], dup[1]))
+    scale = max(float(dup.abs().max()), 1e-12)
+    d_dup = (dup[0] - dup[1]).abs().max().item() / scale
+    hit6a = d_dup < 1e-5
     d6 = (pair_out[0] - single).abs().max().item()
     hit6b = d6 < 1e-5
     ok &= hit6a and hit6b
-    print(f'6. 批量前向:批内自洽逐位 {"ok" if hit6a else "FAIL"}  '
+    print(f'6. 批量前向:批内自洽 rel {d_dup:.2e}  {"ok" if hit6a else "FAIL"}  '
           f'批量vs单跑 max {d6:.2e}  {"ok" if hit6b else "FAIL"}')
 
     print('CHECK MOE PASS' if ok else 'CHECK MOE FAIL')
