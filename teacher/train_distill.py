@@ -64,6 +64,10 @@ DEFAULTS = {
     'loss_logit': 1.0,           # blend logit 对齐权重(幅度阀专项;原 0.5 内联)
     'action_floor': 0.1,         # 教师改动加权:零改动处权重下限(低水平修改压到地板,不学)
     'action_knee': 0.02,         # 权重半衰点(教师 |合成−输入| 幅度 ≈ 5/255;改动越大权重越满)
+    'loss_texture': 0.0,         # 高频专项权重(2026-10-14 v4.1):hf(out−proxy) 带单独监督,救滑区造纹理
+    'texture_floor': 0.25,       # 高频专项:教师高频改动零处权重下限
+    'texture_knee': 0.005,       # 高频专项:半衰点(≈1.3/255;滑区造纹理 ~2/255 落近满权区)
+    'ema_every': 1,              # EMA 更新间隔步数(decay 取 ^ema_every,期望等效;省每步发射)
     'pair_fraction': 0.5,        # 时序对采样比例(历史腿:上帧教师输出 -> truncate_half -> 重投影)
     'crop_prob': 0.5,            # 随机原生裁剪(尺度抖动 1-2x);其余整图 resize
     'degrade_prob': 0.5,         # 在线退化(degrade.py 链;proxy_proc 已预退化的跳过)
@@ -257,12 +261,13 @@ class FrameSource:
 
 def laplacian_l1(a, b):
     """两级拉普拉斯"场之差"的 L1(5.4:让学生的高频形态对上教师,而不是抹掉高频)。
+    批量口径:(B,H,W,C) -> 逐样本 (B,);B=1 与旧逐样本 .mean() 语义一致。
 
     注:初版写成 lap(a)+lap(b)(两图高频能量之和),没在比较师生、反而奖励模糊 —— 已修。
     """
     def lap(x):
         fields = []
-        cur = x.permute(2, 0, 1).unsqueeze(0)
+        cur = x.permute(0, 3, 1, 2)
         for _ in range(2):
             h, w = cur.shape[-2:]
             low = F.avg_pool2d(cur, 2, ceil_mode=True)
@@ -270,24 +275,40 @@ def laplacian_l1(a, b):
             fields.append(cur - up)
             cur = low
         return fields
-    return sum((fa - fb).abs().mean() for fa, fb in zip(lap(a), lap(b)))
+
+    out = 0.0
+    for fa, fb in zip(lap(a), lap(b)):
+        out = out + (fa - fb).abs().reshape(a.shape[0], -1).mean(1)
+    return out
 
 
 def sobel_l1(a, b):
-    """Sobel 边缘场之差的 L1。"""
+    """Sobel 边缘场之差的 L1,逐样本 (B,)。"""
     def edges(x):
-        gray = x.mean(dim=2, keepdim=True).permute(2, 0, 1).unsqueeze(0)
+        gray = x.mean(dim=3, keepdim=True).permute(0, 3, 1, 2)
         kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
                           dtype=gray.dtype, device=gray.device).view(1, 1, 3, 3)
         ky = kx.transpose(-1, -2)
         return F.conv2d(gray, kx, padding=1), F.conv2d(gray, ky, padding=1)
+
     gxa, gya = edges(a)
     gxb, gyb = edges(b)
-    return (gxa - gxb).abs().mean() + (gya - gyb).abs().mean()
+    return ((gxa - gxb).abs().reshape(a.shape[0], -1).mean(1)
+            + (gya - gyb).abs().reshape(a.shape[0], -1).mean(1))
+
+
+def hf(x):
+    """高频带 x − blur3(x),blur3 = 9 次 3×3 均值(与 probe_skin.blur3 同口径)。
+    批量口径:(B,H,W,C) -> (B,H,W,C)。"""
+    y = x.permute(0, 3, 1, 2)
+    for _ in range(9):
+        y = F.avg_pool2d(F.pad(y, (1, 1, 1, 1), mode='replicate'), 3, stride=1)
+    return (x.permute(0, 3, 1, 2) - y).permute(0, 2, 3, 1)
 
 
 def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
-                  logit_w=1.0, act_floor=0.1, act_knee=0.02):
+                  logit_w=1.0, act_floor=0.1, act_knee=0.02,
+                  tex_w=0.0, tex_floor=0.25, tex_knee=0.005):
     """输出损失(5.3):rgb/4 L1 + blend logit SmoothL1 + 合成图 L1,按教师改动幅度加权。
 
     2026-10-12 损失改造(用户口径:低水平修改不需要学习,学就学改动较大的):
@@ -296,31 +317,52 @@ def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
     弱改动再拉回满权,与"不学弱改动"相反),跨样本/跨像素的梯度占比就是改动幅度占比。
     blend logit 单独升为 loss_logit 项(幅度总阀,原 0.5 内联),同样吃 w。
 
+    2026-10-14 高频专项(v4.1):滑区造纹理 ~2/255 的小改动在动作加权下只有 w≈0.25,
+    梯度结构性流向光线(20K 实测滑区纹理复刻 47%,照片脸 91%)。tex_w > 0 时对高频带
+    (probe_skin 同口径 hf())单独加权:权重按教师高频改动幅度(半衰 tex_knee ≈ 1.3/255,
+    滑区造纹理落在近满权区),零高频改动处压到 tex_floor。
+
+    2026-10-14 批量口径(向量化):张量 (B,H,W,·),返回逐样本向量 —— 逐样本 python
+    循环是 GPU 气泡主源之一;B=1 与旧实现同语义(仅浮点求和序差异,~1e-7 级)。
+
     有历史(repro 非空)时合成走 temporal blend(run_image 语义:权重
     clamp(sigmoid(logit)*blend_scale)),blend logit 的监督此时才有意义;
-    返回的 neural 是部署口径合成图(时序损失吃它)。
+    返回的 neural 是部署口径合成图(时序损失吃它)。t_scale 可为 (B,) 张量。
+    返回 (out_v, s_neural, t_neural, tex_v):前三者含逐样本 L1 和,tex_v 为高频项原值。
     """
+    def pm(z):                                          # per-sample mean over (H,W,C)
+        return z.reshape(z.shape[0], -1).mean(1)
+
     s_rgb, t_rgb = s_head[..., :3] / 4.0, t_head[..., :3] / 4.0
     s_neural = torch.clamp(proxy + s_rgb, 0, 1)
     t_neural = torch.clamp(proxy + t_rgb, 0, 1)
     with torch.no_grad():
-        delta = (t_neural - proxy).abs().mean(dim=2, keepdim=True)
+        delta = (t_neural - proxy).abs().mean(dim=3, keepdim=True)
         w = act_floor + (1.0 - act_floor) * delta.pow(2) / (delta.pow(2) + act_knee ** 2)
 
     def wl1(a, b, wm=None):
         ww = w if wm is None else wm
-        return ((a - b).abs() * ww).mean()
+        return pm((a - b).abs() * ww)
 
-    out = wl1(s_rgb, t_rgb) + logit_w * (
-        F.smooth_l1_loss(s_head[..., 3], t_head[..., 3], reduction='none') * w[..., 0]).mean()
+    out = wl1(s_rgb, t_rgb) + logit_w * pm(
+        F.smooth_l1_loss(s_head[..., 3], t_head[..., 3], reduction='none') * w[..., 0])
     out = out + wl1(s_neural, t_neural)
     if repro is not None:
+        ts = torch.as_tensor(t_scale, dtype=s_head.dtype, device=s_head.device)
+        ts = ts.view(-1, 1, 1) if ts.ndim else ts
         s_w = torch.clamp(torch.sigmoid(s_head[..., 3]) * s_scale, 0, 1)
-        t_w = torch.clamp(torch.sigmoid(t_head[..., 3]) * t_scale, 0, 1)
+        t_w = torch.clamp(torch.sigmoid(t_head[..., 3]) * ts, 0, 1)
         s_neural = s_neural + (repro - s_neural) * s_w[..., None]
         t_neural = t_neural + (repro - t_neural) * t_w[..., None]
         out = out + wl1(s_neural, t_neural)
-    return out, s_neural, t_neural
+    tex_v = torch.zeros(s_head.shape[0], dtype=s_head.dtype, device=s_head.device)
+    if tex_w > 0:
+        with torch.no_grad():
+            d_hf = hf(t_neural - proxy).abs().mean(dim=3, keepdim=True)
+            wt = tex_floor + (1.0 - tex_floor) * d_hf.pow(2) / (d_hf.pow(2) + tex_knee ** 2)
+        tex_v = pm((hf(s_neural) - hf(t_neural)).abs() * wt)
+        out = out + tex_w * tex_v
+    return out, s_neural, t_neural, tex_v
 
 
 class FeatureAligner(nn.Module):
@@ -683,20 +725,24 @@ def main():
         for group in optim.param_groups:
             group['lr'] = lr
         t0 = time.perf_counter()
-        totals = {'out': 0.0, 'detail': 0.0, 'feature': 0.0, 'temporal': 0.0}
+        totals = {'out': 0.0, 'detail': 0.0, 'feature': 0.0, 'temporal': 0.0,
+                  'texture': 0.0}
         moe_tot = {}
         feat_detail_acc = {}
         psnrs = []
         optim.zero_grad()
         # ---- 取回本步已备样本(教师批量段在上一步末尾提交,与上一步学生计算重叠),
         # 并把下一步的教师段压进流水(与本步学生计算重叠;末步不预取,防越界取料)。
+        t_wait0 = time.perf_counter()
         prepared = step_futs.popleft().result()
+        t_wait = time.perf_counter() - t_wait0
         if step + 1 < cfg['steps']:
             step_futs.append(teach_pool.submit(prepare_step, _collect_raw()))
 
         # ---- 按 (边长, 模式) 分桶 + rows 预算切块,桶内真 batch 前向(2026-10-12 吞吐改造)。
         # 模型前向接受 batch 维行主序叠放(nr_student batch=1 与逐样本逐位一致;批量=逐样本
         # fp32 等价见钉2/钉3,同批同样本逐位自洽见钉4)。
+        t_comp0 = time.perf_counter()
         buckets = {}
         for p in prepared:
             buckets.setdefault((p['s'], p['kind']), []).append(p)
@@ -738,8 +784,8 @@ def main():
                 for k, v in feat_detail.items():
                     feat_detail_acc[k] = feat_detail_acc.get(k, 0.0) + v * cnb
 
-                # pair:上帧学生前向(teacher-forcing,no_grad)整块走,时序损失逐样本拼。
-                s_neural_a_all = None
+                # pair:上帧学生前向(teacher-forcing,no_grad)整块走,s_neural_a 批量合成。
+                s_neural_a = None
                 if kind == 'pair' and cfg['loss_temporal'] > 0:
                     xa = torch.from_numpy(
                         np.stack([p['feats_a'] for p in chunk])).reshape(-1, 16).to(device)
@@ -747,55 +793,61 @@ def main():
                         sa_all = model(xa, batch=cnb)
                     sa_all = sa_all.view(
                         cnb, g_s['full_height'], g_s['full_width'], 4)[:, :s, :s].float()
-                    s_neural_a_all = []
-                    for i, p in enumerate(chunk):
-                        t_head_a_t = torch.from_numpy(p['t_head_a']).to(device)
-                        prev_t = torch.from_numpy(p['prev']).to(device)
-                        _, s_na, _ = output_losses(
-                            sa_all[i], t_head_a_t, prev_t,
-                            logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
-                            act_knee=cfg['action_knee'])
-                        s_neural_a_all.append(s_na)
+                    prev_t = torch.from_numpy(np.stack([p['prev'] for p in chunk])).to(device)
+                    s_neural_a = torch.clamp(prev_t + sa_all[..., :3] / 4.0, 0, 1)
 
+                # 批量损失(2026-10-14 向量化):整块一次算、逐样本向量聚合 —— 旧逐样本
+                # python 循环是 GPU 气泡主源之一(提速牌 7);B=1 语义与旧实现一致。
                 chunk_loss = 0.0
-                for i, p in enumerate(chunk):
-                    proxy = p['proxy']                     # vis 块取图用(重构后保持旧名)
-                    proxy_t = torch.from_numpy(p['proxy']).to(device)
-                    repro_t = (torch.from_numpy(p['repro']).to(device)
-                               if p['repro'] is not None else None)
-                    t_head_t = torch.from_numpy(p['t_head']).to(device)
-                    out, s_neural, t_neural = output_losses(
-                        s_head_all[i], t_head_t, proxy_t, repro=repro_t,
-                        s_scale=model.blend_scale, t_scale=p['t_scale'],
-                        logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
-                        act_knee=cfg['action_knee'])
-                    # ^ s_scale 传张量而非 float:blend_scale 是 nn.Parameter,曾被 float(detach())
-                    #   断梯度永远停在 1.0(教师实测 0.7397,历史混合量差 35%)。2026-10-10 修。
-                    detail = laplacian_l1(s_neural, t_neural) + sobel_l1(s_neural, t_neural)
-                    sample_loss = cfg['loss_out'] * out + cfg['loss_detail'] * detail
-                    temporal = None
-                    if s_neural_a_all is not None:
-                        # 时序损失(真接上):帧差残差匹配 L1((s_B - s_A) - (t_B - t_A)) ——
-                        # 正是 eval_temporal 的 flicker 口径(输入差分抵消后)。
-                        t_na_t = torch.from_numpy(p['t_neural_a']).to(device)
-                        temporal = F.l1_loss(s_neural - s_neural_a_all[i],
-                                             t_neural - t_na_t)
-                        sample_loss = sample_loss + cfg['loss_temporal'] * temporal
-                    if not torch.isfinite(sample_loss):
-                        print(f'step {step}: non-finite sample loss, skipped')
-                        continue
-                    chunk_loss = chunk_loss + sample_loss / cfg['batch']
-                    totals['out'] += float(out.detach())
-                    totals['detail'] += float(detail.detach())
-                    if temporal is not None:
-                        totals['temporal'] += float(temporal.detach())
-                    psnrs.append(psnr(s_neural.detach(), t_neural))
+                proxy = chunk[-1]['proxy']              # vis 块取图用(重构后保持旧名)
+                proxy_t = torch.from_numpy(np.stack([p['proxy'] for p in chunk])).to(device)
+                t_head_t = torch.from_numpy(np.stack([p['t_head'] for p in chunk])).to(device)
+                repro_t = (torch.from_numpy(np.stack([p['repro'] for p in chunk])).to(device)
+                           if kind == 'pair' else None)
+                out_v, s_neural, t_neural, tex_v = output_losses(
+                    s_head_all, t_head_t, proxy_t, repro=repro_t,
+                    s_scale=model.blend_scale,
+                    t_scale=torch.tensor([p['t_scale'] for p in chunk], device=device),
+                    logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
+                    act_knee=cfg['action_knee'], tex_w=cfg['loss_texture'],
+                    tex_floor=cfg['texture_floor'], tex_knee=cfg['texture_knee'])
+                # ^ s_scale 传张量而非 float:blend_scale 是 nn.Parameter,曾被 float(detach())
+                #   断梯度永远停在 1.0(教师实测 0.7397,历史混合量差 35%)。2026-10-10 修。
+                detail_v = laplacian_l1(s_neural, t_neural) + sobel_l1(s_neural, t_neural)
+                sample_v = cfg['loss_out'] * out_v + cfg['loss_detail'] * detail_v
+                temporal_v = None
+                if s_neural_a is not None:
+                    # 时序损失(真接上):帧差残差匹配 L1((s_B - s_A) - (t_B - t_A)) ——
+                    # 正是 eval_temporal 的 flicker 口径(输入差分抵消后)。
+                    t_na_t = torch.from_numpy(
+                        np.stack([p['t_neural_a'] for p in chunk])).to(device)
+                    temporal_v = (s_neural - s_neural_a - (t_neural - t_na_t)
+                                  ).abs().reshape(cnb, -1).mean(1)
+                    sample_v = sample_v + cfg['loss_temporal'] * temporal_v
+                finite = torch.isfinite(sample_v)
+                if not bool(finite.all()):
+                    print(f'step {step}: non-finite sample loss, '
+                          f'skipped {int((~finite).sum())}')
+                chunk_loss = chunk_loss + (
+                    torch.where(finite, sample_v, torch.zeros_like(sample_v)).sum()
+                    / cfg['batch'])
+                fm = finite.to(out_v.dtype)
+                totals['out'] += float((out_v * fm).sum())
+                totals['detail'] += float((detail_v * fm).sum())
+                totals['texture'] += float((tex_v * fm).sum())
+                if temporal_v is not None:
+                    totals['temporal'] += float((temporal_v * fm).sum())
+                mse = ((s_neural.detach() - t_neural.detach()) ** 2).reshape(cnb, -1).mean(1)
+                psnr_v = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-12))
+                psnrs.extend(psnr_v[finite].tolist())
                 chunk_loss = chunk_loss + (cfg['loss_feature'] * feat + chunk_moe) * (
                     cnb / cfg['batch'])
                 if torch.isfinite(chunk_loss):
                     chunk_loss.backward()
                 else:
                     print(f'step {step}: non-finite chunk loss, skipped')
+        t_comp = time.perf_counter() - t_comp0
+        t_opt0 = time.perf_counter()
         torch.nn.utils.clip_grad_norm_(params, cfg['clip'])
         optim.step()
         if cfg['ema'] > 0:
@@ -806,15 +858,18 @@ def main():
                 for k, p in model.state_dict().items():
                     if p.dtype.is_floating_point:
                         ema[k].mul_(decay).add_(p.detach(), alpha=1 - decay)
+        t_opt = time.perf_counter() - t_opt0
         ms = (time.perf_counter() - t0) * 1000
 
-        if experiment is not None:
+        # comet 上报按 log_every 节流(2026-10-14 提速牌 2:每步 HTTP 上报是墙钟尾巴)。
+        if experiment is not None and (step % cfg['log_every'] == 0 or step == cfg['steps'] - 1):
             n = max(1, len(psnrs))
             metrics = {
                 'loss/total': (totals['out'] + totals['detail'] + totals['feature']) / n,
                 'loss/out': totals['out'] / n,
                 'loss/detail': totals['detail'] / n,
                 'loss/feature': totals['feature'] / n,
+                'loss/texture': totals['texture'] / n,
                 'psnr/teacher': sum(psnrs) / n,
                 'train/lr': lr,
                 'train/ms': ms,
@@ -840,28 +895,26 @@ def main():
             log.flush()
             print(f"step {step:6d}  lr {lr:.2e}  out {totals['out'] / n:.5f}  "
                   f"detail {totals['detail'] / n:.5f}  feat {totals['feature'] / n:.5f}  "
-                  f"temp {totals['temporal'] / n:.5f}  "
+                  f"temp {totals['temporal'] / n:.5f}  tex {totals['texture'] / n:.5f}  "
                   f"psnr(t) {sum(psnrs) / len(psnrs):.2f}"
                   + (f"  moe_aux {aux_val:.3f} umax {moe_tot.get('util_worst', 0.0) / max(1, len(psnrs)):.2f}"
                      if aux_val > 0 else "")
-                  + f"  {ms:.0f} ms")
+                  + f"  {ms:.0f} ms"
+                  + f"  wait {t_wait * 1000:.0f} comp {t_comp * 1000:.0f}"
+                    f" opt {t_opt * 1000:.0f}")
 
         if cfg['vis_every'] and step % cfg['vis_every'] == 0 and step > 0:
             # 可视化只许看不许杀:2026-10-12 vis 块 NameError 杀过一次 28h 跑,套保险。
+            # comet 不传 vis(2026-10-14 用户口径:没看过;本地产 PNG 保留)。
             try:
                 vis = os.path.join(args.out, f'vis-{step:06d}')
                 os.makedirs(vis, exist_ok=True)
+                t_last = t_neural[-1].detach().cpu().numpy()
+                s_last = s_neural[-1].detach().cpu().numpy()
                 save_png(os.path.join(vis, 'proxy.png'), proxy)
-                save_png(os.path.join(vis, 'teacher.png'), t_neural.detach().cpu().numpy())
-                save_png(os.path.join(vis, 'student.png'), s_neural.detach().cpu().numpy())
-                diff = np.abs(s_neural.detach().cpu().numpy()
-                              - t_neural.detach().cpu().numpy()) * 12
-                save_png(os.path.join(vis, 'diff_x12.png'), diff)
-                if experiment is not None:
-                    experiment.log_image(proxy, 'proxy', step=step)
-                    experiment.log_image(t_neural.detach().cpu().numpy(), 'teacher', step=step)
-                    experiment.log_image(s_neural.detach().cpu().numpy(), 'student', step=step)
-                    experiment.log_image(np.clip(diff, 0, 1), 'diff_x12', step=step)
+                save_png(os.path.join(vis, 'teacher.png'), t_last)
+                save_png(os.path.join(vis, 'student.png'), s_last)
+                save_png(os.path.join(vis, 'diff_x12.png'), np.abs(s_last - t_last) * 12)
             except Exception as exc:                            # noqa: BLE001
                 print(f'step {step}: vis failed ({exc!r}), skipped')
 
