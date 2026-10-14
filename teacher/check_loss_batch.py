@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from train_distill import hf, laplacian_l1, output_losses, sobel_l1  # noqa: E402
 
 KW = dict(logit_w=1.0, act_floor=0.2, act_knee=0.01,
-          tex_w=1.0, tex_floor=0.25, tex_knee=0.005)
+          tex_w=1.0, tex_floor=0.25, tex_knee=0.005,
+          tex_boost=4.0, tex_sigma=0.008)
 
 
 def rel(a, b):

@@ -67,6 +67,8 @@ DEFAULTS = {
     'loss_texture': 0.0,         # 高频专项权重(2026-10-14 v4.1):hf(out−proxy) 带单独监督,救滑区造纹理
     'texture_floor': 0.25,       # 高频专项:教师高频改动零处权重下限
     'texture_knee': 0.005,       # 高频专项:半衰点(≈1.3/255;滑区造纹理 ~2/255 落近满权区)
+    'tex_boost': 0.0,            # 滑区加成(2026-10-14 v4.1b):输入平滑像素的高频权重倍增上限
+    'tex_sigma': 0.008,          # 滑区加成宽度(|hf(输入)| 尺度 ≈2/255;平滑度高斯窗)
     'ema_every': 1,              # EMA 更新间隔步数(decay 取 ^ema_every,期望等效;省每步发射)
     'pair_fraction': 0.5,        # 时序对采样比例(历史腿:上帧教师输出 -> truncate_half -> 重投影)
     'crop_prob': 0.5,            # 随机原生裁剪(尺度抖动 1-2x);其余整图 resize
@@ -308,7 +310,8 @@ def hf(x):
 
 def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
                   logit_w=1.0, act_floor=0.1, act_knee=0.02,
-                  tex_w=0.0, tex_floor=0.25, tex_knee=0.005):
+                  tex_w=0.0, tex_floor=0.25, tex_knee=0.005,
+                  tex_boost=0.0, tex_sigma=0.008):
     """输出损失(5.3):rgb/4 L1 + blend logit SmoothL1 + 合成图 L1,按教师改动幅度加权。
 
     2026-10-12 损失改造(用户口径:低水平修改不需要学习,学就学改动较大的):
@@ -360,6 +363,12 @@ def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
         with torch.no_grad():
             d_hf = hf(t_neural - proxy).abs().mean(dim=3, keepdim=True)
             wt = tex_floor + (1.0 - tex_floor) * d_hf.pow(2) / (d_hf.pow(2) + tex_knee ** 2)
+            if tex_boost > 0:
+                # 滑区加成(v4.1b):皮肤滑区造纹理是稀有事件,全图均值梯度被大面积非
+                # 皮肤高频淹没 —— 20K 实测滑区复刻 43%(10K 61% 被挤出)。输入自身
+                # 高频越小(越平滑)加成越大,直接对准滑区复刻率验收指标。
+                mag0 = hf(proxy).abs().mean(dim=3, keepdim=True)
+                wt = wt * (1.0 + tex_boost * torch.exp(-(mag0 / tex_sigma) ** 2))
         tex_v = pm((hf(s_neural) - hf(t_neural)).abs() * wt)
         out = out + tex_w * tex_v
     return out, s_neural, t_neural, tex_v
@@ -810,7 +819,8 @@ def main():
                     t_scale=torch.tensor([p['t_scale'] for p in chunk], device=device),
                     logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
                     act_knee=cfg['action_knee'], tex_w=cfg['loss_texture'],
-                    tex_floor=cfg['texture_floor'], tex_knee=cfg['texture_knee'])
+                    tex_floor=cfg['texture_floor'], tex_knee=cfg['texture_knee'],
+                    tex_boost=cfg['tex_boost'], tex_sigma=cfg['tex_sigma'])
                 # ^ s_scale 传张量而非 float:blend_scale 是 nn.Parameter,曾被 float(detach())
                 #   断梯度永远停在 1.0(教师实测 0.7397,历史混合量差 35%)。2026-10-10 修。
                 detail_v = laplacian_l1(s_neural, t_neural) + sobel_l1(s_neural, t_neural)
