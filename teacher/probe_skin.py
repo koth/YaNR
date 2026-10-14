@@ -65,6 +65,9 @@ def main():
     ap.add_argument('--style', type=float, default=1.5)
     ap.add_argument('--tone', type=float, default=0.5)
     ap.add_argument('--structure', type=float, default=0.35)
+    ap.add_argument('--direct', action='store_true',
+                    help='固定旋钮口径:直接比 out−proxy 的教师/学生差(无基线差分);'
+                         '单工作点学生只能用这个(基线分支对其是分布外)')
     ap.add_argument('-o', '--out', default='probe_skin')
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -96,18 +99,51 @@ def main():
             head = head.view(g['full_height'], g['full_width'], 4).cpu().numpy()
         return np.clip(proxy + head[:args.height, :args.width, :3] / 4, 0, 1).astype(np.float32)
 
-    base = {'t': forward('t', -1.0, False), 's': forward('s', -1.0, False)}
     skin = {'t': forward('t', 1.0, True), 's': forward('s', 1.0, True)}
-    dt, ds = skin['t'] - base['t'], skin['s'] - base['s']
+    if args.direct:
+        dt, ds = skin['t'] - proxy, skin['s'] - proxy
+    else:
+        base = {'t': forward('t', -1.0, False), 's': forward('s', -1.0, False)}
+        dt, ds = skin['t'] - base['t'], skin['s'] - base['s']
 
     print(f"== 教师 skin 效果拆解(/{args.image})==")
-    spectrum(dt, 'teacher 效果')
+    _, e_ht = spectrum(dt, 'teacher 效果')
     print(f"== 学生 skin 效果拆解 ==")
-    spectrum(ds, 'student 效果')
+    _, e_hs = spectrum(ds, 'student 效果')
     print(f"== 学生−教师 效果残差 ==")
     spectrum(ds - dt, 'residual')
 
-    for name, arr in (('base', base['t']), ('skin_t', skin['t']), ('dt_x8', np.clip(dt * 8 + .5, 0, 1)),
+    def hf(a):
+        return a - blur3(a)
+
+    def corr(a, b):
+        a, b = a.ravel() - a.mean(), b.ravel() - b.mean()
+        return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-12))
+
+    base_img = proxy if args.direct else base['t']
+    hb = hf(base_img)
+    print(f"纹理复刻率(高频能量 学生/教师) {100 * e_hs / max(e_ht, 1e-12):5.1f}%"
+          f"   方向 corr(教师Δ,基线HF) {corr(hf(dt), hb):+.2f}"
+          f"  corr(学生Δ,基线HF) {corr(hf(ds), hb):+.2f}"
+          f"   corr(学生Δ,教师Δ) {corr(hf(ds), hf(dt)):+.2f}")
+
+    # 按输入自身纹理强度分区:滑区(低30%)看"造纹理",纹理区(高30%)看"抹纹理"
+    hd, hsd = hf(dt), hf(ds)
+    mag = np.sqrt((hb ** 2).sum(-1)).ravel()
+    md = np.sqrt((hd ** 2).sum(-1)).ravel()
+    ms = np.sqrt((hsd ** 2).sum(-1)).ravel()
+    lo, hi = np.quantile(mag, [0.3, 0.7])
+    for name, sel in (('滑区(输入HF低30%)', mag <= lo),
+                      ('中区', (mag > lo) & (mag <= hi)),
+                      ('纹理区(输入HF高30%)', mag > hi)):
+        bt = hb.reshape(-1, 3)[sel]
+        dt_g = hd.reshape(-1, 3)[sel]
+        ds_g = hsd.reshape(-1, 3)[sel]
+        print(f"  {name:18s} 教师Δ纹理 {md[sel].mean() * 255:5.2f}  学生Δ纹理 {ms[sel].mean() * 255:5.2f}"
+              f"  复刻 {100 * ms[sel].mean() / max(md[sel].mean(), 1e-12):5.1f}%"
+              f"  方向 corr(Δ,输入HF) t {corr(dt_g, bt):+.2f} s {corr(ds_g, bt):+.2f}")
+
+    for name, arr in (('base', base_img), ('skin_t', skin['t']), ('dt_x8', np.clip(dt * 8 + .5, 0, 1)),
                       ('skin_s', skin['s']), ('ds_x8', np.clip(ds * 8 + .5, 0, 1)),
                       ('res_x8', np.clip((ds - dt) * 8 + .5, 0, 1))):
         save_png(os.path.join(args.out, f'{name}.png'), arr)
