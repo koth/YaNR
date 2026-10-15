@@ -77,7 +77,6 @@ weights/student_moe_v0/
 ```powershell
 engine/build/Release/cpu_engine.exe teacher/samples/lake.png `
     --weights weights/student_moe_v0 `
-    --style 1.5 --tone 0.5 --structure 0.5 `
     -o out/lake_nr.png
 ```
 
@@ -103,7 +102,7 @@ cmake --build engine/build-cuda --target gpu_engine cpu_engine
 
 ```powershell
 engine/build-cuda/gpu_engine.exe teacher/samples/lake.png `
-    --weights weights/student_moe_v0 --size 512 --style 1.5 `
+    --weights weights/student_moe_v0 --size 512 `
     --bench --warmup 10 --repeats 50 -o out/lake_gpu_nr.png
 ```
 
@@ -144,17 +143,21 @@ MoE 每个窗口或 token 只选择一个专家，但权重体积和推理耗时
 | `-o PATH` / `--png PATH` | `<文件名>_nr.png` | NR 输出图片 |
 | `--size N` | 输入尺寸 | 缩放为 N × N |
 | `--width W --height H` | 输入尺寸 | 分别指定宽、高 |
-| `--style S` | `0` | style ID / 条件值，范围 `0..127`，输入 lane 为 `S / 128` |
-| `--tone T` | `0.5` | tone 条件值，通常使用 `0..1` |
-| `--structure S` | `0.5` | structure 条件值，通常使用 `0..1` |
-| `--skin S` | `-1` | 仅在 `--automask` 开启时生效；负值跟随 structure |
-| `--automask` | 关闭 | 启用自动 mask 条件分支 |
+| `--style S` | `64` | style ID / 条件值，范围 `0..127`，输入 lane 为 `S / 128` |
+| `--tone T` | `1` | tone 条件值，通常使用 `0..1` |
+| `--structure S` | `1` | structure 条件值，通常使用 `0..1` |
+| `--skin S` | `1` | 自动 mask 开启时生效；负值跟随 structure |
+| `--automask` / `--no-automask` | 开启 | 启用 / 关闭自动 mask 条件分支 |
 | `--seed N` | `12345` | 噪声输入 seed，同输入与参数可重复得到相同结果 |
 | `--threads N` | 环境变量或 `8` | OpenMP 线程数，可覆盖 `OMP_NUM_THREADS` |
 | `--backend cpu\|cuda` | `cpu_engine`: CPU；`gpu_engine`: CUDA | 选择前向后端，CUDA 需启用 `NR_CUDA` 构建 |
 | `--device N` | `0` | CUDA 显卡编号 |
 
-`style` 是网络的条件输入，效果不保证随数值线性增强。旧 `student_mixed` 使用较大的
+CPU/GPU 图片入口和 C++ `LaneParams` 默认均为 `style=64、tone=1、structure=1、skin=1、automask=开启`。
+参数可显式覆盖，`--no-automask` 关闭自动 mask。
+
+`style` 是网络的条件输入，效果不保证随数值线性增强。旧 `student_mixed` 可显式指定
+`--style 0` 或其他 `0..3` 范围内的值；使用较大的
 style 值可能出现背景噪声、颜色溢出或结构伪影；需要全量程条件时使用 `student_moe_v0`。
 
 静态单图的历史输入 lane 使用当前原图，输出按
@@ -169,6 +172,7 @@ style 值可能出现背景噪声、颜色溢出或结构伪影；需要全量�
 ```powershell
 engine/build/Release/cpu_engine.exe teacher/samples/lake.png `
     --weights weights/student_moe_v0 --size 512 --threads 8 `
+    --style 0 --tone 0.5 --structure 0.5 --skin -1 --no-automask `
     --bench --warmup 10 --repeats 30 -o out/lake_bench.png
 ```
 

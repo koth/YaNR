@@ -4,13 +4,37 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <vector>
 #include <omp.h>
 #include "gemm.h"
+#include "f16.h"
 
 namespace {
+void check_f64_half() {
+    // Exhaust every positive finite half boundary, and both signs. Probe the
+    // neighbouring doubles to catch f64 -> f32 -> f16 double rounding.
+    for (unsigned h = 0; h < 0x7c00; ++h) {
+        const double low = f16_to_f32(static_cast<uint16_t>(h));
+        const double high = h == 0x7bff ? 65536.0 : f16_to_f32(static_cast<uint16_t>(h + 1));
+        const double midpoint = (low + high) * 0.5;
+        for (unsigned sign : {0u, 0x8000u}) {
+            const double factor = sign ? -1.0 : 1.0;
+            if (f64_to_f16(factor * std::nextafter(midpoint, low)) != (sign | h) ||
+                f64_to_f16(factor * midpoint) != (sign | (h + (h & 1u))) ||
+                f64_to_f16(factor * std::nextafter(midpoint, high)) != (sign | (h + 1)))
+                throw std::runtime_error("f64 to half boundary / tie / sign mismatch");
+        }
+    }
+    if (f64_to_f16(0.0) != 0 || f64_to_f16(-0.0) != 0x8000 ||
+        f64_to_f16(std::numeric_limits<double>::infinity()) != 0x7c00 ||
+        f64_to_f16(-std::numeric_limits<double>::infinity()) != 0xfc00 ||
+        (f64_to_f16(std::numeric_limits<double>::quiet_NaN()) & 0x7fff) != 0x7e00)
+        throw std::runtime_error("f64 to half zero / inf / NaN mismatch");
+}
+
 std::mt19937 rng(7);
 std::vector<float> random_values(size_t n, float scale = 1) {
     std::uniform_real_distribution<float> dist(-scale, scale);
@@ -123,6 +147,7 @@ void check_field(int iw, int ih, int ow, int oh, int channels) {
 int main() {
     try {
         omp_set_dynamic(0); omp_set_num_threads(8);
+        check_f64_half();
         for (int rows : {1, 3, 4, 7, 8, 31, 32, 33, 257}) {
             for (int channels : {4, 16, 32, 64}) for (int hidden : {7, 16, 32, 48})
                 check_ffn(rows, channels, hidden, channels, 1, true);
@@ -143,7 +168,7 @@ int main() {
             check_field(13, 17, 28, 36, c);
         }
         check_field(320, 320, 160, 160, 32);
-        std::puts("PASS: FFN/expert fusion, grouped MoE short rows/maps, in-place/tails, head, field padding/merge");
+        std::puts("PASS: f64 half rounding, FFN/expert fusion, grouped MoE short rows/maps, in-place/tails, head, field padding/merge");
         return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

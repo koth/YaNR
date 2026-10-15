@@ -203,16 +203,17 @@ def fp8_gemm_full(x, w, residual=None, aux=None, silu=False, quantize=True, raw=
 
 
 def fp8_gemm_partitioned(x, w, partition, residual=None, aux=None, silu=False,
-                         quantize=True, raw=False, out_e4=None, out_raw=None, **_):
+                         quantize=True, raw=False, swizzle=True, out_e4=None, out_raw=None, **_):
     """The ViT's partitioned GEMMs: independent chains per K chunk combined with half adds, epilogue last.
-    All of it happens inside the kernel now (one launch, no torch combines)."""
+    All of it happens inside the kernel now (one launch, no torch combines).
+    The graph passes logical channel order, so apply the same A swizzle as fp8_gemm_full."""
     k = x.shape[2]
     assert k % partition == 0, f'partition {partition} must divide K {k}'
     if out_raw is None and raw:
         out_raw = torch.empty(x.shape[0], x.shape[1], w.shape[2], dtype=torch.float16, device=x.device)
     if out_e4 is None and quantize:
         out_e4 = torch.empty(x.shape[0], x.shape[1], w.shape[2], dtype=torch.float16, device=x.device)
-    _fp8_launch(x, w, None, residual, aux, out_raw, out_e4, silu, False, partition)
+    _fp8_launch(x, w, None, residual, aux, out_raw, out_e4, silu, swizzle, partition)
     return out_e4, out_raw
 
 

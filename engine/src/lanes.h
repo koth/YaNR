@@ -9,11 +9,11 @@
 
 struct LaneParams {
     uint32_t seed = 0;
-    double style = 0.0;        // lane 10 = style / 128 (f64 division, stored f32)
-    double tone = 0.5;         // lane 11 = roundF16(tone)
-    double structure = 0.5;    // lanes 12-14, auto_mask semantics below
-    double skin = -1.0;
-    bool auto_mask = false;
+    double style = 64.0;       // lane 10 = style / 128 (f64 division, stored f32)
+    double tone = 1.0;         // lane 11 = roundF16(tone)
+    double structure = 1.0;    // lanes 12-14, auto_mask semantics below
+    double skin = 1.0;
+    bool auto_mask = true;
     const float* history = nullptr;   // [vh][vw][3] code values, or nullptr = first frame
 };
 

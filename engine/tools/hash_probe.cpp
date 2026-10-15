@@ -58,8 +58,8 @@ int main(int argc, char** argv) {
     std::printf("radius0 %.17g  radius1 %.17g\n", radius0, radius1);
     std::printf("raw n0 %.17g\nraw n1 %.17g\nraw n2 %.17g\n", n0r, n1r, n2r);
     std::printf("f16 n0 %.9g\nf16 n1 %.9g\nf16 n2 %.9g\n",
-                round_f16((float)n0r), round_f16((float)n1r), round_f16((float)n2r));
-    std::printf("direct-double->f16 n1 %.9g\n", f16_to_f32(f32_to_f16((float)n1r)));
+                round_f16(n0r), round_f16(n1r), round_f16(n2r));
+    std::printf("via-float->f16 n1 %.9g\n", f16_to_f32(f32_to_f16((float)n1r)));
     float v = (float)n1r;
     uint32_t vb;
     std::memcpy(&vb, &v, 4);

@@ -12,6 +12,7 @@ import torch
 import nr_torch
 import nr_cuda
 from nr_network import Network
+from nr_model import packed_input_index
 
 DEVICE = nr_torch.DEVICE
 
@@ -122,6 +123,32 @@ def run_vit(rng, tokens, padded, heads):
                 got.reshape(tokens, heads * 32), ref)
 
 
+def run_partitioned_gemm(rows, k, n, partition):
+    """Exercise the graph's split-K path, including its A-operand channel swizzle.
+
+    Plain fp8_gemm tests receive operands that are already in K order. They cannot
+    catch a graph wrapper forgetting to swizzle the input of the ViT's GEMMs.
+    """
+    rng = np.random.default_rng([20261015, rows, k, n, partition])
+    state = nr_torch.fp8_quant(torch.from_numpy(
+        (rng.standard_normal((rows, k)) * 0.25).astype(np.float16)).to(DEVICE))
+    weight = nr_torch.fp8_quant(torch.from_numpy(
+        (rng.standard_normal((k, n)) * 0.25).astype(np.float16)).to(DEVICE))
+    residual = torch.from_numpy((rng.standard_normal((rows, n)) * 0.25).astype(np.float16)).to(DEVICE)
+    aux = torch.from_numpy(rng.uniform(0.5, 1.5, n).astype(np.float16)).to(DEVICE)
+    order = torch.tensor([packed_input_index(i) for i in range(k)], device=DEVICE)
+    seed = (residual.float() * aux.float()).to(torch.float16)
+    reference = nr_torch._fp8_dot_chain_torch(state[:, order], weight, seed, partition=partition)
+    net = Network(None, None)
+    got_e4, got_raw = net.gemm(state, weight.cpu().numpy(), k, n,
+                               partition=partition, residual=residual, aux=aux,
+                               e4=True, half=True)
+    name = f'partitioned graph GEMM K={k} partition={partition}'
+    failed = diff(name + ' raw', got_raw, reference)
+    failed |= diff(name + ' e4', got_e4, nr_torch.fp8_quant(reference))
+    return failed
+
+
 def main():
     rng = np.random.RandomState(20240612)
     failed = False
@@ -137,6 +164,8 @@ def main():
         failed |= run_block_expert(rng, rows, ch)
     for tokens, padded, heads in ((96, 128, 32), (20, 64, 2), (130, 192, 4), (64, 64, 1), (7, 64, 8)):
         failed |= run_vit(rng, tokens, padded, heads)
+    for k, partition in ((4096, 1024), (1024, 512), (1024, 256)):
+        failed |= run_partitioned_gemm(3, k, 16, partition)
     print('CHECK FUSED FAIL' if failed else 'CHECK FUSED PASS')
     return 1 if failed else 0
 

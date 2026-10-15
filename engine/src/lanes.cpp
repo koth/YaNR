@@ -32,9 +32,9 @@ void gaussian3(uint32_t x, uint32_t y, uint32_t seed, double out[3]) {
     const double kTau = 6.283185307179586;
     double radius0 = std::sqrt(std::log2(u0) * kLn2 * -2.0);
     double radius1 = std::sqrt(std::log2(u2) * kLn2 * -2.0);
-    out[0] = round_f16((float)(radius0 * std::cos(u1 * kTau)));
-    out[1] = round_f16((float)(radius0 * std::sin(u1 * kTau)));
-    out[2] = round_f16((float)(radius1 * std::cos(u3 * kTau)));
+    out[0] = round_f16(radius0 * std::cos(u1 * kTau));
+    out[1] = round_f16(radius0 * std::sin(u1 * kTau));
+    out[2] = round_f16(radius1 * std::cos(u3 * kTau));
 }
 
 uint32_t seed_mix(uint64_t seed) {
@@ -55,14 +55,14 @@ void build_lanes(const float* proxy, int vw, int vh, const Geometry& g,
     const int full_w = g.full_width, full_h = g.full_height;
     const uint32_t seed = seed_mix((uint64_t)p.seed);
     const float style_lane = (float)(p.style / 128.0);
-    const float tone_lane = f16_to_f32(f32_to_f16((float)p.tone));
+    const float tone_lane = round_f16(p.tone);
     float s12, s13, s14;
     if (p.auto_mask) {
         s12 = f16_to_f32(f32_to_f16(1.0f));
-        s13 = f16_to_f32(f32_to_f16((float)(p.skin < 0.0 ? p.structure : p.skin)));
-        s14 = f16_to_f32(f32_to_f16((float)p.structure));
+        s13 = round_f16(p.skin < 0.0 ? p.structure : p.skin);
+        s14 = round_f16(p.structure);
     } else {
-        s12 = f16_to_f32(f32_to_f16((float)p.structure));
+        s12 = round_f16(p.structure);
         s13 = f16_to_f32(f32_to_f16(-1.0f));
         s14 = f16_to_f32(f32_to_f16(-1.0f));
     }

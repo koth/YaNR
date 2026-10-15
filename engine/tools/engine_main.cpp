@@ -35,17 +35,19 @@ void usage() {
     std::puts(
         "usage: " NR_CLI_NAME " IMAGE [--weights weights/student_mixed] [--png OUTPUT.png]\n"
         "                  [--size N | --width W --height H] [--bench] [--repeats 30]\n"
-        "                  [--warmup 5] [--threads 8] [--seed 12345] [--style 0..127]\n"
-        "                  [--tone 0.5] [--structure 0.5] [--skin -1] [--automask]\n"
+        "                  [--warmup 5] [--threads 8] [--seed 12345] [--style 64]\n"
+        "                  [--tone 1] [--structure 1] [--skin 1] [--automask | --no-automask]\n"
         "                  [--blend-png blend.png] [--proxy-png proxy.png]\n"
         "                  [--backend cpu|cuda] [--device 0]\n"
         "       " NR_CLI_NAME " --idx MODEL.idx --features INPUT.bin [--out HEAD.bin | --bench]\n"
         "                  [--proxy PROXY.bin --png OUTPUT.png] [--dump-dir DIR]\n"
         "Image size defaults to the input size. -o aliases --png; --out writes raw f32 head.\n"
         "Threads default to OMP_NUM_THREADS when set, otherwise 8.\n"
-        "--style is the style ID/conditioning value (0 keeps the default; nominal range 0..127).\n"
+        "Image defaults: style=64, tone=1, structure=1, skin=1, automask=on.\n"
+        "--style is the style ID/conditioning value (range 0..127).\n"
         "The usable range depends on checkpoint training; student_mixed is intended for style 0..3.\n"
-        "--tone/--structure control lanes directly; --skin is used only with --automask.\n"
+        "--tone/--structure control lanes directly; --skin is used when automatic masking is enabled.\n"
+        "--no-automask disables automatic masking; --automask enables it.\n"
         "With --features, lane options are ignored because the input lanes are prebuilt.\n"
         "--weights can also be combined with --features (default size 512x512).\n"
         "Benchmark times only the network forward after warmup, without image/lane/I/O work.\n"
@@ -151,6 +153,7 @@ int run(const std::vector<std::string>& args) {
         else if (a == "--structure") lanes.structure = real(next());
         else if (a == "--skin") lanes.skin = real(next());
         else if (a == "--automask") lanes.auto_mask = true;
+        else if (a == "--no-automask") lanes.auto_mask = false;
         else if (!a.empty() && a[0] != '-' && image_path.empty()) image_path = a;
         else throw std::runtime_error("unknown argument: " + a);
     }

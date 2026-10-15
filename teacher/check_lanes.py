@@ -77,8 +77,7 @@ def main():
                '--vw', str(size), '--vh', str(size), '--seed', str(args.seed),
                '--style', str(args.style), '--tone', str(args.tone),
                '--structure', str(args.structure), '--skin', str(args.skin)]
-        if args.automask:
-            cmd.append('--automask')
+        cmd.append('--automask' if args.automask else '--no-automask')
         if hist:
             cmd += ['--history', hist[1]]
         subprocess.run(cmd, check=True, capture_output=True)

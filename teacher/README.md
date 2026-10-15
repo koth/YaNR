@@ -13,6 +13,10 @@ extracted from `OpenDLSS-NR/ports/torch` (plus `ports/browser-webgpu/web/fixture
 `src/reference.cpp` and `numerics.js` define it, and every step here is checked against the recorded
 fixture `fixtures/numerics.bin` before anything runs.
 
+The scalar fixture and fused-kernel tests do not by themselves prove whole-network parity. The required
+boundary/head/output comparisons, upstream commands, and the scope of the latest real-weight check are
+documented in [PARITY.md](PARITY.md).
+
 ## Layout
 
 | path | what it is |

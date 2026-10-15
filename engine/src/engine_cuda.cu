@@ -1,10 +1,13 @@
 #include "engine.h"
 #include "engine_cuda.h"
+#include "f16.h"
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <cublas_v2.h>
 #include <cub/device/device_radix_sort.cuh>
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -34,7 +37,40 @@ template<class T> struct Buffer {
         p = next; capacity = n;
     }
 };
+template<class T> struct HostBuffer {
+    T* p = nullptr;
+    HostBuffer() = default;
+    HostBuffer(const HostBuffer&) = delete;
+    HostBuffer& operator=(const HostBuffer&) = delete;
+    ~HostBuffer() { if (p) cudaFreeHost(p); }
+    void allocate(size_t n) { cu(cudaMallocHost(reinterpret_cast<void**>(&p), n * sizeof(T))); }
+};
 int grid(size_t n) { return static_cast<int>((n + 255) / 256); }
+
+__global__ void temporal_bgra(const unsigned char* frames, float* features, const float* centered,
+                             int width, int height, int full_width, int full_height) {
+    size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<size_t>(full_width) * full_height * 6) return;
+    int row = i / 6, c = i % 6, x = row % full_width, y = row / full_width;
+    int rx = max(0, min(x < width ? x : 2 * width - x - 2, width - 1));
+    int ry = max(0, min(y < height ? y : 2 * height - y - 2, height - 1));
+    size_t base = c < 3 ? static_cast<size_t>(width) * height * 4 : 0;
+    unsigned char code = frames[base + (static_cast<size_t>(ry) * width + rx) * 4 + 2 - c % 3];
+    features[static_cast<size_t>(row) * 16 + 4 + c] = centered[code];
+}
+__global__ void redraw_bgra(const unsigned char* current, const float* head, const float* rgb,
+                           unsigned char* output, int width, int height, int full_width, float blend_scale) {
+    size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<size_t>(width) * height) return;
+    size_t row = i / width * full_width + i % width;
+    for (int c = 0; c < 3; ++c) {
+        float v = fmaxf(0.0f, fminf(1.0f, rgb[current[i * 4 + 2 - c]] + head[row * 4 + c] * 0.25f));
+        output[i * 4 + 2 - c] = static_cast<unsigned char>(v * 255.0f + 0.5f);
+    }
+    output[i * 4 + 3] = 255;
+    float confidence = fmaxf(0.0f, fminf(1.0f, (1.0f / (1.0f + expf(-head[row * 4 + 3]))) * blend_scale));
+    output[static_cast<size_t>(width) * height * 4 + i] = static_cast<unsigned char>(confidence * 255.0f + 0.5f);
+}
 
 __global__ void epilogue(float* out, int rows, int channels, const float* bias,
                          bool act, const float* residual, const float* aux) {
@@ -182,12 +218,16 @@ __global__ void group_copy(const float* in, float* out, const int* row_group, in
 
 // q/k/v are packed [window, head, slot, channel]. Invalid window keys stay zero,
 // but remain in the softmax denominator: the trained window mask is query-only.
+template<int Window>
 __global__ void window_qkv(const float* qkv, float* packed, int width, int height,
-                           int heads, int win, int sx, int sy, const float* scale) {
+                           int heads, int runtime_win, int sx, int sy, const float* scale, int tasks) {
+    const int win = Window ? Window : runtime_win;
+    int item = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (item >= tasks) return; // Whole warps are inactive; normalization stays warp-wide.
     int slots = win * win, wy = (height + sy + win - 1) / win;
-    int slot = blockIdx.x % slots, wh = blockIdx.x / slots, head = wh % heads, window = wh / heads;
+    int slot = item % slots, wh = item / slots, head = wh % heads, window = wh / heads;
     int x = window / wy * win - sx + slot % win, y = window % wy * win - sy + slot / win;
-    int c = threadIdx.x;
+    int c = threadIdx.x % 32;
     float q = 0, k = 0, v = 0;
     if (x >= 0 && x < width && y >= 0 && y < height) {
         const float* src = qkv + (static_cast<size_t>(y) * width + x) * heads * 96 + head * 96;
@@ -210,35 +250,57 @@ __device__ float warp_max(float v) {
     for (int d = 16; d; d >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, d));
     return __shfl_sync(0xffffffff, v, 0);
 }
+template<int Window>
 __global__ void window_attend(const float* packed, float* out, const float* prior,
-                              int width, int height, int heads, int win, int sx, int sy) {
+                              int width, int height, int heads, int runtime_win, int sx, int sy) {
     extern __shared__ float shared[];
+    const int win = Window ? Window : runtime_win;
     int wh = blockIdx.x, head = wh % heads, window = wh / heads;
     int slots = win * win, wy = (height + sy + win - 1) / win;
     int ox = window / wy * win - sx, oy = window % wy * win - sy;
-    for (int i = threadIdx.x; i < slots * 96; i += blockDim.x)
-        shared[i] = packed[static_cast<size_t>(wh) * slots * 96 + i];
+    float* queries = shared;
+    float* values = queries + slots * 32;
+    float* keys = values + slots * 32;
+    // Score lanes address different keys at the same channel. Row-major keys
+    // cause 32-way shared-bank conflicts; transpose with a padded pitch so both
+    // the transpose stores and score loads are conflict-free for 4/8 windows.
+    int key_pitch = slots + 1;
+    for (int i = threadIdx.x; i < slots * 32; i += blockDim.x) {
+        size_t base = static_cast<size_t>(wh) * slots * 96;
+        queries[i] = packed[base + i];
+        keys[(i % 32) * key_pitch + i / 32] = packed[base + slots * 32 + i];
+        values[i] = packed[base + slots * 64 + i];
+    }
     __syncthreads();
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int query = warp; query < slots; query += blockDim.x / 32) {
         int x = ox + query % win, y = oy + query / win;
         if (x < 0 || x >= width || y < 0 || y >= height) continue;
-        float scores[8], mx = -CUDART_INF_F;
+        float scores[Window ? (Window * Window + 31) / 32 : 8], mx = -CUDART_INF_F;
+#pragma unroll
         for (int t = lane; t < slots; t += 32) {
             float score = 0;
+#pragma unroll
             for (int c = 0; c < 32; ++c)
-                score += shared[query * 32 + c] * shared[slots * 32 + t * 32 + c];
+                score += queries[query * 32 + c] * keys[c * key_pitch + t];
             score += prior[(head * slots + query) * slots + t];
             scores[t / 32] = score; mx = fmaxf(mx, score);
         }
         mx = warp_max(mx);
         float den = 0;
+#pragma unroll
         for (int t = lane; t < slots; t += 32) { scores[t / 32] = expf(scores[t / 32] - mx); den += scores[t / 32]; }
         den = fmaxf(warp_sum(den), 1e-9f);
+        // Normalize each key once, before broadcasting it to the value lanes.
+        // The denominator is identical across the warp; division and the
+        // sequential value accumulation retain the reference rounding order.
+#pragma unroll
+        for (int t = lane; t < slots; t += 32) scores[t / 32] /= den;
         float v = 0;
+#pragma unroll
         for (int t = 0; t < slots; ++t) {
-            float prob = __shfl_sync(0xffffffff, scores[t / 32], t % 32) / den;
-            v += prob * shared[slots * 64 + t * 32 + lane];
+            float prob = __shfl_sync(0xffffffff, scores[t / 32], t % 32);
+            v += prob * values[t * 32 + lane];
         }
         out[(static_cast<size_t>(y) * width + x) * heads * 32 + head * 32 + lane] = v;
     }
@@ -309,6 +371,7 @@ struct CudaEngine::Impl {
     cudaStream_t stream = nullptr;
     cublasHandle_t handle = nullptr;
     cudaEvent_t start = nullptr, stop = nullptr;
+    cudaEvent_t io_events[4]{};
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t executable = nullptr;
     int device = 0;
@@ -319,6 +382,9 @@ struct CudaEngine::Impl {
     std::unordered_map<std::string, std::vector<BlockCfg>> blocks[2];
     std::vector<BlockCfg> vit;
     Buffer<float> features, head, x, up, trans, pooled, vstate, skip[6];
+    Buffer<float> byte_luts;
+    Buffer<unsigned char> bgra_frames, bgra_output;
+    HostBuffer<unsigned char> host_frames, host_output;
     Buffer<float> tmp, aux, merged, residual, qkv, attended, projected, packed;
     Buffer<float> route_norm, logits, gates, group_in, group_hidden, group_ffn, group_res, group_qkv, group_att;
     Buffer<int> pick, counts, counters, ids0, ids1, ids2, row_group;
@@ -335,12 +401,26 @@ struct CudaEngine::Impl {
         if (handle) cublasDestroy(handle);
         if (start) cudaEventDestroy(start);
         if (stop) cudaEventDestroy(stop);
+        for (auto event : io_events) if (event) cudaEventDestroy(event);
         if (stream) cudaStreamDestroy(stream);
     }
     const float* w(const std::string& key) const {
         auto it = weights.find(key);
         if (it == weights.end()) throw std::runtime_error("CUDA missing tensor " + key);
         return it->second->p;
+    }
+    void ensure_graph() {
+        if (executable) return;
+        run(); cu(cudaStreamSynchronize(stream));
+        cu(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        try { run(); }
+        catch (...) {
+            cudaGraph_t abandoned = nullptr; cudaStreamEndCapture(stream, &abandoned);
+            if (abandoned) cudaGraphDestroy(abandoned);
+            throw;
+        }
+        cu(cudaStreamEndCapture(stream, &graph));
+        cu(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
     }
     const float* optional(const std::string& key) const { return weights.count(key) ? w(key) : nullptr; }
     int dim(const std::string& key, int d) const { return shapes.at(key).at(d); }
@@ -386,10 +466,33 @@ struct CudaEngine::Impl {
             if (win < 1 || win > 8) throw std::runtime_error("CUDA window size must be between 1 and 8");
             int windows = ((width + cfg.shift_x + win - 1) / win) * ((height + cfg.shift_y + win - 1) / win);
             packed.resize(static_cast<size_t>(windows) * heads * win * win * 96);
-            window_qkv<<<windows * heads * win * win, 32, 0, stream>>>
-                (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, w(p + ".attention.scale"));
-            window_attend<<<windows * heads, 128, win * win * 96 * sizeof(float), stream>>>
-                (packed.p, attended.p, w(p + ".attention.prior"), width, height, heads, win, cfg.shift_x, cfg.shift_y);
+            int tasks = windows * heads * win * win;
+            auto scale = w(p + ".attention.scale");
+            int qkv_blocks = grid(static_cast<size_t>(tasks) * 32);
+            // Eight independent normalization warps per block avoid the low
+            // occupancy of one 32-thread block per slot, without changing sums.
+            if (win == 4)
+                window_qkv<4><<<qkv_blocks, 256, 0, stream>>>
+                    (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, scale, tasks);
+            else if (win == 8)
+                window_qkv<8><<<qkv_blocks, 256, 0, stream>>>
+                    (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, scale, tasks);
+            else
+                window_qkv<0><<<qkv_blocks, 256, 0, stream>>>
+                    (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, scale, tasks);
+            // Constant windows keep softmax scores in registers and eliminate
+            // dynamic array indexing in the common trained 4x4/8x8 kernels.
+            auto prior = w(p + ".attention.prior");
+            int shared_bytes = (win * win * 96 + 32) * sizeof(float);
+            if (win == 4)
+                window_attend<4><<<windows * heads, 128, shared_bytes, stream>>>
+                    (packed.p, attended.p, prior, width, height, heads, win, cfg.shift_x, cfg.shift_y);
+            else if (win == 8)
+                window_attend<8><<<windows * heads, 512, shared_bytes, stream>>>
+                    (packed.p, attended.p, prior, width, height, heads, win, cfg.shift_x, cfg.shift_y);
+            else
+                window_attend<0><<<windows * heads, 128, shared_bytes, stream>>>
+                    (packed.p, attended.p, prior, width, height, heads, win, cfg.shift_x, cfg.shift_y);
         }
     }
     int route(const float* state, int width, int height, int ch, int E, const std::string& p, bool windows) {
@@ -408,12 +511,17 @@ struct CudaEngine::Impl {
                         w(p + ".router.1.weight"), ch, route_norm.p, ch, &zero, logits.p, E));
         cu(cudaMemsetAsync(counts.p, 0, E * sizeof(int), stream));
         initial_pick<<<grid(items), 256, 0, stream>>>(logits.p, items, E, pick.p, counts.p, keys0.p, ids0.p);
+        // Keys contain a nonnegative float margin plus an expert ID. Sort only
+        // the populated bits; the victim pass needs just the low 32 bits because
+        // its all-ones sentinel sorts after every nonnegative float margin.
+        int key_bits = 32;
+        for (int e = E - 1; e; e >>= 1) ++key_bits;
         size_t bytes = 0;
         cu(cub::DeviceRadixSort::SortPairs(nullptr, bytes, keys0.p, keys1.p, ids0.p, ids1.p, items, 0, 64, stream));
         sort_temp.resize(bytes);
-        cu(cub::DeviceRadixSort::SortPairs(sort_temp.p, bytes, keys0.p, keys1.p, ids0.p, ids1.p, items, 0, 64, stream));
+        cu(cub::DeviceRadixSort::SortPairs(sort_temp.p, bytes, keys0.p, keys1.p, ids0.p, ids1.p, items, 0, key_bits, stream));
         victim_keys<<<grid(items), 256, 0, stream>>>(keys1.p, counts.p, keys2.p, items, E);
-        cu(cub::DeviceRadixSort::SortPairs(sort_temp.p, bytes, keys2.p, keys0.p, ids1.p, ids2.p, items, 0, 64, stream));
+        cu(cub::DeviceRadixSort::SortPairs(sort_temp.p, bytes, keys2.p, keys0.p, ids1.p, ids2.p, items, 0, 32, stream));
         balanced_assign<<<grid(items), 256, 0, stream>>>(ids2.p, keys0.p, counts.p, pick.p, items, E);
         route_gate<<<grid(items), 256, 0, stream>>>(logits.p, pick.p, gates.p, items, E);
         group_in.resize(static_cast<size_t>(E) * cap * ch);
@@ -562,6 +670,7 @@ CudaEngine::CudaEngine(const Engine& model, int device) : impl_(std::make_unique
     p.blocks[0] = model.blocks_[0]; p.blocks[1] = model.blocks_[1];
     cu(cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking));
     cu(cudaEventCreate(&p.start)); cu(cudaEventCreate(&p.stop));
+    for (auto& event : p.io_events) cu(cudaEventCreate(&event));
     blas(cublasCreate(&p.handle)); blas(cublasSetStream(p.handle, p.stream));
     // Preserve f32 precision. TF32 silently changes router logits and is disabled.
     blas(cublasSetMathMode(p.handle, CUBLAS_PEDANTIC_MATH));
@@ -574,6 +683,16 @@ CudaEngine::CudaEngine(const Engine& model, int device) : impl_(std::make_unique
     }
     p.features.resize(static_cast<size_t>(p.g.full_rows) * 16);
     p.head.resize(static_cast<size_t>(p.g.full_rows) * 4);
+    size_t visible = static_cast<size_t>(p.g.valid_width) * p.g.valid_height;
+    p.bgra_frames.resize(visible * 8); p.bgra_output.resize(visible * 5);
+    p.host_frames.allocate(visible * 8); p.host_output.allocate(visible * 5);
+    std::array<float, 512> luts{};
+    for (int i = 0; i < 256; ++i) {
+        luts[i] = round_f16(round_f16(round_f16(i / 255.0f) - 0.5f) * 0.125f);
+        luts[256 + i] = i / 255.0f;
+    }
+    p.byte_luts.resize(luts.size());
+    cu(cudaMemcpyAsync(p.byte_luts.p, luts.data(), luts.size() * sizeof(float), cudaMemcpyHostToDevice, p.stream));
     cu(cudaStreamSynchronize(p.stream));
 }
 CudaEngine::~CudaEngine() = default;
@@ -588,26 +707,68 @@ void CudaEngine::download(float* head) {
     cu(cudaMemcpyAsync(head, p.head.p, static_cast<size_t>(p.g.full_rows) * 4 * sizeof(float), cudaMemcpyDeviceToHost, p.stream));
     cu(cudaStreamSynchronize(p.stream));
 }
+void CudaEngine::download_features(float* features) {
+    auto& p = *impl_; cu(cudaSetDevice(p.device));
+    cu(cudaMemcpyAsync(features, p.features.p, static_cast<size_t>(p.g.full_rows) * 16 * sizeof(float), cudaMemcpyDeviceToHost, p.stream));
+    cu(cudaStreamSynchronize(p.stream));
+}
 double CudaEngine::forward(bool debug) {
     auto& p = *impl_; cu(cudaSetDevice(p.device));
     if (!p.uploaded) throw std::runtime_error("CUDA features must be uploaded before forward");
     p.debugging = debug; p.captures.clear();
-    if (!debug && !p.executable) {
-        // Warm eager execution allocates all arenas and initializes cuBLAS/CUB.
-        p.run(); cu(cudaStreamSynchronize(p.stream));
-        cu(cudaStreamBeginCapture(p.stream, cudaStreamCaptureModeThreadLocal));
-        try { p.run(); }
-        catch (...) {
-            cudaGraph_t abandoned = nullptr; cudaStreamEndCapture(p.stream, &abandoned);
-            if (abandoned) cudaGraphDestroy(abandoned);
-            throw;
-        }
-        cu(cudaStreamEndCapture(p.stream, &p.graph));
-        cu(cudaGraphInstantiate(&p.executable, p.graph, nullptr, nullptr, 0));
-    }
+    if (!debug) p.ensure_graph();
     cu(cudaEventRecord(p.start, p.stream));
     if (debug) p.run(); else cu(cudaGraphLaunch(p.executable, p.stream));
     cu(cudaEventRecord(p.stop, p.stream)); cu(cudaEventSynchronize(p.stop));
     float ms = 0; cu(cudaEventElapsedTime(&ms, p.start, p.stop)); return ms;
 }
 const std::map<std::string, std::vector<float>>& CudaEngine::debug() const { return impl_->captures; }
+
+CudaBgraTimings CudaEngine::infer_bgra(const std::uint8_t* previous, size_t previous_stride,
+                                     const std::uint8_t* current, size_t current_stride,
+                                     float blend_scale, std::uint8_t* bgra, std::uint8_t* confidence) {
+    auto begin = std::chrono::steady_clock::now();
+    auto& p = *impl_; cu(cudaSetDevice(p.device));
+    size_t row_bytes = static_cast<size_t>(p.g.valid_width) * 4;
+    if (!p.uploaded || !previous || !current || !bgra || !confidence ||
+        previous_stride < row_bytes || current_stride < row_bytes || !std::isfinite(blend_scale))
+        throw std::runtime_error("CUDA temporal BGRA requires initialized lanes, valid pointers, strides and blend scale");
+    size_t pixels = static_cast<size_t>(p.g.valid_width) * p.g.valid_height;
+    for (int y = 0; y < p.g.valid_height; ++y) {
+        std::memcpy(p.host_frames.p + y * row_bytes, previous + y * previous_stride, row_bytes);
+        std::memcpy(p.host_frames.p + pixels * 4 + y * row_bytes, current + y * current_stride, row_bytes);
+    }
+    auto prepared = std::chrono::steady_clock::now();
+    p.debugging = false; p.captures.clear(); p.ensure_graph();
+    cu(cudaEventRecord(p.start, p.stream));
+    cu(cudaMemcpyAsync(p.bgra_frames.p, p.host_frames.p, pixels * 8, cudaMemcpyHostToDevice, p.stream));
+    cu(cudaEventRecord(p.io_events[0], p.stream));
+    temporal_bgra<<<grid(static_cast<size_t>(p.g.full_rows) * 6), 256, 0, p.stream>>>
+        (p.bgra_frames.p, p.features.p, p.byte_luts.p, p.g.valid_width, p.g.valid_height, p.g.full_width, p.g.full_height);
+    cu(cudaEventRecord(p.io_events[1], p.stream));
+    cu(cudaGraphLaunch(p.executable, p.stream));
+    cu(cudaEventRecord(p.io_events[2], p.stream));
+    redraw_bgra<<<grid(pixels), 256, 0, p.stream>>>
+        (p.bgra_frames.p + pixels * 4, p.head.p, p.byte_luts.p + 256, p.bgra_output.p,
+         p.g.valid_width, p.g.valid_height, p.g.full_width, blend_scale);
+    cu(cudaEventRecord(p.io_events[3], p.stream));
+    cu(cudaMemcpyAsync(p.host_output.p, p.bgra_output.p, pixels * 5, cudaMemcpyDeviceToHost, p.stream));
+    cu(cudaEventRecord(p.stop, p.stream)); cu(cudaEventSynchronize(p.stop));
+    auto downloaded = std::chrono::steady_clock::now();
+    std::memcpy(bgra, p.host_output.p, pixels * 4);
+    std::memcpy(confidence, p.host_output.p + pixels * 4, pixels);
+    auto end = std::chrono::steady_clock::now();
+    auto elapsed = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    auto gpu_elapsed = [](cudaEvent_t a, cudaEvent_t b) {
+        float ms = 0; cu(cudaEventElapsedTime(&ms, a, b)); return static_cast<double>(ms);
+    };
+    CudaBgraTimings timing;
+    timing.prepare_ms = elapsed(begin, prepared) + gpu_elapsed(p.io_events[0], p.io_events[1]);
+    timing.transfer_ms = gpu_elapsed(p.start, p.io_events[0]) + gpu_elapsed(p.io_events[3], p.stop);
+    timing.output_ms = gpu_elapsed(p.io_events[2], p.io_events[3]) + elapsed(downloaded, end);
+    timing.device_forward_ms = gpu_elapsed(p.io_events[1], p.io_events[2]);
+    // Attribute submission/wait/graph initialization overhead to forward so
+    // the stages still sum to actual host elapsed time rather than GPU time only.
+    timing.forward_ms = std::max(0.0, elapsed(begin, end) - timing.prepare_ms - timing.transfer_ms - timing.output_ms);
+    return timing;
+}

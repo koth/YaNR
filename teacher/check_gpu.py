@@ -3,8 +3,10 @@
 
 Use the existing uv environment. No CUDA-enabled torch is needed: torch is only
 the CPU reference. Student packages are read directly, without weight conversion.
+student_v4 only runs the default controls at 320x320 and 512x512.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -35,28 +37,37 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', default='engine/build-cuda')
     parser.add_argument('--cpu-build', default='engine/build/Release')
+    parser.add_argument('--baseline-gpu', type=Path,
+                        help='optional previous GPU executable for bitwise optimization regression')
     parser.add_argument('--weights', action='append')
     parser.add_argument('--image', default='teacher/samples/lake.png')
     parser.add_argument('--tolerance', type=float, default=2e-3)
-    parser.add_argument('--quick', action='store_true', help='only 320x320 style 1.5')
+    parser.add_argument('--quick', action='store_true', help='only 320x320 style 64')
     args = parser.parse_args()
     suffix = '.exe' if os.name == 'nt' else ''
     cpu = Path(args.cpu_build) / ('cpu_engine' + suffix)
     gpu = Path(args.build) / ('gpu_engine' + suffix)
     torch.set_num_threads(8)
-    packages = args.weights or ['weights/student_mixed', 'weights/student_moe_v0']
+    packages = args.weights or ['weights/student_v3', 'weights/student_v4']
     for package in packages:
-        cases = [(320, 320, 1.5)] if args.quick else [
-            (320, 320, 0), (512, 512, 1.5),
-            (320, 512, 127 if 'moe' in package else 3), (137, 201, 1.5)]
+        shape = json.loads((Path(package) / 'shape.json').read_text(encoding='utf-8'))
+        has_moe = any(level['kind'] == 'moe' for level in shape['levels'])
+        default_only = Path(package).resolve().name.casefold() == 'student_v4'
+        if default_only:
+            cases = [(320, 320, 64)] if args.quick else [(320, 320, 64), (512, 512, 64)]
+        else:
+            cases = [(320, 320, 64)] if args.quick else [
+                (320, 320, 64), (320, 320, 0), (512, 512, 1.5),
+                (320, 512, 127 if has_moe else 3), (137, 201, 1.5)]
         for width, height, style in cases:
             print(f'\n{package}, {width}x{height}, style {style}', flush=True)
             with tempfile.TemporaryDirectory(prefix='yanr_cuda_') as tmp:
                 tmp = Path(tmp)
                 features = tmp / 'features.bin'
                 cpu_head, gpu_head, graph_head = (tmp / n for n in ('cpu.bin', 'gpu.bin', 'graph.bin'))
+                controls = [] if default_only else ['--style', style]
                 run(cpu, [args.image, '--weights', package, '--width', width, '--height', height,
-                          '--style', style, '--threads', 8, '--dump-features', features,
+                          *controls, '--threads', 8, '--dump-features', features,
                           '--out', cpu_head, '--dump-dir', tmp / 'cpu', '-o', tmp / 'cpu.png'])
                 common = ['--weights', package, '--width', width, '--height', height, '--features', features]
                 run(gpu, common + ['--out', gpu_head, '--dump-dir', tmp / 'gpu'])
@@ -76,6 +87,10 @@ def main():
                 again = tmp / 'again.bin'
                 run(gpu, common + ['--out', again, '--bench', '--warmup', 2, '--repeats', 3])
                 compare('CUDA graph repeat determinism', graph, np.fromfile(again, np.float32), 0)
+                if args.baseline_gpu:
+                    baseline = tmp / 'baseline.bin'
+                    run(args.baseline_gpu, common + ['--out', baseline, '--bench', '--warmup', 2, '--repeats', 3])
+                    compare('Previous / optimized CUDA head', np.fromfile(baseline, np.float32), graph, 0)
                 model, _ = load_student_package(package, width, height, 'cpu')
                 feats = np.fromfile(features, np.float32).reshape(-1, 16)
                 with torch.no_grad():

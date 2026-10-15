@@ -14,9 +14,9 @@ cmake -S engine -B engine/build -DNR_AVX2=ON -DNR_VNNI=ON
 cmake --build engine/build --config Release -j 8
 
 # 原尺寸推理，输出到指定位置
-engine/build/Release/cpu_engine.exe photo.jpg --weights weights/student_mixed -o out/photo_nr.png
+engine/build/Release/cpu_engine.exe photo.jpg --weights weights/student_moe_v0 -o out/photo_nr.png
 
-# 指定 style 强度；0 是默认效果，范围 0..127
+# 显式指定旧 student_mixed 训练范围内的 style
 engine/build/Release/cpu_engine.exe photo.jpg --weights weights/student_mixed --style 1.5 -o out/photo_style.png
 
 # student_moe_v0：完整 MoE 权重包
@@ -25,20 +25,24 @@ engine/build/Release/cpu_engine.exe photo.jpg --weights weights/student_moe_v0 -
 # 512x512 推理 + 只测前向（预热 5 次，测量 30 次）
 $env:OMP_NUM_THREADS = '8'
 engine/build/Release/cpu_engine.exe photo.jpg --weights weights/student_mixed --size 512 `
+    --style 0 --tone 0.5 --structure 0.5 --skin -1 --no-automask `
     -o out/photo512_nr.png --bench --warmup 5 --repeats 30
 
 # 非方形输出
-engine/build/Release/cpu_engine.exe photo.jpg --width 512 --height 320 -o out/photo_rect_nr.png
+engine/build/Release/cpu_engine.exe photo.jpg --weights weights/student_moe_v0 `
+    --width 512 --height 320 -o out/photo_rect_nr.png
 ```
 
 只传图片也可以：权重默认 `weights/student_mixed`（相对于当前目录），
 输出默认是输入图片旁的 `<stem>_nr.png`。
 `--size` 将图片缩放为正方形；`--width/--height` 指定各轴尺寸，未指定的轴保持原尺寸。
-`--style` 是 style ID/条件值，名义范围为 `0..127`，默认 `0`，不是后处理强度旋钮。
+CPU/GPU 图片入口和 C++ `LaneParams` 默认均为：`style=64、tone=1、structure=1、skin=1、automask=开启`。
+`--style` 是 style ID/条件值，名义范围为 `0..127`，默认 `64`，不是后处理强度旋钮。
 `student_mixed` 是旧 checkpoint，训练覆盖的 style 范围是 `0..3`；较大的值会把模型推到
 训练分布外，可能出现背景噪声、颜色溢出或结构伪影。需要使用大范围 style 时请改用
-`weights/student_moe_v0`，它按 `0..127` 全量程训练。
-`--tone` 和 `--structure` 会直接写入条件 lane；`--skin` 只有和 `--automask` 一起使用时才生效，
+`weights/student_moe_v0`，它按 `0..127` 全量程训练。旧 `student_mixed` 可将 `--style` 显式设为 `0..3` 范围内的值。
+`--tone` 和 `--structure` 会直接写入条件 lane；`--skin` 仅在自动 mask 开启时生效，
+负值跟随 structure。`--no-automask` 关闭自动 mask，`--automask` 显式开启；
 这是 Python 教师入口的既定语义。使用 `--features` 时输入 lane 已经预先生成，命令行条件参数不会重建它。
 有效尺寸至少 33，各轴上限 8192，d0 网格必须满足模型的 8 倍数约束。
 模型会自行生成 padding，PNG 只保留有效图片区域。
@@ -73,9 +77,10 @@ Toolkit 不在默认位置时，配置命令加上 `-DCUDAToolkit_ROOT=D:/CUDA/v
 
 ```powershell
 engine/build-cuda/gpu_engine.exe photo.jpg --weights weights/student_moe_v0 `
-    --style 1.5 --size 512 -o out/photo_gpu.png
+    --size 512 -o out/photo_gpu.png
 
 engine/build-cuda/gpu_engine.exe teacher/samples/lake.png --weights weights/student_moe_v0 `
+    --style 0 --tone 0.5 --structure 0.5 --skin -1 --no-automask `
     --size 512 --bench --warmup 10 --repeats 50 -o out/lake_gpu.png
 
 # 同一入口显式选后端；选择第 0 张 CUDA 显卡
@@ -107,10 +112,35 @@ $env:OMP_NUM_THREADS = '8'
 .venv/Scripts/python.exe teacher/check_gpu.py --build engine/build-cuda --cpu-build engine/build/Release
 ```
 
-两种真实权重的 320×320、512×512、320×512 和 137×201 均通过逐层 CPU / CUDA
+初版验证中，两种真实权重的 320×320、512×512、320×512 和 137×201 均通过逐层 CPU / CUDA
 及 PyTorch head 对账，包含 style 0、1.5、3/127。最大 head 误差不超过 `1.8e-5`
 （阈值 `2e-3`）；CUDA eager 与 Graph 回放、独立重复运行的 head 逐位一致。
 CUDA Compute Sanitizer 的 MoE 320×320 内存检查与线程竞争检查均通过（0 errors / 0 hazards）。
+
+2026-10-14 以 `student_v3/v4` 为验收对象。v3 保留控制参数、尺寸与 history 覆盖，
+9/9 通过；v4 仅测试默认 `style=64, tone=1, structure=1, skin=1, automask=on`，
+320×320、512×512 均通过，最大 head 误差 `1.240e-5`。
+这 11 组的输入 lanes 逐位一致，静态 PNG 最大通道误差为 `1/255`。
+两个回归脚本均限制 v4 只测默认参数；复现命令和已修复的 half 舍入问题见
+[PARITY.md](PARITY.md)。
+
+窗口注意力对常用 4×4/8×8 使用编译期尺寸，保留其他 1..8 窗口的通用路径。
+K 在共享内存中转置并加一个 padding 元素；softmax 每个 key 只归一化一次，
+随后广播给 value 通道，保持原来的逐项累加和 FP32 舍入。8×8 使用 512 个线程。
+MoE 两次稳定排序分别只处理 expert ID + margin 的有效位、32 位 margin；
+不改变专家选择、配额、相同 margin 的稳定顺序或全 1 的非 victim 哨兵。
+对比优化前可追加 `--baseline-gpu <旧版gpu_engine.exe>`，检查所有 case 的完整
+head 是否逐位一致；Windows 使用 `$env:PYTHONUTF8 = '1'` 读取 UTF-8 shape 文件。
+
+C++ `infer_bgra` 提供同尺寸的时序输入/输出路径。先用 `upload` 初始化不变的
+noise/control lanes；之后上传前后两帧 BGRA8（支持不同的行 stride），在 GPU
+只更新 lanes 4..9，并转换 FP32 head 为 BGRA8 + confidence。256 项查表沿用
+CPU 的三次 half 舍入，包含镜像并 clamp 的边界；输出 RGB 累加/量化保留原顺序。
+输入和输出 staging 一次分配为 page-locked memory，稳态只在最终下载后等待一次。
+`CudaBgraTimings` 的各项加和为 host elapsed：prepare 含 host copy/GPU lanes，
+transfer 为 H2D+D2H device events，output 为 GPU 转换/host copy，forward 含
+提交/等待开销；`device_forward_ms` 单列纯网络 event 时间。`download_features`
+用于核对全部 lanes。CLI 仍使用原 float pipeline，`--bench` 继续只计纯网络。
 
 ### CUDA 前向 benchmark
 
@@ -125,6 +155,13 @@ Windows 桌面应用在运行，GPU 承担显示任务，后台负载会影响�
 | `student_mixed` | 512×512 | 576×512 | 80.180 ms | 11.177 ms | 11.629 ms | 7.2× |
 | `student_moe_v0` | 320×320 | 320×320 | 84.497 ms | 8.374 ms | 8.818 ms | 10.1× |
 | `student_moe_v0` | 512×512 | 576×512 | 228.584 ms | 17.276 ms | 17.965 ms | 13.2× |
+
+上表为窗口注意力优化前的初版 engine。优化后的 WOF 原始截图（384×224，
+实际 field 384×320，seed 0）预热 10 次、测量 50 次：GPU median **6.317 ms**、
+p90 **6.894 ms**；保存的旧版同图 median 8.525 ms。完整 FP32 head 的 SHA256
+一致。MAME 游戏内纯网络约 7.074 ms，整段 BGRA adapter 约 7.530 ms（包含
+两帧 staging、GPU lanes、H2D/D2H、输出转换和等待；排除最终 BGFX 上传）。
+独立 benchmark 与同时进行 BGFX 渲染的游戏测量不能视为相同负载或硬时延保证。
 
 MoE 的 320 / 512 H2D 输入约 1.31 / 3.29 ms，D2H head 约 0.34 / 0.75 ms，
 均在上表前向时间之外。CUDA 上下文与权重上传也另计；反复启动进程会重复加载。
@@ -186,6 +223,7 @@ VNNI 加速 INT8 点积，默认 FP32 推理需显式启用 `NR_INT8=1` 才会�
 $env:NR_INT8 = '1'
 $env:NR_VNNI = 'auto'
 engine/build/Release/cpu_engine.exe teacher/samples/lake.png --weights weights/student_mixed `
+    --style 0 --tone 0.5 --structure 0.5 --skin -1 --no-automask `
     --size 512 --threads 8 --bench --warmup 10 --repeats 50 -o out/lake_vnni.png
 ```
 

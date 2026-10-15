@@ -1,7 +1,7 @@
 // cpu_lanes: build the 16-lane feature field from a raw proxy dump (task 8.3 parity tool).
 //
 //   cpu_lanes --proxy proxy.bin --out lanes.bin --vw W --vh H --seed N
-//             [--style x --tone y --structure z --skin s] [--automask] [--history hist.bin]
+//             [--style x --tone y --structure z --skin s] [--automask | --no-automask] [--history hist.bin]
 //
 // proxy/history: raw f32 [vh][vw][3] code values. lanes: raw f32 [full_rows][16].
 // The parity check (teacher/check_lanes.py) compares this byte stream against
@@ -38,6 +38,7 @@ int main(int argc, char** argv) {
         else if (a == "--structure") p.structure = std::atof(next());
         else if (a == "--skin") p.skin = std::atof(next());
         else if (a == "--automask") p.auto_mask = true;
+        else if (a == "--no-automask") p.auto_mask = false;
         else if (a == "--bench") bench_reps = std::atoi(next());
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }

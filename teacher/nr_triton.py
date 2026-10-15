@@ -501,8 +501,12 @@ def fp8_gemm_partitioned(x, w, partition, residual=None, aux=None, silu=False,
         seed = (residual.float() * aux.view(1, 1, -1).float()).to(torch.float16)
     combined = None
     for lo in range(0, k, partition):
-        part = fp8_gemm(x[:, :, lo:lo + partition], w[:, lo:lo + partition, :],
-                        seed if lo == 0 else None, partition=0, tm=tm, tn=tn, num_warps=num_warps)
+        part = torch.empty(x.shape[0], x.shape[1], w.shape[2], dtype=torch.float16, device=x.device)
+        # This graph wrapper receives logical channels, unlike the plain chain.
+        # Keep the input swizzle for every partition, as fp8_gemm_full does.
+        _launch_gemm(x[:, :, lo:lo + partition], w[:, lo:lo + partition, :],
+                     seed if lo == 0 else None, None, None, part, None, None,
+                     False, swizzle, tm, tn, num_warps)
         combined = part if combined is None else (combined.float() + part.float()).to(torch.float16)
     value = combined
     if silu:
