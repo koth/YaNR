@@ -69,6 +69,8 @@ DEFAULTS = {
     'texture_knee': 0.005,       # 高频专项:半衰点(≈1.3/255;滑区造纹理 ~2/255 落近满权区)
     'tex_boost': 0.0,            # 滑区加成(2026-10-14 v4.1b):输入平滑像素的高频权重倍增上限
     'tex_sigma': 0.008,          # 滑区加成宽度(|hf(输入)| 尺度 ≈2/255;平滑度高斯窗)
+    'loss_texstat': 0.0,         # 纹理能量统计项(2026-10-15 v4.2):局部 |hf| 幅度匹配教师
+    'texstat_boost': 3.0,        # 统计项滑区加成倍数(造纹理分支的主战场)
     'ema_every': 1,              # EMA 更新间隔步数(decay 取 ^ema_every,期望等效;省每步发射)
     'pair_fraction': 0.5,        # 时序对采样比例(历史腿:上帧教师输出 -> truncate_half -> 重投影)
     'crop_prob': 0.5,            # 随机原生裁剪(尺度抖动 1-2x);其余整图 resize
@@ -311,7 +313,8 @@ def hf(x):
 def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
                   logit_w=1.0, act_floor=0.1, act_knee=0.02,
                   tex_w=0.0, tex_floor=0.25, tex_knee=0.005,
-                  tex_boost=0.0, tex_sigma=0.008):
+                  tex_boost=0.0, tex_sigma=0.008,
+                  texstat_w=0.0, texstat_boost=3.0):
     """输出损失(5.3):rgb/4 L1 + blend logit SmoothL1 + 合成图 L1,按教师改动幅度加权。
 
     2026-10-12 损失改造(用户口径:低水平修改不需要学习,学就学改动较大的):
@@ -367,11 +370,32 @@ def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
                 # 滑区加成(v4.1b):皮肤滑区造纹理是稀有事件,全图均值梯度被大面积非
                 # 皮肤高频淹没 —— 20K 实测滑区复刻 43%(10K 61% 被挤出)。输入自身
                 # 高频越小(越平滑)加成越大,直接对准滑区复刻率验收指标。
+                # (v4.2 起默认关:逐像素 L1 对自造纹理的最优解是"不造",加成反而
+                #  加速收敛到零;造纹理分支交给下面的统计项。)
                 mag0 = hf(proxy).abs().mean(dim=3, keepdim=True)
                 wt = wt * (1.0 + tex_boost * torch.exp(-(mag0 / tex_sigma) ** 2))
         tex_v = pm((hf(s_neural) - hf(t_neural)).abs() * wt)
         out = out + tex_w * tex_v
-    return out, s_neural, t_neural, tex_v
+    stat_v = torch.zeros(s_head.shape[0], dtype=s_head.dtype, device=s_head.device)
+    if texstat_w > 0:
+        # 纹理能量统计项(v4.2):教师造纹理是自造非还原(corr≈0),逐像素 L1 追
+        # 不可预测纹理的最优解是"不造"(40K 实测滑区复刻 34-42%,权重越大掉得越快)。
+        # 改为局部 |hf| 幅度统计匹配:学生造什么纹理由它,能量对上就给分 ——
+        # 正对着"滑区纹理复刻率"验收口径。幅值用 Charbonnier 光滑,免零点梯度死角。
+        def local_amp(z):
+            a = torch.sqrt(hf(z) ** 2 + 1e-8).mean(dim=3, keepdim=True).permute(0, 3, 1, 2)
+            return F.avg_pool2d(F.pad(a, (6, 6, 6, 6), mode='replicate'), 13,
+                                stride=1).permute(0, 2, 3, 1)
+
+        amp_s, amp_t = local_amp(s_neural - proxy), local_amp(t_neural - proxy)
+        wstat = 1.0
+        if texstat_boost > 0:
+            with torch.no_grad():
+                mag0 = hf(proxy).abs().mean(dim=3, keepdim=True)
+                wstat = 1.0 + texstat_boost * torch.exp(-(mag0 / tex_sigma) ** 2)
+        stat_v = pm((amp_s - amp_t).abs() * wstat)
+        out = out + texstat_w * stat_v
+    return out, s_neural, t_neural, tex_v, stat_v
 
 
 class FeatureAligner(nn.Module):
@@ -735,7 +759,7 @@ def main():
             group['lr'] = lr
         t0 = time.perf_counter()
         totals = {'out': 0.0, 'detail': 0.0, 'feature': 0.0, 'temporal': 0.0,
-                  'texture': 0.0}
+                  'texture': 0.0, 'texstat': 0.0}
         moe_tot = {}
         feat_detail_acc = {}
         psnrs = []
@@ -813,14 +837,15 @@ def main():
                 t_head_t = torch.from_numpy(np.stack([p['t_head'] for p in chunk])).to(device)
                 repro_t = (torch.from_numpy(np.stack([p['repro'] for p in chunk])).to(device)
                            if kind == 'pair' else None)
-                out_v, s_neural, t_neural, tex_v = output_losses(
+                out_v, s_neural, t_neural, tex_v, stat_v = output_losses(
                     s_head_all, t_head_t, proxy_t, repro=repro_t,
                     s_scale=model.blend_scale,
                     t_scale=torch.tensor([p['t_scale'] for p in chunk], device=device),
                     logit_w=cfg['loss_logit'], act_floor=cfg['action_floor'],
                     act_knee=cfg['action_knee'], tex_w=cfg['loss_texture'],
                     tex_floor=cfg['texture_floor'], tex_knee=cfg['texture_knee'],
-                    tex_boost=cfg['tex_boost'], tex_sigma=cfg['tex_sigma'])
+                    tex_boost=cfg['tex_boost'], tex_sigma=cfg['tex_sigma'],
+                    texstat_w=cfg['loss_texstat'], texstat_boost=cfg['texstat_boost'])
                 # ^ s_scale 传张量而非 float:blend_scale 是 nn.Parameter,曾被 float(detach())
                 #   断梯度永远停在 1.0(教师实测 0.7397,历史混合量差 35%)。2026-10-10 修。
                 detail_v = laplacian_l1(s_neural, t_neural) + sobel_l1(s_neural, t_neural)
@@ -845,6 +870,7 @@ def main():
                 totals['out'] += float((out_v * fm).sum())
                 totals['detail'] += float((detail_v * fm).sum())
                 totals['texture'] += float((tex_v * fm).sum())
+                totals['texstat'] += float((stat_v * fm).sum())
                 if temporal_v is not None:
                     totals['temporal'] += float((temporal_v * fm).sum())
                 mse = ((s_neural.detach() - t_neural.detach()) ** 2).reshape(cnb, -1).mean(1)
@@ -905,7 +931,8 @@ def main():
             log.flush()
             print(f"step {step:6d}  lr {lr:.2e}  out {totals['out'] / n:.5f}  "
                   f"detail {totals['detail'] / n:.5f}  feat {totals['feature'] / n:.5f}  "
-                  f"temp {totals['temporal'] / n:.5f}  tex {totals['texture'] / n:.5f}  "
+                  f"temp {totals['temporal'] / n:.5f}  tex {totals['texture'] / n:.5f}"
+                  f"  stat {totals['texstat'] / n:.5f}  "
                   f"psnr(t) {sum(psnrs) / len(psnrs):.2f}"
                   + (f"  moe_aux {aux_val:.3f} umax {moe_tot.get('util_worst', 0.0) / max(1, len(psnrs)):.2f}"
                      if aux_val > 0 else "")

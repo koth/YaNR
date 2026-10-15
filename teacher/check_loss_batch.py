@@ -14,7 +14,8 @@ from train_distill import hf, laplacian_l1, output_losses, sobel_l1  # noqa: E40
 
 KW = dict(logit_w=1.0, act_floor=0.2, act_knee=0.01,
           tex_w=1.0, tex_floor=0.25, tex_knee=0.005,
-          tex_boost=4.0, tex_sigma=0.008)
+          tex_boost=0.0, tex_sigma=0.008,
+          texstat_w=2.0, texstat_boost=3.0)
 
 
 def rel(a, b):
@@ -32,17 +33,18 @@ def main():
 
     worst = 0.0
     for name, repro_b in (('single', None), ('pair', repro)):
-        out_v, s_n, t_n, tex_v = output_losses(
+        out_v, s_n, t_n, tex_v, stat_v = output_losses(
             s_head, t_head, proxy, repro=repro_b, s_scale=0.8, t_scale=t_scale, **KW)
         det_v = laplacian_l1(s_n, t_n) + sobel_l1(s_n, t_n)
         hf_v = hf(s_n)
         for i in range(b):
             repro_i = repro_b[i:i + 1] if repro_b is not None else None
-            out1, s1, t1, tex1 = output_losses(
+            out1, s1, t1, tex1, stat1 = output_losses(
                 s_head[i:i + 1], t_head[i:i + 1], proxy[i:i + 1], repro=repro_i,
                 s_scale=0.8, t_scale=t_scale[i:i + 1], **KW)
             det1 = laplacian_l1(s1, t1) + sobel_l1(s1, t1)
             checks = [('out', out_v[i], out1[0]), ('tex', tex_v[i], tex1[0]),
+                      ('stat', stat_v[i], stat1[0]),
                       ('detail', det_v[i], det1[0])]
             for tag, got, want in checks:
                 r = rel(got, want)
