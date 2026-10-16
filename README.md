@@ -164,6 +164,14 @@ style 值可能出现背景噪声、颜色溢出或结构伪影；需要全量�
 `clamp(proxy + head_rgb / 4, 0, 1)` 合成，首帧不额外应用时序融合。
 使用 `--features` 输入预先生成的 lane 时，命令行条件参数不会重新构造它们。
 
+## 批量重跑样例
+
+批量按原尺寸重跑 `teacher/samples/t1`～`t7`：Windows 使用
+`engine/run_samples.ps1`，Linux 使用 `bash engine/run_samples.sh`。
+默认 `student_v43`、style=2、tone=1、structure=1、skin=-1、automask=1，
+直接覆盖各目录的 `nr.png`，不备份。
+构建、Linux 解码依赖和可选参数见 [批处理说明](engine/README.md#批量重跑-t1t7)。
+
 ## 前向性能
 
 `--bench` 只测 `Engine::forward`，预热、权重加载与打包、图片解码与缩放、输入 lane

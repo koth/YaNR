@@ -40,7 +40,7 @@ def read_packed(path):
     return header.get('__metadata__', {}), records
 
 
-def convert_student(ckpt_path, out, stages, size=512, shape_json=None):
+def convert_student(ckpt_path, out, stages, size=512, shape_json=None, student_state='ema'):
     """学生权重打包(7.1):train_distill ckpt.pt -> manifest.json + model/stages/s*.bin。
 
     与教师同格式(sha256 + 逐 tensor 偏移),张量为 f32 裸数据;形状自动探测
@@ -52,7 +52,8 @@ def convert_student(ckpt_path, out, stages, size=512, shape_json=None):
     from nr_student import StudentNetwork, load_student_shape
 
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    state = ckpt.get('ema', ckpt.get('model', ckpt))       # EMA 优先(部署口径,同 dump_weights)
+    use_ema = student_state == 'ema' and 'ema' in ckpt
+    state = ckpt['ema'] if use_ema else ckpt.get('model', ckpt)
     cfg = ckpt.get('config', {}) or {}
     step = int(ckpt.get('step', -1))
     shape_path = shape_json or cfg.get('shape')
@@ -65,10 +66,32 @@ def convert_student(ckpt_path, out, stages, size=512, shape_json=None):
     model = StudentNetwork(shape, g).eval()
     model.load_state_dict(state)                            # strict:形状与权重必须一致
 
+    extra = {'trainConfig': {k: v for k, v in cfg.items()
+                            if k in ('size', 'size_weights', 'steps', 'pair_fraction', 'loss_temporal')}}
+    if getattr(model, 'shared_routed', False):
+        from moe_training import BiasController
+        controller = ckpt.get('routing_controller', {})
+        if (controller.get('version') != BiasController.VERSION or controller.get('step') is not None or
+                controller.get('last_applied_step') != step):
+            raise ValueError('shared/routed export requires a complete optimizer/controller boundary checkpoint')
+        source = ckpt.get('source') or cfg.get('source')
+        if not source or 'teacher_manifest_sha256' not in source or 'student_commit' not in source:
+            raise ValueError('shared/routed checkpoint is missing teacher/student provenance')
+        ema_source = ckpt.get('ema_bias_source')
+        if use_ema and (not ema_source or ema_source.get('optimizer_step') != step or
+                             ema_source.get('policy') != 'copy-after-optimizer-controller-v1'):
+            raise ValueError('shared/routed EMA bias snapshot provenance mismatch')
+        with open(ckpt_path, 'rb') as checkpoint_file:
+            checkpoint_hash = hashlib.sha256(checkpoint_file.read()).hexdigest()
+        extra.update(source=source, untrainedPrototype=False, validationOnly=cfg.get('validation_only', False), checkpointSha256=checkpoint_hash,
+                     weightSource='ema' if use_ema else 'model', biasSource=ema_source if use_ema else dict(policy='raw-controller', optimizer_step=step))
+        extra['trainConfig'].update({k: v for k, v in cfg.items()
+                                    if k in ('student_precision', 'router_jitter', 'moe_aux', 'moe_z', 'moe_z_formula',
+                                             'moe_bias_rate', 'ema_bias_policy', 'seed', 'style_range', 'tone_range',
+                                             'skin_range', 'structure_range', 'automask_prob')})
+
     manifest = write_package(model, state, out, shape_path, step=step, stages=stages,
-                             extra={'trainConfig': {k: v for k, v in cfg.items()
-                                                    if k in ('size', 'size_weights', 'steps',
-                                                             'pair_fraction', 'loss_temporal')}})
+                             extra=extra)
     meta = manifest['model']
     print(f"student package: {meta['version']}  {meta['params']:,} params  "
           f"{sum(t['byteLength'] for t in manifest['tensors']) / 1e6:.2f} MB f32  "
@@ -84,6 +107,7 @@ def main():
                                       'with --shape student: train_distill ckpt.pt')
     parser.add_argument('-o', '--out', required=True, help='output model directory')
     parser.add_argument('--stages', type=int, default=3, help='number of stage files to split into')
+    parser.add_argument('--student-state', choices=('ema', 'model'), default='ema', help='Student checkpoint weights; EMA is the compatible default')
     parser.add_argument('--template', default=None,
                         help='an existing manifest.json to cross-check record sizes against')
     parser.add_argument('--shape', default=None,
@@ -96,7 +120,7 @@ def main():
 
     if args.shape == 'student':
         return convert_student(args.packed, args.out, args.stages,
-                               size=args.size, shape_json=args.shape_json)
+                               size=args.size, shape_json=args.shape_json, student_state=args.student_state)
     if args.shape is not None:
         raise SystemExit(f'--shape {args.shape!r} 未支持(教师打包不需要;学生用 --shape student)')
 

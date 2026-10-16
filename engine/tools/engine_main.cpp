@@ -36,6 +36,7 @@ void usage() {
         "usage: " NR_CLI_NAME " IMAGE [--weights weights/student_mixed] [--png OUTPUT.png]\n"
         "                  [--size N | --width W --height H] [--bench] [--repeats 30]\n"
         "                  [--warmup 5] [--threads 8] [--seed 12345] [--style 64]\n"
+        "                  [--bench-times TIMINGS.txt]\n"
         "                  [--tone 1] [--structure 1] [--skin 1] [--automask | --no-automask]\n"
         "                  [--blend-png blend.png] [--proxy-png proxy.png]\n"
         "                  [--backend cpu|cuda] [--device 0]\n"
@@ -100,7 +101,7 @@ double elapsed(std::chrono::steady_clock::time_point t0) {
 }
 int run(const std::vector<std::string>& args) {
     std::string idx_path, weights_path, image_path, feat_path, out_path, dump_dir;
-    std::string proxy_path, png_path, blend_path, proxy_png, dump_features;
+    std::string proxy_path, png_path, blend_path, proxy_png, dump_features, bench_times;
     int repeats = 30, warmup = 5, threads = 0, width = 0, height = 0;
     bool bench = false;
     int device = 0;
@@ -125,6 +126,7 @@ int run(const std::vector<std::string>& args) {
         else if (a == "--out") out_path = next();
         else if (a == "--dump-dir") dump_dir = next();
         else if (a == "--dump-features") dump_features = next();
+        else if (a == "--bench-times") bench_times = next();
         else if (a == "--proxy") proxy_path = next();
         else if (a == "--png" || a == "-o") png_path = next();
         else if (a == "--blend-png") blend_path = next();
@@ -171,6 +173,7 @@ int run(const std::vector<std::string>& args) {
     if (!image_path.empty() && !proxy_path.empty()) throw std::runtime_error("--image already provides the proxy");
     if (!idx_path.empty() && (width || height)) throw std::runtime_error("--idx fixes the geometry; use --weights to resize");
     if (weights_path.empty() && idx_path.empty()) weights_path = "weights/student_mixed";
+    if (!bench_times.empty() && !bench) throw std::runtime_error("--bench-times requires --bench");
     if (!threads) threads = std::getenv("OMP_NUM_THREADS") ? omp_get_max_threads() : 8;
     omp_set_dynamic(0);
     omp_set_num_threads(threads);
@@ -259,11 +262,20 @@ int run(const std::vector<std::string>& args) {
         for (int i = 0; i < repeats; ++i) {
             times.push_back(forward());
         }
+        if (!bench_times.empty()) {
+            mkdir_parent(bench_times);
+            std::ofstream samples(fs::u8path(bench_times));
+            samples.precision(17);
+            for (double ms : times) samples << ms << '\n';
+            samples.close();
+            if (!samples) throw std::runtime_error("cannot write " + bench_times);
+        }
         std::sort(times.begin(), times.end());
         double median = (times[(repeats - 1) / 2] + times[repeats / 2]) * 0.5;
         double p90 = times[static_cast<size_t>(std::ceil(repeats * 0.9)) - 1];
-        std::printf("forward only: median %.3f ms  min %.3f ms  p90 %.3f ms  (%d warmup, %d repeats)\n",
-                    median, times.front(), p90, warmup, repeats);
+        double p95 = times[static_cast<size_t>(std::ceil(repeats * 0.95)) - 1];
+        std::printf("forward only: median %.3f ms  min %.3f ms  p90 %.3f ms  p95 %.3f ms  (%d warmup, %d repeats)\n",
+                    median, times.front(), p90, p95, warmup, repeats);
         if (profile) {
             const double* p = engine->profile();
             double inv = 1.0 / repeats;
@@ -292,6 +304,12 @@ int run(const std::vector<std::string>& args) {
         t0 = std::chrono::steady_clock::now();
         gpu->download(head.data());
         download_ms = elapsed(t0);
+        auto bytes = gpu->buffer_bytes();
+        std::printf("CUDA buffers: resident %zu bytes  allocation high-water %zu bytes (excludes CUDA/cuBLAS/Graph internal allocations)\n", bytes.first, bytes.second);
+        auto memory = gpu->memory_sample_bytes();
+        if (!memory.empty()) std::printf("CUDA memory sample: total %zu initial-used %zu peak-used %zu delta %zu bytes (device-wide, sampled at allocations/operation boundaries; separate diagnostic)\n", memory[0], memory[1], memory[2], memory[3]);
+        for (const auto& kv : gpu->profile())
+            std::printf("CUDA profile: %.6f ms %s\n", kv.second, kv.first.c_str());
         std::printf("outside forward: CUDA init+weight upload %.2f ms  H2D features %.2f ms  D2H head %.2f ms\n",
                     gpu_load_ms, upload_ms, download_ms);
         for (const auto& kv : gpu->debug())

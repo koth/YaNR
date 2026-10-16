@@ -5,6 +5,7 @@
 #include <vector>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 class Engine;
 
@@ -35,6 +36,13 @@ public:
                              const std::uint8_t* current, std::size_t current_stride,
                              float blend_scale, std::uint8_t* bgra, std::uint8_t* confidence);
     const std::map<std::string, std::vector<float>>& debug() const;
+    // Diagnostic mode NR_CUDA_PROFILE=1 inserts Graph event nodes; instrumentation
+    // is excluded from normal Graph benchmarks. Last forward, per operation.
+    const std::map<std::string, double>& profile() const;
+    std::pair<std::size_t, std::size_t> buffer_bytes() const; // resident, allocation high-water
+    // NR_CUDA_MEMORY=1 samples device memory at allocations/operation boundaries.
+    // Device-wide totals include other applications; run separately from timing.
+    std::vector<std::size_t> memory_sample_bytes() const; // total, initial used, sampled peak used, delta
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -56,6 +56,9 @@ def load_student_shape(path):
     """shapes/*.json(与 cost_model 同一 DSL)。"""
     with open(path) as fh:
         spec = json.load(fh)
+    if 'architecture' in spec:
+        from moe_shape import validate
+        return validate(spec)
     for level in spec['levels']:
         if level['channels'] % 32 or level['hidden'] % 32:
             raise ValueError(f"{level['level']}: channels/hidden must be multiples of 32")
@@ -577,6 +580,9 @@ def make_block(level, phase_index):
     ch = level['channels']
     attn = level.get('attn', True)
     window = level.get('window_slots', WINDOW)
+    if kind == 'shared_routed_moe':
+        from nr_shared_moe import SharedRoutedBlock
+        return SharedRoutedBlock(ch, level['hidden'], attn=attn, phase_index=phase_index)
     if kind == 'ffn':
         return FFNBlock(ch, level['hidden'], attn=attn, window=window, phase_index=phase_index)
     if kind == 'expert':
@@ -602,6 +608,12 @@ class StudentNetwork(nn.Module):
         super().__init__()
         self.g = g
         self.shape = shape
+        from moe_shape import is_shared, validate
+        self.shared_routed = is_shared(shape)
+        if 'architecture' in shape or any(lv['kind'] == 'shared_routed_moe' for lv in shape['levels']):
+            validate(shape)
+        if self.shared_routed:
+            from nr_shared_moe import SharedRoutedLinear, SharedRoutedBlock
         self.blend_scale = nn.Parameter(torch.ones(1))
         levels = {lv['level']: lv for lv in shape['levels']}
         order = ('full', 'd0', 'd1', 'd2', 'd3', 'd4')
@@ -626,21 +638,25 @@ class StudentNetwork(nn.Module):
                               'enc': enc_count, 'dec': dec_count})
 
         # 过渡:enc 每级 ch->2ch(含 full->d0 的学习变换)、dec 对称、上采样合并、ViT 进出。
+        transition = SharedRoutedLinear if self.shared_routed else nn.Linear
         self.enc_trans = nn.ModuleDict({
-            name: nn.Linear(self.channels[low], self.channels[name])
+            name: transition(self.channels[low], self.channels[name])
             for low, name in zip(order, order[1:])})
         # 解码投影方向相反:高层(更大) -> 本层。
         self.dec_trans = nn.ModuleDict({
-            name: nn.Linear(self.channels[higher], self.channels[name])
+            name: transition(self.channels[higher], self.channels[name])
             for name, higher in (('d3', 'd4'), ('d2', 'd3'), ('d1', 'd2'), ('d0', 'd1'))})
         self.merge = nn.ModuleDict({name: UpsampleMerge(self.channels[name])
                                     for name in order[1:]})
         vit_ch = shape['vit']['channels']
-        self.vit_in = nn.Linear(self.channels['d4'], vit_ch)
-        self.vit_out = nn.Linear(vit_ch, self.channels['d4'])
+        self.vit_in = (transition(self.channels['d4'], vit_ch, token=True) if self.shared_routed
+                       else transition(self.channels['d4'], vit_ch))
+        self.vit_out = (transition(vit_ch, self.channels['d4'], token=True) if self.shared_routed
+                        else transition(vit_ch, self.channels['d4']))
         vit_experts = int(shape['vit'].get('experts', 0))
         self.vit_blocks = nn.ModuleList(
-            (MoEVitBlock(vit_ch, shape['vit']['ffn'], experts=vit_experts) if vit_experts >= 2
+            (SharedRoutedBlock(vit_ch, shape['vit']['ffn'], token=True) if self.shared_routed else
+             MoEVitBlock(vit_ch, shape['vit']['ffn'], experts=vit_experts) if vit_experts >= 2
              else VitBlock(vit_ch, shape['vit']['ffn'])) for _ in range(shape['vit']['blocks']))
         self.post = PostBlend(self.channels['full'])
 
@@ -650,6 +666,9 @@ class StudentNetwork(nn.Module):
     def capture(self, name, tensor):
         if self.capture_enabled:
             self.captures[name] = tensor
+
+    def transition(self, module, state, width, height, batch):
+        return module(state, width, height, batch) if self.shared_routed else module(state)
 
     def moe_aux_loss(self):
         """Switch 负载均衡辅助损失:E * Σ_e f_e * mean(p_e)(f 常数、p 可导);无 MoE 块=0。"""
@@ -664,13 +683,14 @@ class StudentNetwork(nn.Module):
         return total / len(stats)
 
     def moe_z_loss(self):
-        """router z-loss(ST-MoE):mean(logits²),压 logits 幅值防 softmax 饱和。"""
+        """New shared/routed: ST-MoE logsumexp²; legacy preserves old logits L2."""
         stats = [s for m in self.modules() if hasattr(m, 'moe_stats') for s in m.moe_stats]
         if not stats:
             return torch.zeros((), device=self.blend_scale.device)
         total = self.blend_scale.new_zeros(())
         for _assign, _probs, logits in stats:
-            total = total + (logits ** 2).mean()
+            total = total + (torch.logsumexp(logits.float(), dim=-1).square().mean()
+                             if self.shared_routed else (logits ** 2).mean())
         return total / len(stats)
 
     def forward(self, features, batch=1):
@@ -680,6 +700,8 @@ class StudentNetwork(nn.Module):
         for m in self.modules():
             if hasattr(m, 'moe_stats'):
                 m.moe_stats.clear()
+            if hasattr(m, 'training_metric_records'):
+                m.training_metric_records.clear()
         g = self.g
         full_w, full_h = g['full_width'], g['full_height']
         order = ('full', 'd0', 'd1', 'd2', 'd3', 'd4')
@@ -697,14 +719,15 @@ class StudentNetwork(nn.Module):
             if name != 'd4':
                 next_name = order[i + 1]
                 nw, nh = level_size(g, next_name)
-                state = self.enc_trans[next_name](
-                    box_downsample(state, width, height, nw, nh, batch=batch))
+                state = self.transition(self.enc_trans[next_name],
+                    box_downsample(state, width, height, nw, nh, batch=batch), nw, nh, batch)
 
         # ---- ViT(d5 tokens)。
         tokens = g['vit_tokens']
         padded = g['padded_vit_tokens']
         dw, dh = level_size(g, 'd5')
-        state = self.vit_in(box_downsample(state, *level_size(g, 'd4'), dw, dh, batch=batch))
+        state = self.transition(self.vit_in,
+            box_downsample(state, *level_size(g, 'd4'), dw, dh, batch=batch), dw, dh, batch)
         if batch > 1:
             per_sample = state.view(batch, tokens, -1)
             outs = []
@@ -720,12 +743,12 @@ class StudentNetwork(nn.Module):
         self.capture('s-vit', state)
 
         # ---- 解码:d5 -> d4 -> d3 -> d2 -> d1 -> d0 -> full。
-        state = self.vit_out(state)
+        state = self.transition(self.vit_out, state, dw, dh, batch)
         prev_name, prev_w, prev_h = 'd5', dw, dh
         for name in ('d4', 'd3', 'd2', 'd1', 'd0'):
             width, height = level_size(g, name)
             if prev_name != 'd5':
-                state = self.dec_trans[name](state)
+                state = self.transition(self.dec_trans[name], state, prev_w, prev_h, batch)
             state = self.merge[name](state, skips[name], prev_w, prev_h, width, height,
                                      batch=batch)
             for block in self.dec_blocks[name]:

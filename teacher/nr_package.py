@@ -53,6 +53,8 @@ def write_package(model, state, out_dir, shape_path, step=-1, stages=3, extra=No
     """
     block_idx = _block_order(model)
     shape_name = os.path.splitext(os.path.basename(shape_path))[0]
+    shared = getattr(model, 'shared_routed', False)
+    parameters = set(dict(model.named_parameters()))
 
     records = []
     for name, tensor in state.items():
@@ -76,6 +78,8 @@ def write_package(model, state, out_dir, shape_path, step=-1, stages=3, extra=No
             'stage': stage_id, 'stageOffset': len(buffer), 'byteLength': len(raw),
             'shape': list(arr.shape), 'dtype': 'f32',
         })
+        if shared:
+            tensors[-1]['isParameter'] = name in parameters
         buffer += raw
 
     os.makedirs(os.path.join(out_dir, 'model', 'stages'), exist_ok=True)
@@ -91,20 +95,31 @@ def write_package(model, state, out_dir, shape_path, step=-1, stages=3, extra=No
 
     with open(shape_path) as handle:
         shape_text = handle.read()
-    with open(os.path.join(out_dir, 'shape.json'), 'w') as handle:
-        handle.write(shape_text)
+    if shared and json.loads(shape_text) != model.shape:
+        raise ValueError('export shape does not match the shared/routed model')
+    if shared:
+        with open(os.path.join(out_dir, 'shape.json'), 'wb') as handle:
+            handle.write(shape_text.encode('utf-8'))
+    else:
+        with open(os.path.join(out_dir, 'shape.json'), 'w') as handle:
+            handle.write(shape_text)
 
     meta = {
         'kind': 'student',
         'shape': shape_name,
         'shapeFile': 'shape.json',
         'step': int(step),
-        'params': int(sum(int(np.prod(t['shape'])) for t in tensors)),
+        'params': int(sum(int(np.prod(t['shape'])) for t in tensors if t.get('isParameter', True))),
         'blendScale': float(model.blend_scale.detach().cpu().reshape(-1)[0]),
         'version': model_version(shape_name, step),
     }
     if extra:
         meta.update(extra)
+    if shared:
+        from moe_shape import ARCHITECTURE, ROUTING
+        meta.update(architecture=ARCHITECTURE, routing=ROUTING, expertLayout='bank[shared,routed0..15,in,out]',
+                    precision='fp32-tf32-off', biasPolicy='frozen-inference',
+                    shapeSha256=hashlib.sha256(shape_text.encode('utf-8')).hexdigest())
     manifest = {
         'totals': {'blockCount': len(block_idx), 'tensorCount': len(tensors),
                    'paramCount': meta['params']},
@@ -112,6 +127,11 @@ def write_package(model, state, out_dir, shape_path, step=-1, stages=3, extra=No
         'stages': manifest_stages,
         'tensors': tensors,
     }
+    if shared:
+        from audit_moe import audit_manifest
+        audit = audit_manifest(manifest, model.shape)
+        meta['parameterAudit'] = audit['totals']
+        meta['publicParameterLedger'] = [t for t in audit['tensors'] if t['category'] == 'public']
     with open(os.path.join(out_dir, 'manifest.json'), 'w') as handle:
         json.dump(manifest, handle, indent=1)
     return manifest
@@ -157,6 +177,15 @@ def load_student_package(directory, width, height, device):
     state, manifest = read_package(directory)
     shape_file = manifest['model'].get('shapeFile', 'shape.json')
     shape = load_student_shape(os.path.join(directory, shape_file))
+    if 'architecture' in shape:
+        from moe_shape import ARCHITECTURE, ROUTING
+        meta = manifest['model']
+        if (meta.get('architecture') != ARCHITECTURE or meta.get('routing') != ROUTING or
+                meta.get('precision') != 'fp32-tf32-off' or meta.get('biasPolicy') != 'frozen-inference'):
+            raise ValueError('package shared/routed semantics mismatch')
+        with open(os.path.join(directory, shape_file), 'rb') as handle:
+            if hashlib.sha256(handle.read()).hexdigest() != meta.get('shapeSha256'):
+                raise ValueError('shared/routed shape checksum mismatch')
     g = geometry_from_valid(width, height)
     torch.manual_seed(0)
     model = StudentNetwork(shape, g).to(device).eval()

@@ -5,6 +5,47 @@
 保留原来的 `--idx/--features/--out` 接口，供逐层对账使用。
 同一个入口也支持 `weights/student_moe_v0` 的窗口/Token top-1 MoE。
 
+## 批量重跑 t1～t7
+
+脚本默认加载 `weights/student_v43`，使用 `style=2、tone=1、structure=1、skin=-1、automask=1`，
+seed 为 12345。保持原图尺寸，首帧历史输入为当前原图，直接覆盖
+`teacher/samples/t1`～`t7` 各目录的 `nr.png`，不创建备份。
+从任意工作目录运行均可，默认权重和图片路径相对于仓库。
+
+Windows（先按下文构建引擎；优先查找 CUDA 版本，否则使用 CPU）：
+
+```powershell
+.\engine\run_samples.ps1
+# 仅跑指定图片，或指定其他权重/引擎
+.\engine\run_samples.ps1 -Samples t1,t7 -Weights weights/student_v43
+.\engine\run_samples.ps1 -Engine engine/build/Release/cpu_engine.exe
+```
+
+CUDA runtime DLL 需在 PATH 中；设置了 `CUDA_PATH` 时，Windows 脚本会自动加入其 `bin`。
+
+Linux（在仓库根目录配置；图像解码只依赖 Pillow，推理无需 PyTorch）：
+
+```bash
+cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
+cmake --build engine/build --target cpu_engine cpu_lanes -j 8
+uv venv tmp/samples-venv --python 3.10
+uv pip install --python tmp/samples-venv/bin/python pillow
+bash engine/run_samples.sh
+# 仅跑指定图片；有 CUDA 构建时可指定 GPU 引擎
+bash engine/run_samples.sh t1 t7
+# CUDA 构建还需生成 cpu_lanes，或用 --lanes 指定它
+bash engine/run_samples.sh --engine engine/build-cuda/gpu_engine --lanes engine/build/cpu_lanes
+```
+
+Linux 脚本优先查找 `engine/build-cuda/gpu_engine`，其次是 `engine/build/cpu_engine`；
+默认使用引擎同目录的 `cpu_lanes`。因为 Linux 图片入口尚不支持解码，
+`tools/decode_proxy.py` 只负责读取 PNG/JPG 等图片并写入临时 RGB f32 数据；
+输入 lanes、网络前向、合成和 PNG 写出均由 C++ 完成，临时数据运行后清理。
+`--python` 可指定现有的 Pillow 环境；`--help` 查看路径和控制参数选项。
+Windows 使用 `-Style/-Tone/-Structure/-Skin/-NoAutomask/-Seed/-Threads/-Device`，
+Linux 对应 `--style/--tone/--structure/--skin/--no-automask/--seed/--threads/--device`。
+任一图片或引擎运行失败时立即停止并返回非零状态。
+
 ## 构建与运行（Windows）
 
 在仓库根目录执行，需安装 Visual Studio C++ 工具链和 CMake：
@@ -295,3 +336,8 @@ $env:OMP_NUM_THREADS = '8'
     --shape weights/student_mixed/shape.json --checkpoint checkpoint.pt `
     --engine-build engine/build/Release --bisect
 ```
+
+共享 + Top-1 的 17 专家原型使用独立 `shared-routed-moe-v1` 包，仅支持原生 CUDA 后端。
+结构契约、未训练随机包生成、逐层对账、完整前向门禁与显存/profile 诊断命令见
+[`teacher/SHARED_MOE.md`](../teacher/SHARED_MOE.md)；阶段测量见
+[`teacher/SHARED_MOE_REPORT.md`](../teacher/SHARED_MOE_REPORT.md)。旧包和默认入口继续使用既有语义。

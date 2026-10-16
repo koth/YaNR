@@ -51,10 +51,13 @@ def teacher_shape():
 def load_shape(path):
     with open(path) as fh:
         spec = json.load(fh)
+    if 'architecture' in spec:
+        from moe_shape import validate
+        return validate(spec)
     for level in spec['levels']:
         if level['channels'] % 32 or level['hidden'] % 32:
             raise ValueError(f"{level['level']}: channels/hidden must be multiples of 32")
-        if level['kind'] not in ('ffn', 'expert', 'split'):
+        if level['kind'] not in ('ffn', 'expert', 'split', 'moe'):
             raise ValueError(f"{level['level']}: unknown kind {level['kind']!r}")
         if level['kind'] == 'split':
             for key in ('branches', 'branch_channels', 'middle_channels'):
@@ -131,6 +134,17 @@ def account(shape, g):
 
 
 def report(shape, sizes, gops=DEFAULT_GOPS, as_json=False):
+    if shape.get('architecture') or any(lv['kind'] == 'moe' for lv in shape['levels']):
+        from moe_cost import account_moe
+        results = [dict(size=s, **account_moe(shape, geometry_from_valid(s, s))) for s in sizes]
+        if as_json:
+            print(json.dumps(dict(shape=shape['name'], results=results), indent=1))
+        else:
+            for row in results:
+                print(f"{row['size']}²: {row['total_macs'] / 1e9:.4f} GMAC (detailed reference; no latency prediction)")
+                for layer in row['layers']:
+                    print(f"  {layer['name']:24s} rows={layer['rows']:7d} {layer['total_macs'] / 1e9:.5f} GMAC")
+        return results
     results = []
     for size in sizes:
         g = geometry_from_valid(size, size)

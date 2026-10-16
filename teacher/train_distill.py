@@ -45,6 +45,8 @@ from nr_geometry import geometry_from_valid                          # noqa: E40
 from nr_history import block_match_flow, reproject_history, store_history  # noqa: E402
 from nr_student import StudentNetwork, load_student_shape, student_alignment   # noqa: E402
 from run_image import build_features, save_png                       # noqa: E402
+from moe_training import (BiasController, configure, provenance, restore_gradients,
+                          restore_rng, training_checkpoint, update_ema)
 
 DEFAULTS = {
     'shape': os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -77,6 +79,9 @@ DEFAULTS = {
     'degrade_prob': 0.5,         # 在线退化(degrade.py 链;proxy_proc 已预退化的跳过)
     'moe_aux': 0.02,             # MoE 均衡正则(配额分配已结构保证均衡;此项仅防 p 漂移)
     'moe_z': 1e-2,               # router z-loss(ST-MoE,压 logits 幅值;router 前 LN 后配合生效)
+    'student_precision': 'bf16', 'router_jitter': 0.1,
+    'moe_z_formula': 'legacy-logits-l2-v1', 'moe_bias_rate': 1e-3,
+    'ema_bias_policy': 'legacy-average-float-buffers', 'comet_disabled': False,
     'log_every': 100, 'vis_every': 2000, 'ckpt_every': 5000,
     'seed': 20261007,
     'style_range': [0.0, 127.0], 'tone_range': [0.0, 1.0], 'structure_range': [0.0, 1.0],
@@ -103,9 +108,12 @@ def comet_key(cfg):
 
 def load_config(args):
     cfg = dict(DEFAULTS)
+    explicit = set()
     if args.config:
         with open(args.config) as fh:
-            cfg.update(json.load(fh))
+            provided = json.load(fh)
+            cfg.update(provided)
+            explicit.update(provided)
     for key in ('shape', 'teacher_weights', 'batch', 'steps', 'overfit', 'lr', 'wd',
                 'warmup', 'ema', 'clip', 'loss_out', 'loss_detail', 'loss_feature',
                 'loss_temporal', 'pair_fraction', 'seed', 'batch_rows', 'teacher_workers',
@@ -114,17 +122,19 @@ def load_config(args):
         value = getattr(args, key, None)
         if value is not None:
             cfg[key] = value
+            explicit.add(key)
     if getattr(args, 'size', None) is not None:
         cfg['size'] = args.size
     size = cfg['size']
-    cfg['size'] = [int(v) for v in str(size).split(',')]      # 支持多尺度:'320' 或 '320,512'
+    cfg['size'] = [int(v) for v in (size if isinstance(size, list) else str(size).split(','))]
     if getattr(args, 'size_weights', None) is not None:
         cfg['size_weights'] = args.size_weights
     if cfg['size_weights'] is not None:
-        cfg['size_weights'] = [float(v) for v in str(cfg['size_weights']).split(',')]
+        weights = cfg['size_weights']
+        cfg['size_weights'] = [float(v) for v in (weights if isinstance(weights, list) else str(weights).split(','))]
         if len(cfg['size_weights']) != len(cfg['size']):
             raise SystemExit('size_weights length must match --size list')
-    return cfg
+    return configure(cfg, load_student_shape(cfg['shape']), explicit)
 
 
 # ---------------------------------------------------------------- data
@@ -533,12 +543,19 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     torch.manual_seed(cfg['seed'])
     np.random.seed(cfg['seed'])
+    shape = load_student_shape(cfg['shape'])
+    from moe_shape import is_shared
+    shared_routed = is_shared(shape)
+    if shared_routed:
+        cfg['source'] = provenance(cfg['shape'], cfg['teacher_weights'])
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        torch.use_deterministic_algorithms(True)
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, 'config.json'), 'w') as fh:
         json.dump(cfg, fh, indent=1, sort_keys=True)
 
     experiment = None
-    key = comet_key(cfg)
+    key = None if cfg.get('comet_disabled', False) else comet_key(cfg)
     if key and Experiment is not None:
         experiment = Experiment(api_key=key, project_name=cfg['comet_project'],
                                 workspace=cfg.get('comet_workspace') or None,
@@ -550,7 +567,6 @@ def main():
 
     sizes = cfg['size']
     g = geometry_from_valid(sizes[0], sizes[0])
-    shape = load_student_shape(cfg['shape'])
     geo_cache = {}
     _tls = threading.local()
     _teacher_lock = threading.Lock()
@@ -585,6 +601,10 @@ def main():
 
     model = StudentNetwork(shape, g).to(device)
     model.capture_enabled = True
+    controller = BiasController(model, cfg['moe_bias_rate']) if shared_routed else None
+    if controller:
+        for module in controller.modules.values():
+            module.training_metrics_enabled = True
 
     # 形状不匹配的特征对(d4/ViT) -> 1x1 投影表。s 维从形状读 —— 曾经硬编码 v0,
     # 非 v0 形状(如 slim 系列 d3=128)会漏建投影,教师维度原样穿透直接崩。
@@ -614,12 +634,27 @@ def main():
 
     start = 0
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        if controller:
+            old_source = ckpt.get('source', {})
+            for key in ('teacher_manifest_sha256', 'shape_sha256', 'teacher_source_sha256'):
+                if old_source.get(key) != cfg['source'].get(key):
+                    raise ValueError('shared/routed replay provenance changed: ' + key)
+            for key in ('batch', 'batch_rows', 'size', 'size_weights', 'seed', 'style_range', 'tone_range',
+                        'structure_range', 'skin_range', 'automask_prob', 'pair_fraction', 'crop_prob', 'degrade_prob'):
+                if ckpt['config'].get(key) != cfg.get(key):
+                    raise ValueError('shared/routed replay sampling configuration changed: ' + key)
         model.load_state_dict(ckpt['model'])
         aligner.load_state_dict(ckpt['aligner'])
         optim.load_state_dict(ckpt['optim'])
         ema = ckpt['ema']
         start = ckpt['step'] + 1
+        if controller:
+            controller.load_state_dict(ckpt['routing_controller'])
+            restore_rng(ckpt['rng'])
+            if controller.step is not None:
+                restore_gradients(ckpt, model, aligner)
+                start = controller.step
         print(f"resumed at step {start} from {args.resume}")
 
     source = FrameSource(args.data, sizes, cfg, overfit=cfg['overfit'])
@@ -763,7 +798,12 @@ def main():
         moe_tot = {}
         feat_detail_acc = {}
         psnrs = []
-        optim.zero_grad()
+        resumed_chunks = controller.microbatches if controller and controller.step == step else 0
+        if not resumed_chunks:
+            optim.zero_grad()
+            if controller:
+                controller.begin(step)
+        chunk_cursor = 0
         # ---- 取回本步已备样本(教师批量段在上一步末尾提交,与上一步学生计算重叠),
         # 并把下一步的教师段压进流水(与本步学生计算重叠;末步不预取,防越界取料)。
         t_wait0 = time.perf_counter()
@@ -784,6 +824,9 @@ def main():
             model.g = g_s                              # 学生算子与分辨率无关,换几何即换边长
             max_b = max(1, int(cfg.get('batch_rows', 4 * 512 * 512)) // (s * s))
             for c0 in range(0, len(group), max_b):
+                chunk_cursor += 1
+                if chunk_cursor <= resumed_chunks:
+                    continue
                 chunk = group[c0:c0 + max_b]
                 cnb = len(chunk)
                 # 教师捕获按样本 stack 成整块布局喂特征损失。
@@ -793,8 +836,10 @@ def main():
                     t_res_stack[name] = arr.reshape(-1, arr.shape[-1])
 
                 x = torch.from_numpy(np.stack([p['feats'] for p in chunk])).reshape(-1, 16).to(device)
-                with torch.autocast(device, dtype=torch.bfloat16):
+                with torch.autocast(device, dtype=torch.bfloat16, enabled=cfg['student_precision'] == 'bf16'):
                     s_head_all = model(x, batch=cnb)
+                if controller:
+                    controller.collect()
                 s_head_all = s_head_all.view(
                     cnb, g_s['full_height'], g_s['full_width'], 4)[:, :s, :s].float()
 
@@ -822,7 +867,7 @@ def main():
                 if kind == 'pair' and cfg['loss_temporal'] > 0:
                     xa = torch.from_numpy(
                         np.stack([p['feats_a'] for p in chunk])).reshape(-1, 16).to(device)
-                    with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16):
+                    with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16, enabled=cfg['student_precision'] == 'bf16'):
                         sa_all = model(xa, batch=cnb)
                     sa_all = sa_all.view(
                         cnb, g_s['full_height'], g_s['full_width'], 4)[:, :s, :s].float()
@@ -879,21 +924,32 @@ def main():
                 chunk_loss = chunk_loss + (cfg['loss_feature'] * feat + chunk_moe) * (
                     cnb / cfg['batch'])
                 if torch.isfinite(chunk_loss):
+                    if controller and (cfg['moe_aux'] != 0 or cfg['moe_z'] != 0):
+                        controller.observe_regularizer(chunk_moe * (cnb / cfg['batch']))
                     chunk_loss.backward()
                 else:
                     print(f'step {step}: non-finite chunk loss, skipped')
         t_comp = time.perf_counter() - t_comp0
         t_opt0 = time.perf_counter()
+        if controller:
+            controller.capture_gradients()
         torch.nn.utils.clip_grad_norm_(params, cfg['clip'])
         optim.step()
+        if controller:
+            controller.apply(step)
         if cfg['ema'] > 0:
             # EMA 暖起:固定 decay 在短跑里会被早期半成品权重污染(3K 步 × 0.999 视界
             # 下 32% 质量来自 step 1000-2000),按步数渐升到 cfg['ema'](run v1 长跑自然退化为常数)。
             decay = min(cfg['ema'], (1.0 + step) / (100.0 + step))
             with torch.no_grad():
-                for k, p in model.state_dict().items():
-                    if p.dtype.is_floating_point:
-                        ema[k].mul_(decay).add_(p.detach(), alpha=1 - decay)
+                if controller:
+                    update_ema(ema, model.state_dict(), decay)
+                else:
+                    for k, p in model.state_dict().items():
+                        if p.dtype.is_floating_point:
+                            ema[k].mul_(decay).add_(p.detach(), alpha=1 - decay)
+        elif controller:
+            update_ema(ema, model.state_dict(), 0.)
         t_opt = time.perf_counter() - t_opt0
         ms = (time.perf_counter() - t0) * 1000
 
@@ -920,6 +976,11 @@ def main():
                                        step=step)
 
         if step % cfg['log_every'] == 0 or step == cfg['steps'] - 1:
+            if controller:
+                with open(os.path.join(args.out, 'routing.jsonl'), 'a', encoding='utf-8') as route_log:
+                    json.dump(dict(step=step, gradient_source='task_only' if cfg['moe_aux'] == cfg['moe_z'] == 0 else 'task_plus_regularizers',
+                                   layers=controller.diagnostics(model)), route_log)
+                    route_log.write('\n')
             n = cfg['batch']
             pn = max(1, len(psnrs))
             row = [step, f'{lr:.2e}',
@@ -956,12 +1017,9 @@ def main():
                 print(f'step {step}: vis failed ({exc!r}), skipped')
 
         if cfg['ckpt_every'] and step % cfg['ckpt_every'] == 0 and step > 0:
-            torch.save({'step': step, 'model': model.state_dict(), 'aligner': aligner.state_dict(),
-                        'optim': optim.state_dict(), 'ema': ema, 'config': cfg},
+            torch.save(training_checkpoint(model, aligner, optim, ema, cfg, step, controller),
                        os.path.join(args.out, 'ckpt.pt'))
-    torch.save({'step': cfg['steps'] - 1, 'model': model.state_dict(),
-                'aligner': aligner.state_dict(), 'optim': optim.state_dict(), 'ema': ema,
-                'config': cfg}, os.path.join(args.out, 'ckpt.pt'))
+    torch.save(training_checkpoint(model, aligner, optim, ema, cfg, cfg['steps'] - 1, controller), os.path.join(args.out, 'ckpt.pt'))
     log.close()
     if experiment is not None:
         experiment.end()
