@@ -187,7 +187,24 @@ class VitAttention(nn.Module):
         self.heads = channels // HEAD_DIM
         self.scale = nn.Parameter(torch.ones(self.heads))
 
-    def forward(self, qkv, tokens, padded):
+    def forward(self, qkv, tokens, padded, batch=1):
+        if batch > 1:
+            heads = self.heads
+            qkv3 = qkv.view(batch, tokens, heads, 3, HEAD_DIM)
+            q = cosine_norm(qkv3[:, :, :, 0]) * self.scale.view(1, 1, heads, 1) * math.sqrt(HEAD_DIM)
+            k = cosine_norm(qkv3[:, :, :, 1])
+            v = qkv3[:, :, :, 2]
+            k_pad = qkv.new_zeros((batch, padded, heads, HEAD_DIM))
+            v_pad = qkv.new_zeros((batch, padded, heads, HEAD_DIM))
+            k_pad[:, :tokens] = k
+            v_pad[:, :tokens] = v
+            # Batch is an explicit einsum axis: samples cannot attend to one another.
+            scores = torch.einsum('bthd,bphd->bhtp', q, k_pad)
+            keep = (torch.arange(padded, device=qkv.device) < tokens).view(1, 1, 1, padded)
+            masked = scores.masked_fill(~keep, torch.finfo(scores.dtype).min)
+            exp = torch.exp(masked - masked.amax(dim=-1, keepdim=True)) * keep.to(scores.dtype)
+            attn = exp / exp.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            return torch.einsum('bhtp,bphd->bthd', attn, v_pad).reshape(batch * tokens, heads * HEAD_DIM)
         heads = self.heads
         qkv3 = qkv.view(tokens, heads, 3, HEAD_DIM)
         q = cosine_norm(qkv3[:, :, 0]) * self.scale.view(1, heads, 1) * math.sqrt(HEAD_DIM)
@@ -704,8 +721,8 @@ class StudentNetwork(nn.Module):
 
     def forward(self, features, batch=1):
         """batch>1(2026-10-12 吞吐):features 为样本行主序叠放 ((batch*rows, 16)),
-        输出同布局 ((batch*rows, 4));ViT 在瓶颈 token 数小,逐样本跑(全局注意力
-        跨样本互见的掩码复杂度不值当)。batch=1 与原实现逐位一致。"""
+        输出同布局 ((batch*rows, 4));shared/routed ViT 用独立 batch 轴合并派发，
+        旧结构保留逐样本路径。batch=1 与原实现逐位一致。"""
         self.captures.clear()
         for m in self.modules():
             if hasattr(m, 'moe_stats'):
@@ -738,7 +755,10 @@ class StudentNetwork(nn.Module):
         dw, dh = level_size(g, 'd5')
         state = self.transition(self.vit_in,
             box_downsample(state, *level_size(g, 'd4'), dw, dh, batch=batch), dw, dh, batch)
-        if batch > 1:
+        if batch > 1 and self.shared_routed:
+            for block in self.vit_blocks:
+                state = block(state, tokens, padded, batch)
+        elif batch > 1:
             per_sample = state.view(batch, tokens, -1)
             outs = []
             for b in range(batch):

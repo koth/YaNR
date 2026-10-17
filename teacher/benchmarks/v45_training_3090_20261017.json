@@ -1,0 +1,686 @@
+{
+  "date": "2026-10-17",
+  "hardware": {
+    "host": "koth@192.168.3.32",
+    "gpu": "NVIDIA GeForce RTX 3090 24GB",
+    "driver": "535.171.04",
+    "torch": "2.4.1+cu121",
+    "python": "3.8.10",
+    "cpu_threads": 8
+  },
+  "method": {
+    "pipeline": "Real train_distill.main; observed wall time per complete step without extra boundary CUDA synchronization. Sequential runs, 40 steps, discard first 5; full losses and online teacher; Comet, visualizations and checkpoint disk I/O disabled. No training weights saved.",
+    "student_only": "Forward, head MSE, backward, AdamW, controller and EMA; synchronized boundaries; 2 warmups then 5 samples.",
+    "limits": [
+      "Short probes do not establish long-run training quality or exact speed relative to the previous compiled production run.",
+      "Data roots and seed are identical within these A/B runs. Original production CLI root order was not recovered; no claim of replaying its exact sample order.",
+      "Baseline implementation is git archive 796ff4f. Its resolved provenance git labels see the containing aa4a886 repository; the explicit reference and file SHA256 values below identify the actual baseline.",
+      "Batched ViT pipeline and 512 smoke precede the equivalent bit_length-to-threshold tile compatibility change. Final source was rechecked with 320 pair smoke and all regressions.",
+      "Teacher batch_rows is ignored by old 796ff4f; the baseline therefore has an unbounded teacher batch.",
+      "Non-finite state checks and controller steps passed for completed probes."
+    ]
+  },
+  "data": {
+    "images": 30582,
+    "roots": [
+      "/f/yanr/rs/DIV2K_train_HR",
+      "/f/yanr/rs/Flickr2K",
+      "/f/yanr/rs/Full-Resolution",
+      "/f/yanr/rs/proxy_proc",
+      "/f/yanr/rs/rgb",
+      "/f/yanr/rs/gameplay",
+      "/f/yanr/rs/portraits",
+      "/f/yanr/rs/frames_2k"
+    ],
+    "seed": 20261007
+  },
+  "common_resolved_config": {
+    "action_floor": 0.1,
+    "action_knee": 0.02,
+    "automask_prob": 1,
+    "batch": 8,
+    "batch_rows": 1179648,
+    "ckpt_every": 0,
+    "clip": 1,
+    "comet_disabled": true,
+    "comet_key": null,
+    "comet_project": "dlss-student",
+    "comet_workspace": null,
+    "crop_prob": 0.5,
+    "degrade_prob": 0.5,
+    "ema": 0.999,
+    "ema_bias_policy": "copy-after-optimizer-controller-v1",
+    "ema_every": 4,
+    "log_every": 10,
+    "loss_detail": 0.5,
+    "loss_feature": 0.5,
+    "loss_logit": 1,
+    "loss_out": 1,
+    "loss_temporal": 1,
+    "loss_texstat": 3,
+    "loss_texture": 1.5,
+    "lr": 0.0002,
+    "lr_decay": 0.25,
+    "lr_floor": 0.00001,
+    "lr_hold": 0.5,
+    "moe_aux": 0,
+    "moe_bias_rate": 0.001,
+    "moe_z": 0,
+    "moe_z_formula": "logsumexp-square-v1",
+    "optimizer_fused": null,
+    "overfit": 0,
+    "pair_fraction": 0.35,
+    "router_jitter": 0,
+    "seed": 20261007,
+    "shape": "shapes/student_shared_moe_v1.json",
+    "size": [
+      320,
+      512
+    ],
+    "size_weights": [
+      0.7,
+      0.3
+    ],
+    "skin_range": [
+      -1,
+      -1
+    ],
+    "steps": 40,
+    "structure_range": [
+      1,
+      1
+    ],
+    "student_compile": false,
+    "student_precision": "fp32",
+    "style_range": [
+      2,
+      2
+    ],
+    "teacher_batch_rows": 589824,
+    "teacher_overlap": true,
+    "teacher_weights": "/home/koth/klss/models/nr",
+    "teacher_workers": 2,
+    "tex_boost": 0,
+    "tex_sigma": 0.008,
+    "texstat_boost": 3,
+    "texture_floor": 0.25,
+    "texture_knee": 0.005,
+    "tone_range": [
+      1,
+      1
+    ],
+    "vis_every": 0,
+    "warmup": 4000,
+    "wd": 0.01
+  },
+  "shared_provenance": {
+    "shape_sha256": "e0e8d58213937c542acc04d0883a63a77a332d22659bd96f8be069d42e70b512",
+    "teacher_manifest_sha256": "1f0d82c4323c081ec4d3510c51aa3cb49aa4c7821c6141e1727b3a7274236c20",
+    "teacher_source_sha256": {
+      "nr_kernels.cu": "4952bfe91587b3732742134bd2bff3600b401a56fe18a750cae5eecd9ae64cf7",
+      "nr_model.py": "dbafbd42bb6ad3db6605b27fda5e43130e8dd793d246b92f42a1a38cf7ad3a1c",
+      "nr_network.py": "bf98fb08c22e303415d4b46b92f2b95543f95649f144ae1009a289bcd83c1964",
+      "nr_torch.py": "9678ce92746d368323380004702e6ffbd6acb3a7acf04d3512718f65216d5fb5"
+    }
+  },
+  "pipelines": [
+    {
+      "label": "796ff4f eager",
+      "config_overrides": {
+        "batch_rows": 262144,
+        "optimizer_fused": "not present"
+      },
+      "student_source_sha256": {
+        "moe_training.py": "7ef2d5102f3fdcf0ae44cd126256ea64557b64612be1f335c12867f68c45d95d",
+        "nr_shared_moe.py": "dbe880422f7f7cce6bd6d1d9e8e0105ff2d78c40dd837d8ae0a5f306ec6ae63d",
+        "nr_student.py": "1fa32ce7f32a5fa0dcacf2fe0aef054f06f9e159ad8d1aa1ecf941a19561ae58",
+        "train_distill.py": "21d80dd32399f7f49017ccc7bf1338753ff5a29d68bff60e13d87693303092f0"
+      },
+      "torch": "2.4.1+cu121",
+      "precision": "FP32; TF32 off",
+      "finite_model": true,
+      "checkpoint_step": 39,
+      "controller_last_step": 39,
+      "tf32_matmul": false,
+      "deterministic": true,
+      "wall_seconds": 148.42514288500024,
+      "steady_mean_ms": 3490.5699588568364,
+      "steady_median_ms": 3457.502976998512,
+      "peak_allocated": 8519396352,
+      "peak_reserved": 13042188288,
+      "exit_code": 0,
+      "step_ms": [
+        10857.256,
+        3477.755,
+        3293.007,
+        3542.41,
+        3889.596,
+        4204.041,
+        4046.907,
+        3008.339,
+        2866.84,
+        3457.503,
+        2895.543,
+        3507.696,
+        3319.786,
+        2758.037,
+        3404.138,
+        3910.988,
+        2837.876,
+        3758.034,
+        4402.168,
+        3474.228,
+        2901.197,
+        3233.417,
+        3612.41,
+        4019.728,
+        3569.073,
+        3264.903,
+        3205.669,
+        2738.017,
+        2739.514,
+        3729.893,
+        4873.103,
+        3942.763,
+        4188.68,
+        3401.475,
+        3596.197,
+        3010.519,
+        3244.146,
+        4163.467,
+        4129.677,
+        2753.974
+      ]
+    },
+    {
+      "label": "aa4a886 eager",
+      "config_overrides": {},
+      "student_source_sha256": {
+        "moe_training.py": "6a0327c52647e0ada029436d82842670f30740b9e2eabd715ff7c534553eb686",
+        "nr_shared_moe.py": "af33c27af8322ade0590ed23ccdc2dd92062e1dbd0383cf62f50cc6fe168e025",
+        "nr_student.py": "ca8c17256a564f392b3da3bb5eaadcda4ff509cd602ad87f42f63d1795df85dd",
+        "train_distill.py": "8a59b9e25b7b3a544df494a52cb66bb72e04d66a8f8f889dbd9db5cc894bd6a9"
+      },
+      "torch": "2.4.1+cu121",
+      "precision": "FP32; TF32 off",
+      "finite_model": true,
+      "checkpoint_step": 39,
+      "controller_last_step": 39,
+      "tf32_matmul": false,
+      "deterministic": true,
+      "wall_seconds": 109.6860166309998,
+      "steady_mean_ms": 2529.505956428745,
+      "steady_median_ms": 2408.9093920010782,
+      "peak_allocated": 16243291648,
+      "peak_reserved": 19042140160,
+      "exit_code": 0,
+      "step_ms": [
+        9822.615,
+        2479.992,
+        2400.332,
+        2523.556,
+        2744.099,
+        3137.499,
+        3037.954,
+        2099.66,
+        1489.652,
+        3267.073,
+        2076.844,
+        2580.417,
+        2301.578,
+        1980.463,
+        2308.938,
+        2927.407,
+        1991.086,
+        2749.76,
+        3191.331,
+        2526.124,
+        2102.652,
+        2408.909,
+        2634.335,
+        2849.88,
+        2548.328,
+        2213.601,
+        2274.629,
+        1886.391,
+        1822.901,
+        2143.766,
+        4538.536,
+        2893.771,
+        3147.028,
+        2322.55,
+        2630.949,
+        2133.925,
+        2191.713,
+        3162.439,
+        2890.25,
+        2070.372
+      ]
+    },
+    {
+      "label": "aa4a886 + batched shared/routed ViT, eager",
+      "config_overrides": {},
+      "student_source_sha256": {
+        "moe_training.py": "6a0327c52647e0ada029436d82842670f30740b9e2eabd715ff7c534553eb686",
+        "nr_shared_moe.py": "76f81cfcf1f9891964a677bf488ff34b2f97e8bb5d0dfaca4520f7557f7d1943",
+        "nr_student.py": "d5b76d6203b892dcd01b357d1d4098c64edbf39d7975910783b6b7cdb0cb76bb",
+        "train_distill.py": "8a59b9e25b7b3a544df494a52cb66bb72e04d66a8f8f889dbd9db5cc894bd6a9"
+      },
+      "torch": "2.4.1+cu121",
+      "precision": "FP32; TF32 off",
+      "finite_model": true,
+      "checkpoint_step": 39,
+      "controller_last_step": 39,
+      "tf32_matmul": false,
+      "deterministic": true,
+      "wall_seconds": 104.63091059599901,
+      "steady_mean_ms": 2402.0771695427748,
+      "steady_median_ms": 2207.743799997843,
+      "peak_allocated": 15511288832,
+      "peak_reserved": 18723373056,
+      "exit_code": 0,
+      "step_ms": [
+        9783.317,
+        2347.093,
+        2338.788,
+        2433.28,
+        2557.049,
+        2926.603,
+        2888.629,
+        1976.337,
+        1315.842,
+        3221.689,
+        1982.047,
+        2479.117,
+        2146.85,
+        1884.078,
+        2092.598,
+        2959.871,
+        1866.027,
+        2431.025,
+        3286.057,
+        2366.44,
+        1929.603,
+        2338.545,
+        2424.545,
+        2743.452,
+        2318.816,
+        2037.13,
+        2156.12,
+        1752.468,
+        1701.431,
+        1917.743,
+        4700.805,
+        2189.29,
+        3563.965,
+        2207.744,
+        2536.111,
+        1981.736,
+        1794.577,
+        3332.017,
+        2705.654,
+        1917.741
+      ]
+    }
+  ],
+  "smoke": [
+    {
+      "label": "512 only, batch=8, all temporal pairs",
+      "config_overrides": {
+        "pair_fraction": 1,
+        "size": [
+          512
+        ],
+        "size_weights": null,
+        "steps": 4
+      },
+      "student_source_sha256": {
+        "moe_training.py": "6a0327c52647e0ada029436d82842670f30740b9e2eabd715ff7c534553eb686",
+        "nr_shared_moe.py": "76f81cfcf1f9891964a677bf488ff34b2f97e8bb5d0dfaca4520f7557f7d1943",
+        "nr_student.py": "d5b76d6203b892dcd01b357d1d4098c64edbf39d7975910783b6b7cdb0cb76bb",
+        "train_distill.py": "8a59b9e25b7b3a544df494a52cb66bb72e04d66a8f8f889dbd9db5cc894bd6a9"
+      },
+      "torch": "2.4.1+cu121",
+      "precision": "FP32; TF32 off",
+      "finite_model": true,
+      "checkpoint_step": 3,
+      "controller_last_step": 3,
+      "tf32_matmul": false,
+      "deterministic": true,
+      "wall_seconds": 27.370936589999474,
+      "peak_allocated": 16055037952,
+      "peak_reserved": 17033068544,
+      "exit_code": 0,
+      "step_ms": [
+        12472.493,
+        4708.91,
+        4613.558,
+        3654.078
+      ]
+    },
+    {
+      "label": "320 only, batch=8, all temporal pairs, final threshold tile source",
+      "config_overrides": {
+        "pair_fraction": 1,
+        "size": [
+          320
+        ],
+        "size_weights": null,
+        "steps": 4
+      },
+      "student_source_sha256": {
+        "moe_training.py": "6a0327c52647e0ada029436d82842670f30740b9e2eabd715ff7c534553eb686",
+        "nr_shared_moe.py": "69457c6d059aabc5af887ba4ee09ba933e7dbb3d344baf550ec54191f5b2f548",
+        "nr_student.py": "d5b76d6203b892dcd01b357d1d4098c64edbf39d7975910783b6b7cdb0cb76bb",
+        "train_distill.py": "8a59b9e25b7b3a544df494a52cb66bb72e04d66a8f8f889dbd9db5cc894bd6a9"
+      },
+      "torch": "2.4.1+cu121",
+      "precision": "FP32; TF32 off",
+      "finite_model": true,
+      "checkpoint_step": 3,
+      "controller_last_step": 3,
+      "tf32_matmul": false,
+      "deterministic": true,
+      "wall_seconds": 13.215683723999973,
+      "peak_allocated": 11477768704,
+      "peak_reserved": 12828278784,
+      "exit_code": 0,
+      "step_ms": [
+        7036.733,
+        1799.866,
+        1789.108,
+        1349.664
+      ]
+    }
+  ],
+  "compile": [
+    {
+      "label": "Torch 2.4.1 CUDA Inductor, final threshold tile source; failed before step 0",
+      "config_overrides": {
+        "pair_fraction": 0,
+        "size": [
+          320
+        ],
+        "size_weights": null,
+        "steps": 8,
+        "student_compile": true
+      },
+      "student_source_sha256": {
+        "moe_training.py": "6a0327c52647e0ada029436d82842670f30740b9e2eabd715ff7c534553eb686",
+        "nr_shared_moe.py": "69457c6d059aabc5af887ba4ee09ba933e7dbb3d344baf550ec54191f5b2f548",
+        "nr_student.py": "d5b76d6203b892dcd01b357d1d4098c64edbf39d7975910783b6b7cdb0cb76bb",
+        "train_distill.py": "8a59b9e25b7b3a544df494a52cb66bb72e04d66a8f8f889dbd9db5cc894bd6a9"
+      },
+      "torch": "2.4.1+cu121",
+      "precision": "FP32; TF32 off",
+      "wall_seconds": 49.88716526400094,
+      "peak_allocated": 2539999744,
+      "peak_reserved": 3485466624,
+      "error": "BackendCompilerFailed('backend=\\'inductor\\' raised:\\nAssertionError: Failed to find static RBLOCK for (s0//(s4*s5))\\n\\nSet TORCH_LOGS=\"+dynamo\" and TORCHDYNAMO_VERBOSE=1 for more information\\n\\n\\nYou can suppress this exception and fall back to eager by setting:\\n    import torch._dynamo\\n    torch._dynamo.config.suppress_errors = True\\n')",
+      "step_ms": []
+    }
+  ],
+  "student_only": {
+    "baseline320b1": {
+      "size": 320,
+      "batch": 1,
+      "field": [
+        320,
+        320
+      ],
+      "reference": "796ff4f",
+      "tile_override": null,
+      "telemetry": true,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "torch": "2.4.1+cu121",
+      "samples": [
+        {
+          "ms": 320.0336250010878,
+          "peak_allocated": 4091940352,
+          "peak_reserved": 4508876800,
+          "loss": 0.28149497509002686
+        },
+        {
+          "ms": 320.00014500226825,
+          "peak_allocated": 4093324800,
+          "peak_reserved": 4508876800,
+          "loss": 0.20114058256149292
+        },
+        {
+          "ms": 321.5059360009036,
+          "peak_allocated": 4115643904,
+          "peak_reserved": 4584374272,
+          "loss": 0.23958571255207062
+        },
+        {
+          "ms": 316.0323949996382,
+          "peak_allocated": 3957747200,
+          "peak_reserved": 4586471424,
+          "loss": 0.19395244121551514
+        },
+        {
+          "ms": 312.0821299999079,
+          "peak_allocated": 3925093888,
+          "peak_reserved": 4586471424,
+          "loss": 0.20526956021785736
+        }
+      ],
+      "median_ms": 320.00014500226825,
+      "peak_allocated": 4115643904,
+      "peak_reserved": 4586471424
+    },
+    "current320b1": {
+      "size": 320,
+      "batch": 1,
+      "field": [
+        320,
+        320
+      ],
+      "reference": "working-tree",
+      "tile_override": null,
+      "telemetry": false,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "torch": "2.4.1+cu121",
+      "samples": [
+        {
+          "ms": 263.8164780000807,
+          "peak_allocated": 2644401152,
+          "peak_reserved": 2965372928,
+          "loss": 0.2814951539039612
+        },
+        {
+          "ms": 259.82570099949953,
+          "peak_allocated": 2650095104,
+          "peak_reserved": 2967470080,
+          "loss": 0.20114071667194366
+        },
+        {
+          "ms": 261.44934599869885,
+          "peak_allocated": 2648688640,
+          "peak_reserved": 2967470080,
+          "loss": 0.23958605527877808
+        },
+        {
+          "ms": 259.92690099883475,
+          "peak_allocated": 2633916928,
+          "peak_reserved": 2967470080,
+          "loss": 0.19395266473293304
+        },
+        {
+          "ms": 259.9482200021157,
+          "peak_allocated": 2636027904,
+          "peak_reserved": 2967470080,
+          "loss": 0.20526984333992004
+        }
+      ],
+      "median_ms": 259.9482200021157,
+      "peak_allocated": 2650095104,
+      "peak_reserved": 2967470080
+    },
+    "current320b8": {
+      "size": 320,
+      "batch": 8,
+      "field": [
+        320,
+        320
+      ],
+      "reference": "working-tree",
+      "tile_override": null,
+      "telemetry": false,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "torch": "2.4.1+cu121",
+      "samples": [
+        {
+          "ms": 809.1551980032818,
+          "peak_allocated": 10707606016,
+          "peak_reserved": 11339300864,
+          "loss": 0.2839438021183014
+        },
+        {
+          "ms": 810.726646999683,
+          "peak_allocated": 10812068352,
+          "peak_reserved": 11444158464,
+          "loss": 0.2449408620595932
+        },
+        {
+          "ms": 811.0379249992548,
+          "peak_allocated": 10795208704,
+          "peak_reserved": 11444158464,
+          "loss": 0.24711433053016663
+        },
+        {
+          "ms": 814.2253539990634,
+          "peak_allocated": 10813348352,
+          "peak_reserved": 11444158464,
+          "loss": 0.21965646743774414
+        },
+        {
+          "ms": 822.5965710007586,
+          "peak_allocated": 10870423552,
+          "peak_reserved": 11551113216,
+          "loss": 0.2100292146205902
+        }
+      ],
+      "median_ms": 811.0379249992548,
+      "peak_allocated": 10870423552,
+      "peak_reserved": 11551113216
+    },
+    "current512b4": {
+      "size": 512,
+      "batch": 4,
+      "field": [
+        576,
+        512
+      ],
+      "reference": "working-tree",
+      "tile_override": null,
+      "telemetry": false,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "torch": "2.4.1+cu121",
+      "samples": [
+        {
+          "ms": 936.2412539994693,
+          "peak_allocated": 13315848704,
+          "peak_reserved": 14172553216,
+          "loss": 0.2681615650653839
+        },
+        {
+          "ms": 935.4709760009428,
+          "peak_allocated": 13331700224,
+          "peak_reserved": 14174650368,
+          "loss": 0.26826491951942444
+        },
+        {
+          "ms": 938.7058039974363,
+          "peak_allocated": 13336328192,
+          "peak_reserved": 14174650368,
+          "loss": 0.23914115130901337
+        },
+        {
+          "ms": 929.9346710031386,
+          "peak_allocated": 13432097280,
+          "peak_reserved": 14174650368,
+          "loss": 0.22791844606399536
+        },
+        {
+          "ms": 926.3661349978065,
+          "peak_allocated": 13364175360,
+          "peak_reserved": 14174650368,
+          "loss": 0.21906355023384094
+        }
+      ],
+      "median_ms": 935.4709760009428,
+      "peak_allocated": 13432097280,
+      "peak_reserved": 14174650368
+    },
+    "batched_vit320b8": {
+      "size": 320,
+      "batch": 8,
+      "field": [
+        320,
+        320
+      ],
+      "reference": "working-tree",
+      "tile_override": null,
+      "telemetry": false,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3090",
+      "torch": "2.4.1+cu121",
+      "samples": [
+        {
+          "ms": 649.6050890018523,
+          "peak_allocated": 9400527872,
+          "peak_reserved": 10030678016,
+          "loss": 0.283943772315979
+        },
+        {
+          "ms": 648.7190279985953,
+          "peak_allocated": 9395238400,
+          "peak_reserved": 10030678016,
+          "loss": 0.2449408620595932
+        },
+        {
+          "ms": 649.8833059995377,
+          "peak_allocated": 9385247232,
+          "peak_reserved": 10030678016,
+          "loss": 0.24711433053016663
+        },
+        {
+          "ms": 650.4801629998838,
+          "peak_allocated": 9388831744,
+          "peak_reserved": 10030678016,
+          "loss": 0.21965646743774414
+        },
+        {
+          "ms": 654.4952630029002,
+          "peak_allocated": 9398858240,
+          "peak_reserved": 10030678016,
+          "loss": 0.2100292146205902
+        }
+      ],
+      "median_ms": 649.8833059995377,
+      "peak_allocated": 9400527872,
+      "peak_reserved": 10030678016
+    }
+  },
+  "regressions": {
+    "shared_moe_and_controller": "15 tests PASS, CPU and CUDA including batched-vs-independent forward, routing, auxiliary loss and all gradients",
+    "loss_batch": "PASS, worst relative difference 1.04e-7",
+    "fused": "PASS, bit exact",
+    "model": "PASS, real teacher",
+    "numerics": "PASS, CUDA torch fixtures and scalar oracle",
+    "cost_model": "12 tests PASS",
+    "lanes": "PASS, rebuilt current engine, first frame exact",
+    "engine_bisect": "PASS, rebuilt current engine, head max abs 4.768e-7"
+  },
+  "full_training_started": false
+}

@@ -17,7 +17,11 @@ def route_tile_rows(rows):
     At most 15 partial tiles: padding < 16*tile, instead of imposing 4096
     rows even on a group with one token. Sizes depend only on the input shape.
     """
-    return min(4096, max(8, 1 << max(0, (max(1, rows // 16)).bit_length() - 1)))
+    # Shape guards work with Dynamo's SymInt; Python int.bit_length() does not.
+    for tile in (4096, 2048, 1024, 512, 256, 128, 64, 32, 16):
+        if rows >= 16 * tile:
+            return tile
+    return 8
 
 
 def row_counts(assign):
@@ -104,6 +108,8 @@ def pool_windows(state, width, height, batch):
 
 
 class RoutedModule(nn.Module):
+    split_token_stats = False
+
     def __init__(self, channels, token=False):
         super().__init__()
         self.router = nn.Sequential(nn.LayerNorm(channels), nn.Linear(channels, 16, bias=False))
@@ -139,7 +145,12 @@ class RoutedModule(nn.Module):
                 top = logits.topk(2, dim=1).values
                 self.training_metrics.update(gate_mean=gates.mean(), gate_max=gates.max(),
                                              score_margin_mean=(top[:, 0] - top[:, 1]).mean())
-        self.moe_stats.append((assign.detach(), probs, logits))
+        if self.token and self.split_token_stats and batch > 1:
+            # Keep the existing per-sample auxiliary-loss population, even
+            # though the projections/attention now execute in one batch.
+            self.moe_stats.extend(zip(assign.detach().chunk(batch), probs.chunk(batch), logits.chunk(batch)))
+        else:
+            self.moe_stats.append((assign.detach(), probs, logits))
         for name, tensor in [('logits', logits), ('pick', pick), ('gate', gate), ('assign', assign)]:
             self.capture(name, tensor)
         # One scalar size read per route; reuse its compact layout in all four
@@ -234,6 +245,8 @@ class SharedRoutedLinear(RoutedModule):
 
 
 class SharedRoutedBlock(RoutedModule):
+    split_token_stats = True
+
     def __init__(self, channels, hidden, attn=True, phase_index=0, token=False):
         super().__init__(channels, token)
         from nr_student import WindowAttention, VitAttention
@@ -273,8 +286,7 @@ class SharedRoutedBlock(RoutedModule):
         if self.attn:
             qkv = self.mixed_mm(out, self.qkv, route)
             self.capture('qkv', qkv)
-            attended = (self.attention(qkv, width, height) if self.token else
-                        self.attention(qkv, width, height, batch))
+            attended = self.attention(qkv, width, height, batch)
             self.capture('attention', attended)
             projection = self.mixed_mm(attended, self.proj, route)
             out = out + self.aux_attn * projection

@@ -1,7 +1,8 @@
 # v45 训练的分块与显存
 
-2026-10-17，本机 RTX 3080 10GB，Torch 2.6.0+cu124，FP32、TF32 off、确定性模式，CPU 8 线程。
-桌面与其他应用占用约 2GB 显存；未关闭用户应用。没有可用的 3090，24GB 配置是容量建议，尚未在 24GB 卡实测。
+本节保留此前 2026-10-17 的 Windows / RTX 3080 10GB 测试记录：Torch 2.6.0+cu124，
+FP32、TF32 off、确定性模式，CPU 8 线程。桌面与其他应用占用约 2GB 显存，未关闭用户应用。
+该轮没有可用的 3090，24GB 配置当时只是容量建议；后续目标服务器实测见下方 3090 小节。
 
 ## `batch_rows` 的选择
 
@@ -87,3 +88,77 @@ CUDA 测试设置 `CUBLAS_WORKSPACE_CONFIG=:4096:8`；各 GPU 测试顺序执行
 静态窗缓存与旧实现比较 CPU/CUDA、奇数尺寸、多 batch、四种相位的前向及反向，逐位一致。
 教师捕获裁剪的 head 和全部所需特征逐位一致。Python/C++ shared MoE 在 320²、512²、320×512、137×201 对账，所有路由一致，head 最大绝对误差 3.76e-6。
 同时执行既有 lanes、engine bisect、numerics、fused、model、cost_model 和损失批量回归；本次没有启动长训或作出纹理质量结论。
+
+## 3090 服务器验证（2026-10-17）
+
+在目标服务器 RTX 3090 24GB、Torch 2.4.1+cu121 上验证；CPU 8 线程、FP32、TF32 off、确定性模式。
+数据为原有八类语料，共 30,582 张；各版本使用相同根目录顺序、seed、batch=8、320/512=0.7/0.3、
+在线教师及全部特征/细节/纹理/时序损失。各 GPU 测试顺序执行。
+
+`bench_distill_pipeline.py` 包装真实训练循环，记录完整每步墙钟与 allocator 峰值；不在步边界添加 GPU 同步，
+以保留教师/学生的重叠。每组 40 步，丢弃前 5 步，统计剩余 35 步；`log_every=10`。
+仅禁用 Comet、可视化和 checkpoint 写盘，最终检查模型有限值及 controller 更新步数；这些短跑不保存训练权重。
+
+| 实现 / 学生预算 | 平均 ms/步 | median ms/步 | allocated 峰值 GiB | reserved 峰值 GiB |
+|---|---:|---:|---:|---:|
+| `796ff4f` / 262144 | 3491 | 3458 | 7.93 | 12.15 |
+| 拉取的 `aa4a886` / 1179648 | 2530 | 2409 | 15.13 | 17.73 |
+| 本次 ViT 批量化 / 1179648 | **2402** | **2208** | **14.45** | **17.44** |
+
+三组均为 eager。新实现教师预算为 589824；旧版无教师分块，传入该字段也不会生效。
+新版本相比旧版平均耗时下降 **31.2%**，吞吐约 **1.45×**；ViT 改动相对拉取版本再降约 **5.0%**。
+这是同卡短跑比较，不能直接当作过去 compiled 长训日志的加速比，也不是完整训练质量结论。
+
+本次额外合并 shared/routed ViT 的批内派发：attention 显式保留 batch 轴，不会跨图互看；
+token 块仍保留逐样本辅助损失统计，过渡层保持原来的统计口径，旧网络和 batch=1 路径保持原实现。
+学生单独训练的 320/batch=8 从 811 ms 降到 650 ms，allocated 峰值从 10.12 降到 8.76 GiB。
+新增测试在 CPU/CUDA 比较独立样本的输出、路由、辅助损失、输入及全部参数梯度，并检查修改其他图不会影响首张图。
+
+纯 512、batch=8、pair_fraction=1 的 4 步冒烟通过，allocated/reserved 峰值 **14.95/15.86 GiB**。
+正常混合尺寸的 reserved 峰值更高，因为同时保留两种几何及缓存。根配置继续使用学生预算 1179648、教师预算 589824。
+`action_floor=0.1`、`action_knee=0.02` 现已显式写入配置，沿用实际 v45 配方。
+
+服务器 Torch 2.4.1 的 `student_compile=true` **未通过**：首先在 `SymInt.bit_length()` 报错，
+已将 tile 选择改成等价的形状阈值（0～1,000,000 行逐一对比旧公式相等）。重试仍遇到 Inductor 的
+`Unsupported ... LessThan` 和 `Failed to find static RBLOCK`，约 50 秒后首步前失败。
+因此根配置默认改为 **`student_compile=false`**，不启用静默编译失败回退；表中的速度不依赖编译。
+
+复测示例（数据根目录顺序也应固定）：
+
+```bash
+OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+python3 teacher/bench_distill_pipeline.py --config run_v45_cfg.json \
+  --out tmp/perf-new --steps 40 --data <八个数据根目录，按存档顺序>
+```
+
+包装器要求新的或空的输出目录，避免覆盖正式运行。原始配置和每步记录见
+[3090 采样记录](benchmarks/v45_training_3090_20261017.json)。正式全量训练按用户要求保持未启动。
+
+## 同卡升级环境对比（2026-10-17）
+
+在独立目录 `/f/yanr/keep_tmp/perf_20261017/torch2141` 安装 Torch 2.14.1+cu126，
+保留原来的系统 Python/Torch 和 535.171.04 驱动。使用相同最终源码（含等价的 tile 阈值修正）、
+原八类数据的相同顺序和 seed、同一配置，各跑 40 步、丢弃前 5 步；两组均不编译。
+
+| 环境 | 平均 ms/步 | median ms/步 | allocated / reserved 峰值 GiB |
+|---|---:|---:|---:|
+| Python 3.8.10 / Torch 2.4.1+cu121 | 2389 | 2209 | 14.44 / 17.44 |
+| Python 3.14.7 / Torch 2.14.1+cu126 | **1801** | **1427** | 14.48 / 17.25 |
+
+平均耗时下降 **24.6%**，吞吐提高 **32.6%**。这是整个软件环境升级的收益：
+NumPy 同时从 1.24.4 升到 2.5.2，Pillow 从 7.0.0 升到 12.3.0，不能把收益全归给 Torch。
+FP32、TF32 off、确定性模式、loss/路由配方均保持一致。
+五个日志点的学习率、各项已记录 loss 和 PSNR 在 CSV 显示精度上一致，不代表长训轨迹逐位相同。
+学生单独训练的 320/batch=8 中位数从 650 ms 降到 369 ms；端到端仍包括数据准备和在线教师。
+
+新版环境通过 15 项 MoE/controller 测试、fused、真实教师 model、numerics、cost_model、
+loss_batch、lanes 和 engine bisect。另做 512/batch=8/pair_fraction=1 的四步冒烟，
+模型有限值与 controller 步数均通过；不保存训练权重。
+
+新版 `student_compile=true` 在首步前约 43 秒失败：Inductor 生成 C++20 命令，
+系统 GCC 9.4 不认识 `-std=c++20`。未发现现成的新 GCC；未修改系统编译器。
+本轮未验证升级工具链后的编译兼容性、吞吐或跨尺寸重编译，根配置继续保持 `student_compile=false`。
+
+新版环境的详细版本、源码 SHA256、逐步耗时与日志采样见
+[Torch 环境升级采样记录](benchmarks/v45_torch_upgrade_3090_20261017.json)。
+这些结果支持后续训练使用独立的新环境，但尚未启动全量训练，也未据短跑推断最终纹理质量。

@@ -136,6 +136,67 @@ class SharedMoETest(unittest.TestCase):
         measured = account_moe(s, g, {'enc_blocks.full.0': [f['rows']] + [0] * 15})
         self.assertEqual(measured['layers'][0]['alignment_extra_rows'], (-f['rows']) % 32)
 
+    def test_batched_token_block_matches_independent_samples_and_gradients(self):
+        torch.backends.cuda.matmul.allow_tf32 = False
+        for device in ['cpu'] + (['cuda'] if torch.cuda.is_available() else []):
+            for batch, tokens, padded in [(2, 7, 64), (3, 20, 64), (2, 65, 128)]:
+                with self.subTest(device=device, batch=batch, tokens=tokens):
+                    layer = SharedRoutedBlock(32, 64, token=True).to(device).train()
+                    reference = copy.deepcopy(layer)
+                    x = torch.randn(batch * tokens, 32, device=device, requires_grad=True)
+                    y = x.detach().clone().requires_grad_(True)
+                    out = layer(x, tokens, padded, batch)
+                    expected = torch.cat([reference(v, tokens, padded) for v in y.chunk(batch)])
+                    torch.testing.assert_close(out, expected, rtol=2e-5, atol=3e-6)
+                    self.assertEqual(len(layer.moe_stats), batch)
+                    def auxiliary(stats):
+                        return sum(16 * (torch.bincount(a, minlength=16).to(p.dtype) /
+                                         a.numel() * p.mean(0)).sum() for a, p, _ in stats) / len(stats)
+                    aux = auxiliary(layer.moe_stats)
+                    ref_aux = auxiliary(reference.moe_stats)
+                    torch.testing.assert_close(aux, ref_aux, rtol=1e-6, atol=1e-6)
+                    for got_stats, ref_stats in zip(layer.moe_stats, reference.moe_stats):
+                        self.assertTrue(torch.equal(got_stats[0], ref_stats[0]))
+                    # This also catches accidental attention across sample boundaries.
+                    perturbed = x.detach().clone()
+                    perturbed[tokens:] += 3
+                    torch.testing.assert_close(layer(perturbed, tokens, padded, batch)[:tokens],
+                                               out[:tokens], rtol=0, atol=0)
+                    probe = torch.randn_like(out)
+                    got = torch.autograd.grad((out * probe).sum() + .02 * aux, [x] + list(layer.parameters()))
+                    want = torch.autograd.grad((expected * probe).sum() + .02 * ref_aux, [y] + list(reference.parameters()))
+                    for a, b in zip(got, want):
+                        torch.testing.assert_close(a, b, rtol=5e-5, atol=5e-5)
+
+    def test_network_batched_vit_matches_previous_sample_loop(self):
+        from nr_student import StudentNetwork
+        class SampleLoop(torch.nn.Module):
+            def __init__(self, block):
+                super().__init__()
+                self.block = block
+
+            def forward(self, state, tokens, padded, batch=1):
+                return torch.cat([self.block(v, tokens, padded) for v in state.chunk(batch)])
+
+        for device in ['cpu'] + (['cuda'] if torch.cuda.is_available() else []):
+            g = geometry_from_valid(64, 96)
+            shape = candidate([32] * 6, [32] * 6, 32, 64)
+            model = StudentNetwork(shape, g).to(device).train()
+            reference = copy.deepcopy(model)
+            reference.vit_blocks = torch.nn.ModuleList([SampleLoop(block) for block in reference.vit_blocks])
+            a = torch.randn(2 * g['full_rows'], 16, device=device, requires_grad=True)
+            b = a.detach().clone().requires_grad_(True)
+            actual, expected = model(a, 2), reference(b, 2)
+            torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-6)
+            torch.testing.assert_close(model.moe_aux_loss(), reference.moe_aux_loss(), rtol=2e-6, atol=1e-6)
+            probe = torch.randn_like(actual)
+            (actual * probe).mean().backward()
+            (expected * probe).mean().backward()
+            torch.testing.assert_close(a.grad, b.grad, rtol=1e-4, atol=1e-7)
+            for (name, p), (_, q) in zip(model.named_parameters(), reference.named_parameters()):
+                with self.subTest(device=device, parameter=name):
+                    torch.testing.assert_close(p.grad, q.grad, rtol=1e-4, atol=1e-7)
+
 
 if __name__ == '__main__':
     unittest.main()
