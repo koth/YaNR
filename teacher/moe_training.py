@@ -213,10 +213,13 @@ def provenance(shape_path, teacher_dir):
     root = Path(__file__).resolve().parent.parent
     def digest(p):
         return hashlib.sha256(Path(p).read_bytes()).hexdigest()
-    result = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=root, capture_output=True, text=True, check=True)
+    # 服务器训练副本可以不是 git 工作树:git 元数据降级为 'unavailable',版本溯源
+    # 由 teacher/shape/source 的 sha256 承担,resume 校验逐项钉死,不受影响。
+    result = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=root, capture_output=True, text=True)
+    commit = result.stdout.strip() if result.returncode == 0 else 'unavailable'
     teacher_files = ['nr_model.py', 'nr_network.py', 'nr_kernels.cu', 'nr_torch.py']
     student_files = ['nr_student.py', 'nr_shared_moe.py', 'moe_training.py', 'train_distill.py']
-    return dict(student_commit=result.stdout.strip(), teacher_commit=result.stdout.strip(),
+    return dict(student_commit=commit, teacher_commit=commit,
                 shape_sha256=digest(shape_path), teacher_manifest_sha256=digest(Path(teacher_dir) / 'manifest.json'),
                 teacher_source_sha256={n: digest(root / 'teacher' / n) for n in teacher_files},
                 student_source_sha256={n: digest(root / 'teacher' / n) for n in student_files})
