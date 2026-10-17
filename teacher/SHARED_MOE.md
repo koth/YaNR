@@ -102,6 +102,8 @@ python teacher/check_shared_moe.py --weights tmp/shared_moe/compact --routes-onl
 
 ## 训练、恢复与导出
 
+v45 的训练分块建议、显存优化、本机短跑与验证范围见 [TRAINING_PERF.md](TRAINING_PERF.md)。
+
 `train_distill.py` 检测新 kind 后默认 `student_precision=fp32`、`router_jitter=0`、`moe_aux=0`、`moe_z=0`，关闭 TF32。显式不兼容的 BF16/jitter/QAT 配置报错。可选 z-loss 使用 `mean(logsumexp(z)^2)`；旧网络保留原 BF16/抖动/L2 复现路径。
 
 训练控制器仅统计主任务前向的实际 field 行，跨微批累积后在 optimizer step **之后一次**更新：`b = center(b + rate*sign(sum(load)/16 - load))`。默认 `moe_bias_rate=0.001`。共享专家和 GEMM 对齐空行不计负载；时序 teacher-forcing 的 no_grad 次前向也不重复计入。评估和推理不调用控制器。

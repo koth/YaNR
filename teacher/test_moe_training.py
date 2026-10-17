@@ -7,7 +7,7 @@ from torch import nn
 
 from moe_shape import candidate
 from moe_training import (BiasController, configure, rng_state, restore_rng,
-                          training_checkpoint, restore_gradients, update_ema)
+                          training_checkpoint, restore_gradients, update_ema, validate_resume_sampling)
 from nr_shared_moe import SharedRoutedLinear
 
 
@@ -120,6 +120,33 @@ class ControllerTest(unittest.TestCase):
         gradient = controller.gradient_summary['block']
         self.assertGreater(gradient['router_task_gradient_norm'], 0.)
         self.assertGreater(gradient['router_regularizer_gradient_norm'], 0.)
+
+    def test_foreach_ema_preserves_weight_formula_and_copies_control_state(self):
+        state = {'block.weight': torch.randn(17, 32, 32),
+                 'block.router_bias': torch.randn(16), 'counter': torch.tensor(4)}
+        ema = {n: torch.zeros_like(v) for n, v in state.items()}
+        expected = copy.deepcopy(ema)
+        for name, value in state.items():
+            if name.endswith('.router_bias') or not value.dtype.is_floating_point:
+                expected[name].copy_(value)
+            else:
+                expected[name].mul_(.99).add_(value, alpha=1 - .99)
+        update_ema(ema, state, .99)
+        for name in state:
+            torch.testing.assert_close(ema[name], expected[name], rtol=0, atol=0)
+
+    def test_change_memory_budget_only_at_optimizer_boundary(self):
+        checkpoint = {'config': {'batch': 8, 'batch_rows': 262144},
+                      'routing_controller': {'step': None}}
+        cfg = {'batch': 8, 'batch_rows': 1179648}
+        validate_resume_sampling(checkpoint, cfg)
+        checkpoint['routing_controller']['step'] = 7
+        with self.assertRaisesRegex(ValueError, 'batch_rows'):
+            validate_resume_sampling(checkpoint, cfg)
+        checkpoint['routing_controller']['step'] = None
+        cfg['batch'] = 4
+        with self.assertRaisesRegex(ValueError, 'batch'):
+            validate_resume_sampling(checkpoint, cfg)
 
 
 if __name__ == '__main__':

@@ -46,7 +46,7 @@ from nr_history import block_match_flow, reproject_history, store_history  # noq
 from nr_student import StudentNetwork, load_student_shape, student_alignment   # noqa: E402
 from run_image import build_features, save_png                       # noqa: E402
 from moe_training import (BiasController, configure, provenance, restore_gradients,
-                          restore_rng, training_checkpoint, update_ema)
+                          restore_rng, training_checkpoint, update_ema, validate_resume_sampling)
 
 DEFAULTS = {
     'shape': os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -54,8 +54,10 @@ DEFAULTS = {
     'teacher_weights': os.environ.get('NR_WEIGHTS'),
     'size': 320, 'size_weights': None,
     'batch': 4,
-    'batch_rows': 4 * 512 * 512,  # 真 batch 前向的行数预算(≈ 4×512²;逐样本激活显存的上限)
-    'teacher_workers': 2,        # 教师标注预取线程数(线程本地实例 + 独立 CUDA 流,与学生重叠)
+    'batch_rows': 4 * 512 * 512,  # 单次学生前向的实际 field 行预算(含 padding；至少容纳一张)
+    'teacher_batch_rows': None,  # 默认沿用学生行预算；教师也必须分块，不能整步无限成批
+    'teacher_overlap': True,    # 关闭后教师/学生串行，降低重叠峰值；CPU 准备仍预取
+    'teacher_workers': 2,        # 兼容旧配置；GPU 教师当前由一个执行器串行调度，避免复制模型
     'steps': 200000,
     'overfit': 0,
     'lr': 2e-4, 'wd': 0.01, 'warmup': 2000, 'ema': 0.999, 'clip': 1.0,
@@ -80,6 +82,7 @@ DEFAULTS = {
     'moe_aux': 0.02,             # MoE 均衡正则(配额分配已结构保证均衡;此项仅防 p 漂移)
     'moe_z': 1e-2,               # router z-loss(ST-MoE,压 logits 幅值;router 前 LN 后配合生效)
     'student_precision': 'bf16', 'router_jitter': 0.1, 'student_compile': False,
+    'optimizer_fused': None,     # 新 FP32 CUDA 学生默认 fused AdamW；旧结构保持既有优化器
     'moe_z_formula': 'legacy-logits-l2-v1', 'moe_bias_rate': 1e-3,
     'ema_bias_policy': 'legacy-average-float-buffers', 'comet_disabled': False,
     'log_every': 100, 'vis_every': 2000, 'ckpt_every': 5000,
@@ -117,6 +120,7 @@ def load_config(args):
     for key in ('shape', 'teacher_weights', 'batch', 'steps', 'overfit', 'lr', 'wd',
                 'warmup', 'ema', 'clip', 'loss_out', 'loss_detail', 'loss_feature',
                 'loss_temporal', 'pair_fraction', 'seed', 'batch_rows', 'teacher_workers',
+                'teacher_batch_rows', 'teacher_overlap',
                 'lr_hold', 'lr_decay', 'lr_floor', 'loss_logit',
                 'action_floor', 'action_knee'):
         value = getattr(args, key, None)
@@ -134,6 +138,9 @@ def load_config(args):
         cfg['size_weights'] = [float(v) for v in (weights if isinstance(weights, list) else str(weights).split(','))]
         if len(cfg['size_weights']) != len(cfg['size']):
             raise SystemExit('size_weights length must match --size list')
+    for key in ('batch_rows', 'teacher_batch_rows'):
+        if cfg.get(key) is not None and int(cfg[key]) <= 0:
+            raise SystemExit(key + ' must be positive')
     return configure(cfg, load_student_shape(cfg['shape']), explicit)
 
 
@@ -423,7 +430,7 @@ class FeatureAligner(nn.Module):
         return teacher_act.float()
 
 
-def feature_losses(student_caps, teacher_caps, aligner, weights):
+def feature_losses(student_caps, teacher_caps, aligner, weights, diagnostics=True):
     """逐级 (1 - cosine) + 0.1* MSE,按点取加权均值(5.5)。
 
     注意:MSE 不做逐点方差归一化 —— 方差小的层会把比值炸成 1e4+,首次训练就是这样 NaN 的。
@@ -443,7 +450,11 @@ def feature_losses(student_caps, teacher_caps, aligner, weights):
         w = weights.get(s_name, 1.0)
         total = total + w * value
         wsum += w
-        detail[s_name] = float(value.detach())
+        if diagnostics:
+            detail[s_name] = value.detach()
+    if detail:
+        values = torch.stack(list(detail.values())).cpu().tolist()
+        detail = dict(zip(detail, values))
     return total / max(wsum, 1e-6), detail
 
 
@@ -506,9 +517,13 @@ def main():
                         help='per-size sampling weights, e.g. "0.7,0.3" for 7:3 mix')
     parser.add_argument('--batch', type=int)
     parser.add_argument('--batch-rows', dest='batch_rows', type=int,
-                        help='真 batch 前向行数预算(默认 4×512²;显存紧可调小)')
+                        help='单次学生前向的 field 行预算(含 padding；显存紧可调小)')
+    parser.add_argument('--teacher-batch-rows', type=int,
+                        help='单次教师前向的 field 行预算(默认沿用 batch_rows)')
+    parser.add_argument('--no-teacher-overlap', dest='teacher_overlap', action='store_false', default=None,
+                        help='教师和学生串行执行以降低显存峰值；CPU 准备仍预取')
     parser.add_argument('--teacher-workers', dest='teacher_workers', type=int,
-                        help='教师标注预取线程数(默认 2;显存紧调 1)')
+                        help='兼容配置项；GPU 教师当前串行调度')
     parser.add_argument('--steps', type=int)
     parser.add_argument('--overfit', type=int)
     parser.add_argument('--lr', type=float)
@@ -637,25 +652,32 @@ def main():
     aligner = FeatureAligner(align_pairs).to(device)
 
     params = list(model.parameters()) + list(aligner.parameters())
-    optim = torch.optim.AdamW(params, lr=cfg['lr'], weight_decay=cfg['wd'])
+    fused_adam = cfg['optimizer_fused']
+    if fused_adam is None:
+        fused_adam = bool(shared_routed and device == 'cuda')
+    optim = torch.optim.AdamW(params, lr=cfg['lr'], weight_decay=cfg['wd'], **({'fused': True} if fused_adam else {}))
     ema = {k: p.detach().clone() for k, p in model.state_dict().items()}
 
     start = 0
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        # Loading the full model+EMA+Adam checkpoint directly on GPU retained
+        # a second model/optimizer snapshot throughout the whole resumed run.
+        ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
         if controller:
             old_source = ckpt.get('source', {})
             for key in ('teacher_manifest_sha256', 'shape_sha256', 'teacher_source_sha256'):
                 if old_source.get(key) != cfg['source'].get(key):
                     raise ValueError('shared/routed replay provenance changed: ' + key)
-            for key in ('batch', 'batch_rows', 'size', 'size_weights', 'seed', 'style_range', 'tone_range',
-                        'structure_range', 'skin_range', 'automask_prob', 'pair_fraction', 'crop_prob', 'degrade_prob'):
-                if ckpt['config'].get(key) != cfg.get(key):
-                    raise ValueError('shared/routed replay sampling configuration changed: ' + key)
+            validate_resume_sampling(ckpt, cfg)
         model.load_state_dict(ckpt['model'])
         aligner.load_state_dict(ckpt['aligner'])
         optim.load_state_dict(ckpt['optim'])
-        ema = ckpt['ema']
+        for group in optim.param_groups:
+            group.update(fused=bool(fused_adam), foreach=False if fused_adam else None)
+        for state in optim.state.values():
+            if 'step' in state:
+                state['step'] = state['step'].to(device if fused_adam else 'cpu')
+        ema = {n: v.to(device) for n, v in ckpt['ema'].items()}
         start = ckpt['step'] + 1
         if controller:
             controller.load_state_dict(ckpt['routing_controller'])
@@ -664,6 +686,7 @@ def main():
                 restore_gradients(ckpt, model, aligner)
                 start = controller.step
         print(f"resumed at step {start} from {args.resume}")
+        del ckpt
 
     source = FrameSource(args.data, sizes, cfg, overfit=cfg['overfit'])
     teacher_caps = tuple(t for t in student_alignment().values() if t != 'head')
@@ -726,8 +749,15 @@ def main():
         for p in raw_items:
             if p['kind'] == 'pair':
                 by_size.setdefault(p['s'], []).append(p)
-        for s, grp in by_size.items():
-            g_s, _, res = annotate_group(grp, s, key='feats_a')    # 上帧整批
+        def chunks(by_size):
+            budget = cfg.get('teacher_batch_rows') or cfg['batch_rows']
+            for s, items in by_size.items():
+                limit = max(1, int(budget) // geo_for(s)['full_rows'])
+                for i in range(0, len(items), limit):
+                    yield s, items[i:i + limit]
+
+        for s, grp in chunks(by_size):
+            g_s, _, res = annotate_group(grp, s, key='feats_a')
             heads = res['head'].reshape(len(grp), g_s['full_height'], g_s['full_width'], 4)
             for i, p in enumerate(grp):
                 h = heads[i][:s, :s]
@@ -746,7 +776,7 @@ def main():
         by_size = {}
         for p in raw_items:
             by_size.setdefault(p['s'], []).append(p)
-        for s, grp in by_size.items():
+        for s, grp in chunks(by_size):
             g_s, teacher_s, res = annotate_group(grp, s, capture=teacher_caps)   # 当前帧整批
             heads = res['head'].reshape(len(grp), g_s['full_height'], g_s['full_width'], 4)
             for i, p in enumerate(grp):
@@ -797,6 +827,10 @@ def main():
     step_futs.append(teach_pool.submit(prepare_step, _collect_raw()))
 
     for step in range(start, cfg['steps']):
+        log_step = step % cfg['log_every'] == 0 or step == cfg['steps'] - 1
+        if controller:
+            for module in controller.modules.values():
+                module.training_metrics_enabled = log_step
         lr = lr_at(step, cfg)
         for group in optim.param_groups:
             group['lr'] = lr
@@ -817,8 +851,9 @@ def main():
         t_wait0 = time.perf_counter()
         prepared = step_futs.popleft().result()
         t_wait = time.perf_counter() - t_wait0
-        if step + 1 < cfg['steps']:
-            step_futs.append(teach_pool.submit(prepare_step, _collect_raw()))
+        next_raw = _collect_raw() if step + 1 < cfg['steps'] else None
+        if next_raw is not None and cfg['teacher_overlap']:
+            step_futs.append(teach_pool.submit(prepare_step, next_raw))
 
         # ---- 按 (边长, 模式) 分桶 + rows 预算切块,桶内真 batch 前向(2026-10-12 吞吐改造)。
         # 模型前向接受 batch 维行主序叠放(nr_student batch=1 与逐样本逐位一致;批量=逐样本
@@ -830,7 +865,7 @@ def main():
         for (s, kind), group in buckets.items():
             g_s = geo_for(s)
             model.g = g_s                              # 学生算子与分辨率无关,换几何即换边长
-            max_b = max(1, int(cfg.get('batch_rows', 4 * 512 * 512)) // (s * s))
+            max_b = max(1, int(cfg.get('batch_rows', 4 * 512 * 512)) // g_s['full_rows'])
             for c0 in range(0, len(group), max_b):
                 chunk_cursor += 1
                 if chunk_cursor <= resumed_chunks:
@@ -854,19 +889,22 @@ def main():
                 # 整块级损失:特征(整块捕获 ≈ 逐样本均值,行数同)与 MoE 均衡项 ——
                 # 必须在时序二次前向(清 moe_stats/captures)之前取。
                 feat, feat_detail = feature_losses(model.captures, t_res_stack,
-                                                   aligner, feature_weights)
-                moe_aux = model.moe_aux_loss()
-                aux_val = float(moe_aux.detach())
+                                                   aligner, feature_weights, diagnostics=log_step)
+                need_moe = log_step or cfg['moe_aux'] != 0 or cfg['moe_z'] != 0
+                moe_aux = model.moe_aux_loss() if need_moe else s_head_all.new_zeros(())
+                aux_val = float(moe_aux.detach()) if log_step else 0.
                 chunk_moe = 0.0
                 if moe_aux.requires_grad:
-                    z = model.moe_z_loss()
+                    z = model.moe_z_loss() if log_step or cfg['moe_z'] != 0 else moe_aux.new_zeros(())
                     chunk_moe = cfg.get('moe_aux', 0.1) * moe_aux + cfg.get('moe_z', 1e-3) * z
-                    route = moe_route_metrics(model)            # 坍缩指标(Comet 上报)
-                    route['aux'] = aux_val
-                    route['z'] = float(z.detach())
-                    for k, v in route.items():
-                        moe_tot[k] = moe_tot.get(k, 0.0) + v * cnb
-                totals['feature'] += float(feat.detach()) * cnb
+                    if log_step:
+                        route = moe_route_metrics(model)
+                        route['aux'] = aux_val
+                        route['z'] = float(z.detach())
+                        for k, v in route.items():
+                            moe_tot[k] = moe_tot.get(k, 0.0) + v * cnb
+                if log_step:
+                    totals['feature'] += float(feat.detach()) * cnb
                 for k, v in feat_detail.items():
                     feat_detail_acc[k] = feat_detail_acc.get(k, 0.0) + v * cnb
 
@@ -919,16 +957,17 @@ def main():
                 chunk_loss = chunk_loss + (
                     torch.where(finite, sample_v, torch.zeros_like(sample_v)).sum()
                     / cfg['batch'])
-                fm = finite.to(out_v.dtype)
-                totals['out'] += float((out_v * fm).sum())
-                totals['detail'] += float((detail_v * fm).sum())
-                totals['texture'] += float((tex_v * fm).sum())
-                totals['texstat'] += float((stat_v * fm).sum())
-                if temporal_v is not None:
-                    totals['temporal'] += float((temporal_v * fm).sum())
-                mse = ((s_neural.detach() - t_neural.detach()) ** 2).reshape(cnb, -1).mean(1)
-                psnr_v = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-12))
-                psnrs.extend(psnr_v[finite].tolist())
+                if log_step:
+                    fm = finite.to(out_v.dtype)
+                    totals['out'] += float((out_v * fm).sum())
+                    totals['detail'] += float((detail_v * fm).sum())
+                    totals['texture'] += float((tex_v * fm).sum())
+                    totals['texstat'] += float((stat_v * fm).sum())
+                    if temporal_v is not None:
+                        totals['temporal'] += float((temporal_v * fm).sum())
+                    mse = ((s_neural.detach() - t_neural.detach()) ** 2).reshape(cnb, -1).mean(1)
+                    psnr_v = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-12))
+                    psnrs.extend(psnr_v[finite].tolist())
                 chunk_loss = chunk_loss + (cfg['loss_feature'] * feat + chunk_moe) * (
                     cnb / cfg['batch'])
                 if torch.isfinite(chunk_loss):
@@ -939,7 +978,7 @@ def main():
                     print(f'step {step}: non-finite chunk loss, skipped')
         t_comp = time.perf_counter() - t_comp0
         t_opt0 = time.perf_counter()
-        if controller:
+        if controller and log_step:
             controller.capture_gradients()
         torch.nn.utils.clip_grad_norm_(params, cfg['clip'])
         optim.step()
@@ -959,6 +998,8 @@ def main():
         elif controller:
             update_ema(ema, model.state_dict(), 0.)
         t_opt = time.perf_counter() - t_opt0
+        if next_raw is not None and not cfg['teacher_overlap']:
+            step_futs.append(teach_pool.submit(prepare_step, next_raw))
         ms = (time.perf_counter() - t0) * 1000
 
         # comet 上报按 log_every 节流(2026-10-14 提速牌 2:每步 HTTP 上报是墙钟尾巴)。

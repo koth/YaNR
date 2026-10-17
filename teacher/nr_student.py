@@ -20,6 +20,7 @@ import json
 import math
 import os
 import sys
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -96,6 +97,25 @@ def cosine_norm(x):
     return x / x.float().norm(dim=-1, keepdim=True).clamp_min(1e-6).to(x.dtype)
 
 
+@lru_cache(maxsize=32)
+def _window_indices(width, height, win, shift_x, shift_y, batch, device):
+    """Geometry is static: resolve boolean selections on CPU once, not per GPU forward."""
+    wx, wy = (width + shift_x + win - 1) // win, (height + shift_y + win - 1) // win
+    ox = (torch.arange(wx) * win - shift_x).view(-1, 1).expand(wx, wy).reshape(-1)
+    oy = (torch.arange(wy) * win - shift_y).view(1, -1).expand(wx, wy).reshape(-1)
+    slot = torch.arange(win * win)
+    fx = (ox[:, None] + (slot % win)[None, :]).reshape(-1)
+    fy = (oy[:, None] + (slot // win)[None, :]).reshape(-1)
+    valid = (fx >= 0) & (fx < width) & (fy >= 0) & (fy < height)
+    index = fy.clamp(0, height - 1) * width + fx.clamp(0, width - 1)
+    if batch > 1:
+        index = (index[None, :] + (torch.arange(batch) * width * height)[:, None]).reshape(-1)
+        valid = valid[None, :].expand(batch, -1).reshape(-1)
+    valid_slots = torch.arange(index.numel())[valid]
+    valid_index = index[valid]
+    return tuple(v.to(device) for v in (index, valid, valid_index, valid_slots))
+
+
 class WindowAttention(nn.Module):
     """8x8 移位窗注意力:余弦 q/k、每头 scale、相对先验、掩码 softmax。
 
@@ -126,19 +146,8 @@ class WindowAttention(nn.Module):
         windows_y = (height + shift_y + win - 1) // win
         windows = windows_x * windows_y
 
-        win_x = torch.arange(windows_x, device=qkv.device) * win - shift_x
-        win_y = torch.arange(windows_y, device=qkv.device) * win - shift_y
-        slot = torch.arange(slots, device=qkv.device)
-        ox = win_x.view(-1, 1).expand(windows_x, windows_y).reshape(-1)     # [windows]
-        oy = win_y.view(1, -1).expand(windows_x, windows_y).reshape(-1)
-        fx = (ox.view(-1, 1) + (slot % win).view(1, -1)).reshape(-1)
-        fy = (oy.view(-1, 1) + (slot // win).view(1, -1)).reshape(-1)
-        valid = (fx >= 0) & (fx < width) & (fy >= 0) & (fy < height)
-        index = fy.clamp(0, height - 1) * width + fx.clamp(0, width - 1)
+        index, valid, valid_index, valid_slots = _window_indices(width, height, win, shift_x, shift_y, batch, qkv.device)
         if batch > 1:
-            off = (torch.arange(batch, device=qkv.device) * rows).view(-1, 1)
-            index = (index.view(1, -1) + off).reshape(-1)
-            valid = valid.view(1, -1).expand(batch, -1).reshape(-1)
             windows = windows * batch
             rows = rows * batch
 
@@ -165,7 +174,7 @@ class WindowAttention(nn.Module):
 
         result = qkv.new_zeros((rows, heads * HEAD_DIM))
         values = out.permute(0, 2, 1, 3).reshape(windows * slots, heads * HEAD_DIM)
-        result[index[valid]] = values[valid]
+        result[valid_index] = values[valid_slots]
         return result
 
 
@@ -697,6 +706,7 @@ class StudentNetwork(nn.Module):
         """batch>1(2026-10-12 吞吐):features 为样本行主序叠放 ((batch*rows, 16)),
         输出同布局 ((batch*rows, 4));ViT 在瓶颈 token 数小,逐样本跑(全局注意力
         跨样本互见的掩码复杂度不值当)。batch=1 与原实现逐位一致。"""
+        self.captures.clear()
         for m in self.modules():
             if hasattr(m, 'moe_stats'):
                 m.moe_stats.clear()

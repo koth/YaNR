@@ -42,16 +42,25 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+class _AnnotationNetwork(Network):
+    """Keep only requested tensors; the teacher's numerical implementation stays unchanged."""
+    capture_filter = None
+
+    def capture(self, name, tensor):
+        if self.capture_filter is None or name in self.capture_filter:
+            super().capture(name, tensor)
+
+
 class TeacherAnnotator:
     """在线教师:一次前向产出 head 与任意捕获点激活。"""
 
     def __init__(self, weights, g):
         self.g = g
         self.model = Model(nr_torch.DEVICE).load(weights)
-        self.network = Network(self.model, g)
+        self.network = _AnnotationNetwork(self.model, g)
         self.blend_scale = float(self.model.blend_scale())
 
-    def forward(self, features_np, batch=1):
+    def forward(self, features_np, batch=1, capture=None):
         """跑一次教师,返回 (head [rows,4] f32 torch, boundaries dict 名->张量)。
 
         2026-10-12:torch.cuda.synchronize()(全设备)改为流本地同步 —— 训练把教师标注
@@ -62,13 +71,14 @@ class TeacherAnnotator:
         """
         features = torch.from_numpy(np.ascontiguousarray(features_np, dtype=np.float32))
         features = features.to(nr_torch.DEVICE)
+        self.network.capture_filter = None if capture is None else frozenset(capture)
         head = self.network.record(features, batch=batch)
         torch.cuda.current_stream().synchronize()
         return head, self.network.boundaries
 
     def annotate(self, features_np, capture=(), batch=1):
         """head f32 numpy + 捕获点激活(原 buffer dtype,通常 f16)。"""
-        head, boundaries = self.forward(features_np, batch=batch)
+        head, boundaries = self.forward(features_np, batch=batch, capture=capture)
         out = {'head': head.float().cpu().numpy().reshape(-1, 4)}
         for name in capture:
             tensor = boundaries.get(name)

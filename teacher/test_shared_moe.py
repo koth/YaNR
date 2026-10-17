@@ -1,14 +1,16 @@
 """Small semantic fixtures, independent of trained weights or CUDA availability."""
 import copy
+import os
 import unittest
 
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 import torch
 
 from audit_moe import audit_manifest
 from moe_shape import candidate, ledger, validate
 from moe_cost import account_moe
 from nr_geometry import geometry_from_valid
-from nr_shared_moe import select, SharedRoutedBlock, SharedRoutedLinear
+from nr_shared_moe import select, SharedRoutedBlock, SharedRoutedLinear, RoutedModule
 
 
 class SharedMoETest(unittest.TestCase):
@@ -89,6 +91,37 @@ class SharedMoETest(unittest.TestCase):
         entry['shape'][0] = 16; entry['byteLength'] = 4 * 16 * 384 * 192
         with self.assertRaises(ValueError):
             audit_manifest({'tensors': malformed}, s)
+
+    def test_grouped_projection_backward_with_padding_and_empty_experts(self):
+        # Compare the padded grouped operator with an independent dense-per-row
+        # oracle, including repeated tiles, empty groups and all-hot routing.
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        for device in ['cpu'] + (['cuda'] if torch.cuda.is_available() else []):
+            for hot, rows in [(False, 3), (False, 135), (True, 135)]:
+                with self.subTest(device=device, hot=hot, rows=rows):
+                    layer = SharedRoutedLinear(32, 32, token=True).to(device)
+                    if hot:
+                        with torch.no_grad():
+                            layer.router[1].weight.zero_()
+                    state = torch.randn(rows, 32, device=device, requires_grad=True)
+                    route = layer.route(state, rows, 1, 1)
+                    assign = layer.moe_stats[-1][0]
+                    weight = torch.randn(17, 32, 5, device=device, requires_grad=True)
+                    bias = torch.randn(17, 5, device=device, requires_grad=True)
+                    actual = RoutedModule.routed_mm(state, weight, route, bias)
+                    expected = torch.cat([state[i:i+1] @ weight[int(assign[i]) + 1] +
+                                          bias[int(assign[i]) + 1] for i in range(rows)])
+                    probe = torch.randn_like(actual)
+                    got = torch.autograd.grad((actual * probe).sum(), (state, weight, bias))
+                    want = torch.autograd.grad((expected * probe).sum(), (state, weight, bias))
+                    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+                    for a, b in zip(got, want):
+                        torch.testing.assert_close(a, b, atol=3e-5, rtol=2e-5)
+                    again = RoutedModule.routed_mm(state, weight, route, bias)
+                    repeated = torch.autograd.grad((again * probe).sum(), (state, weight, bias))
+                    for a, b in zip(got, repeated):
+                        self.assertTrue(torch.equal(a, b))
 
     def test_cost_geometry_and_alignment(self):
         s = candidate([32] * 6, [32] * 6, 32, 32)

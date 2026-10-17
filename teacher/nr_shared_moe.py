@@ -11,6 +11,73 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def route_tile_rows(rows):
+    """Bound padding by the actual problem size, particularly deep ViT groups.
+
+    At most 15 partial tiles: padding < 16*tile, instead of imposing 4096
+    rows even on a group with one token. Sizes depend only on the input shape.
+    """
+    return min(4096, max(8, 1 << max(0, (max(1, rows // 16)).bit_length() - 1)))
+
+
+def row_counts(assign):
+    # Fixed output shape; CUDA bincount/repeat_interleave otherwise need a host
+    # read to discover their output size, even with minlength=16.
+    return torch.zeros(16, dtype=torch.int64, device=assign.device).scatter_add_(
+        0, assign, torch.ones_like(assign))
+
+
+class _Permutation(torch.autograd.Function):
+    """The transpose of a known permutation is its inverse, never an atomic sum."""
+    @staticmethod
+    def forward(ctx, state, order, inverse):
+        ctx.save_for_backward(inverse)
+        return state.index_select(0, order)
+
+    @staticmethod
+    def backward(ctx, grad):
+        inverse, = ctx.saved_tensors
+        return grad.index_select(0, inverse), None, None
+
+
+class _TilePack(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, state, packed_rows, valid, slots):
+        ctx.save_for_backward(slots)
+        return state.index_select(0, packed_rows) * valid[:, None]
+
+    @staticmethod
+    def backward(ctx, grad):
+        slots, = ctx.saved_tensors
+        return grad.index_select(0, slots), None, None, None
+
+
+class _TileUnpack(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, state, slots, packed_rows, valid):
+        ctx.save_for_backward(packed_rows, valid)
+        return state.index_select(0, slots)
+
+    @staticmethod
+    def backward(ctx, grad):
+        packed_rows, valid = ctx.saved_tensors
+        return grad.index_select(0, packed_rows) * valid[:, None], None, None, None
+
+
+class _ExpertWeights(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, bank, experts, tiles):
+        ctx.save_for_backward(tiles)
+        return bank.index_select(0, experts)
+
+    @staticmethod
+    def backward(ctx, grad):
+        tiles, = ctx.saved_tensors
+        # Tiles are contiguous and sorted by expert. This ordered reduction
+        # replaces generic repeated-index backward (sort + atomic/scatter).
+        return torch.segment_reduce(grad, 'sum', lengths=tiles, axis=0, unsafe=True), None, None
+
+
 def select(logits, bias):
     """Selection uses frozen bias; differentiable gate uses unbiased FP32 logits."""
     if logits.dtype != torch.float32 or bias.dtype != torch.float32:
@@ -75,20 +142,28 @@ class RoutedModule(nn.Module):
         self.moe_stats.append((assign.detach(), probs, logits))
         for name, tensor in [('logits', logits), ('pick', pick), ('gate', gate), ('assign', assign)]:
             self.capture(name, tensor)
-        # 分组布局全张量化:排序后逐行算 (tile_id, slot),routed_mm 走固定瓦片 bmm。
-        # 无逐专家 Python 循环;.tolist() 只剩一次 int(tiles.sum()) 尺寸取值。
+        # One scalar size read per route; reuse its compact layout in all four
+        # projections. Never impose a 4096-row minimum on small/deep layers.
         order = torch.argsort(assign, stable=True)
-        counts = torch.bincount(assign, minlength=16)
-        tile = 4096
+        counts = row_counts(assign)
+        tile = route_tile_rows(assign.numel())
         tiles = (counts + tile - 1) // tile
         tile_base = torch.cumsum(tiles, 0) - tiles
         group_start = torch.cumsum(counts, 0) - counts
         dev = assign.device
-        expert = torch.repeat_interleave(torch.arange(16, device=dev), counts)
-        pos = torch.arange(assign.numel(), device=dev) - torch.repeat_interleave(group_start, counts)
+        expert = assign[order]
+        pos = torch.arange(assign.numel(), device=dev) - group_start[expert]
         tile_id = tile_base[expert] + pos // tile
-        lay = dict(TILE=tile, B=int(tiles.sum()), tile_id=tile_id, slot=pos % tile,
-                   expert_of_tile=torch.repeat_interleave(torch.arange(16, device=dev), tiles),
+        tile_count = int(tiles.sum())
+        tile_experts = torch.searchsorted(tile_base + tiles, torch.arange(tile_count, device=dev), right=True)
+        packed = torch.arange(tile_count * tile, device=dev)
+        packed_expert = tile_experts[packed // tile]
+        packed_pos = (packed // tile - tile_base[packed_expert]) * tile + packed % tile
+        packed_valid = packed_pos < counts[packed_expert]
+        packed_rows = (group_start[packed_expert] + packed_pos).clamp_max(assign.numel() - 1)
+        lay = dict(TILE=tile, B=tile_count, tiles=tiles, tile_id=tile_id, slot=pos % tile,
+                   packed_rows=packed_rows, packed_valid=packed_valid, flat_slots=tile_id * tile + pos % tile,
+                   expert_of_tile=tile_experts,
                    expert_per_row=expert)
         inv = torch.empty_like(order)
         inv[order] = torch.arange(order.numel(), device=order.device)
@@ -97,30 +172,33 @@ class RoutedModule(nn.Module):
     @staticmethod
     def routed_mm(state, bank, route, bias=None):
         order, inv, lay, _ = route
-        sorted_x = state[order]
-        k = state.shape[1]
+        sorted_x = _Permutation.apply(state, order, inv)
         out_f = bank.shape[2]
         # 固定瓦片分组 GEMM(2026-10-17 向量化):变长专家组折算进稠密 [B, TILE, k],
         # 16 专家一次 bmm;替代逐专家循环(33 碎内核/次 -> 8,无 Python 循环派发)。
-        buf = sorted_x.new_zeros(lay['B'], lay['TILE'], k)
-        buf[lay['tile_id'], lay['slot']] = sorted_x
-        out = torch.bmm(buf, bank[1:17][lay['expert_of_tile']]).reshape(-1, out_f)
-        seg = out[lay['tile_id'] * lay['TILE'] + lay['slot']]
+        buf = _TilePack.apply(sorted_x, lay['packed_rows'], lay['packed_valid'], lay['flat_slots'])
+        weights = _ExpertWeights.apply(bank[1:17], lay['expert_of_tile'], lay['tiles'])
+        out = torch.bmm(buf.view(lay['B'], lay['TILE'], state.shape[1]), weights).reshape(-1, out_f)
+        seg = _TileUnpack.apply(out, lay['flat_slots'], lay['packed_rows'], lay['packed_valid'])
         if bias is not None:
             seg = seg + bias[1:17][lay['expert_per_row']]
-        return seg[inv]
+        return _Permutation.apply(seg, inv, order)
 
     def mixed_mm(self, state, bank, route, bias=None):
-        shared = state @ bank[0]
-        if bias is not None:
-            shared = shared + bias[0]
-        routed = self.routed_mm(state, bank, route, bias)
+        shared, routed = self.expert_pair(state, state, bank, route, bias)
         if self.training_metrics_enabled and self.training and torch.is_grad_enabled():
             with torch.no_grad():
                 self.training_metrics.update(shared_projection_rms=shared.square().mean().sqrt(),
                                              routed_projection_rms=routed.square().mean().sqrt())
         shared, routed = self.diagnostic_branches(shared, routed)
         return (shared + route[3] * routed) * 0.5
+
+    @staticmethod
+    def expert_pair(shared_state, routed_state, bank, route, bias=None):
+        shared = shared_state @ bank[0]
+        if bias is not None:
+            shared = shared + bias[0]
+        return shared, RoutedModule.routed_mm(routed_state, bank, route, bias)
 
     def diagnostic_branches(self, shared, routed):
         if self.branch_mode != 'full' and self.training:
@@ -180,9 +258,8 @@ class SharedRoutedBlock(RoutedModule):
         # For token blocks width=tokens, height=padded, matching existing ViT API.
         route = self.route(state, width, height, batch)
         contract = getattr(self, self.contract_name)
-        shared = F.silu(state @ self.expand[0]) @ contract[0]
-        hidden = F.silu(self.routed_mm(state, self.expand, route))
-        routed = self.routed_mm(hidden, contract, route)
+        shared_hidden, routed_hidden = self.expert_pair(state, state, self.expand, route)
+        shared, routed = self.expert_pair(F.silu(shared_hidden), F.silu(routed_hidden), contract, route)
         if self.training_metrics_enabled and self.training and torch.is_grad_enabled():
             with torch.no_grad():
                 self.training_metrics.update(shared_ffn_rms=shared.square().mean().sqrt(),

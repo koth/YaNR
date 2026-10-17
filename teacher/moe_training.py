@@ -10,7 +10,7 @@ import random
 import numpy as np
 import torch
 
-from nr_shared_moe import RoutedModule
+from nr_shared_moe import RoutedModule, row_counts
 
 
 def configure(cfg, shape, explicit=()):
@@ -45,6 +45,18 @@ def restore_rng(state):
         torch.cuda.set_rng_state_all([v.cpu() for v in state['cuda']])
 
 
+def validate_resume_sampling(checkpoint, cfg):
+    """A field budget may change at a complete optimizer boundary, never mid-step."""
+    keys = ('batch', 'size', 'size_weights', 'seed', 'style_range', 'tone_range',
+            'structure_range', 'skin_range', 'automask_prob', 'pair_fraction', 'crop_prob', 'degrade_prob')
+    pending = checkpoint['routing_controller'].get('step') is not None
+    if pending:
+        keys += ('batch_rows',)
+    for key in keys:
+        if checkpoint['config'].get(key) != cfg.get(key):
+            raise ValueError('shared/routed replay sampling configuration changed: ' + key)
+
+
 class BiasController:
     VERSION = 'row-load-step-bias-v1'
 
@@ -64,7 +76,7 @@ class BiasController:
     def begin(self, step):
         if self.step is not None or step <= self.last_applied_step:
             raise ValueError('bias step is already pending or has been applied')
-        if any(bool(v.any()) for v in self.pending.values()):
+        if bool(torch.stack([v.any() for v in self.pending.values()]).any()):
             raise ValueError('unconsumed microbatch loads')
         self.step = int(step); self.microbatches = 0; self.telemetry = {}
         self.regularizer_gradients = {}; self.gradient_summary = {}
@@ -83,15 +95,20 @@ class BiasController:
                     self.regularizer_gradients[name].add_(gradient.detach())
 
     def capture_gradients(self):
+        names, norms = [], []
         for name, module in self.modules.items():
             total = module.router[1].weight.grad
             if total is None:
                 continue
             regularizer = self.regularizer_gradients.get(name)
             task = total if regularizer is None else total - regularizer
-            self.gradient_summary[name] = dict(router_task_gradient_norm=float(task.norm()),
-                                                router_regularizer_gradient_norm=0. if regularizer is None else float(regularizer.norm()),
-                                                router_total_gradient_norm_before_clip=float(total.norm()))
+            names.append(name)
+            norms.append(torch.stack((task.norm(), total.new_zeros(()) if regularizer is None else regularizer.norm(), total.norm())))
+        # One transfer, instead of 2-3 scalar synchronizations for every layer.
+        if norms:
+            for name, values in zip(names, torch.stack(norms).detach().cpu().tolist()):
+                self.gradient_summary[name] = dict(zip(('router_task_gradient_norm', 'router_regularizer_gradient_norm',
+                                                        'router_total_gradient_norm_before_clip'), values))
 
     def collect(self):
         """Call once after each task forward, before any no_grad temporal pass."""
@@ -99,12 +116,12 @@ class BiasController:
             raise ValueError('call begin(step) before accumulating loads')
         for name, module in self.modules.items():
             for assign, _probs, _logits in module.moe_stats:
-                self.pending[name].add_(torch.bincount(assign, minlength=16))
+                self.pending[name].add_(row_counts(assign))
             for stats in module.training_metric_records:
                 record = self.telemetry.setdefault(name, dict(calls=0))
                 record['calls'] += 1
                 for key, value in stats.items():
-                    record[key] = record.get(key, 0.) + float(value.detach())
+                    record[key] = record.get(key, 0.) + value.detach()
             module.training_metric_records.clear()
         self.microbatches += 1
 
@@ -112,10 +129,10 @@ class BiasController:
     def apply(self, step):
         if self.step != step or step <= self.last_applied_step or self.microbatches == 0:
             raise ValueError('missing/duplicate/out-of-order optimizer bias update')
+        if bool(torch.stack([v.sum() == 0 for v in self.pending.values()]).any()):
+            raise ValueError('a routed module received no task rows')
         for name, module in self.modules.items():
             load = self.pending[name]
-            if not bool(load.sum()):
-                raise ValueError('module received no task rows: ' + name)
             before = module.router_bias.clone()
             module.router_bias.add_(self.rate * (load.sum().float() / 16 - load.float()).sign())
             module.router_bias.sub_(module.router_bias.mean())
@@ -123,7 +140,7 @@ class BiasController:
             active = load > 0
             self.last_active_step[name][active] = step
             self.updated_steps[name].add_(active.to(torch.int64))
-            self.telemetry.setdefault(name, dict(calls=0))['bias_change_max'] = float((module.router_bias - before).abs().max())
+            self.telemetry.setdefault(name, dict(calls=0))['bias_change_max'] = (module.router_bias - before).abs().max()
             load.zero_()
         self.last_applied_step = int(step); self.step = None
 
@@ -146,6 +163,13 @@ class BiasController:
                 if parameter.ndim >= 2 and parameter.shape[0] == 17 and parameter.grad is not None:
                     item['expert_gradient_norms'][key] = parameter.grad.detach().flatten(1).norm(dim=1).cpu().tolist()
             output[name] = item
+        # Scalars stay on-device between microbatches. Convert together only
+        # when JSON diagnostics are actually requested.
+        entries = [(item, key, value) for item in output.values() for key, value in item.items() if torch.is_tensor(value)]
+        if entries:
+            values = torch.stack([value for _, _, value in entries]).detach().cpu().tolist()
+            for (item, key, _), value in zip(entries, values):
+                item[key] = value
         return output
 
     def state_dict(self):
@@ -164,6 +188,9 @@ class BiasController:
                 getattr(self, key)[name].copy_(value)
         self.step = state['step']; self.last_applied_step = state['last_applied_step']
         self.microbatches = state['microbatches']; self.telemetry = copy.deepcopy(state.get('telemetry', {}))
+        for name, record in self.telemetry.items():
+            self.telemetry[name] = {k: v.to(self.modules[name].router_bias.device) if torch.is_tensor(v) else v
+                                    for k, v in record.items()}
         self.regularizer_gradients = {n: v.to(self.modules[n].router_bias.device).clone() for n, v in state.get('regularizer_gradients', {}).items()}
         if self.step is None and any(bool(v.any()) for v in self.pending.values()):
             raise ValueError('controller has pending rows without a pending optimizer step')
@@ -178,11 +205,18 @@ def update_ema(ema, state, decay):
 Bias is a control state, not a trainable parameter. Arithmetic EMA of bias
 would create a controller state which never existed at an update boundary.
 """
+    averaged, current = [], []
     for name, value in state.items():
         if name.endswith('.router_bias') or not value.dtype.is_floating_point:
             ema[name].copy_(value)
         else:
-            ema[name].mul_(decay).add_(value.detach(), alpha=1 - decay)
+            averaged.append(ema[name])
+            current.append(value.detach())
+    if averaged:
+        # Preserve the two-rounding mul/add formula, while replacing hundreds
+        # of per-parameter CUDA launches with two multi-tensor operations.
+        torch._foreach_mul_(averaged, decay)
+        torch._foreach_add_(averaged, current, alpha=1 - decay)
 
 
 def training_checkpoint(model, aligner, optimizer, ema, cfg, step, controller=None):

@@ -1,0 +1,412 @@
+{
+  "date": "2026-10-17",
+  "baseline_commit": "796ff4f28d2e681a9dc838b39b0950c01fdfd8e6",
+  "notes": [
+    "Local Windows RTX 3080 10GB; ordinary desktop/services remained running. CPU 8 threads.",
+    "Model-only cases include one optimizer update per iteration; different batches do not represent equal-effective-batch comparisons.",
+    "Candidate model-only probes used the same grouped gather implementation before later changes limited to capture cleanup, resume and logging. Capture is disabled in these probes.",
+    "All timing probes use eager FP32, TF32 off and deterministic algorithms. Linux CUDA Inductor and the proposed 24GB budgets were not benchmarked.",
+    "Pipeline uses 33 repository sample images, effective batch 8, local teacher, no Comet, no periodic checkpoints/visualization, log_every 2; includes final checkpoint.",
+    "First two pipeline reports predate extra override fields in the helper: teacher_batch_rows=294912 and teacher_overlap=true in both.",
+    "Pipeline totals include initialization/data preparation and final checkpoint and are short smoke runs, not stable throughput statistics.",
+    "Old pipeline stopped manually after approximately 169 seconds without completing/logging its first step; not a completed baseline."
+  ],
+  "reports": {
+    "baseline320": {
+      "size": 320,
+      "batch": 1,
+      "field": [
+        320,
+        320
+      ],
+      "reference": "796ff4f",
+      "tile_override": null,
+      "telemetry": true,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "torch": "2.6.0+cu124",
+      "samples": [
+        {
+          "ms": 622.6952997967601,
+          "peak_allocated": 4091858432,
+          "peak_reserved": 4452253696,
+          "loss": 0.2814948856830597
+        },
+        {
+          "ms": 649.0299999713898,
+          "peak_allocated": 4094029312,
+          "peak_reserved": 4452253696,
+          "loss": 0.20114055275917053
+        },
+        {
+          "ms": 661.994700320065,
+          "peak_allocated": 4121198080,
+          "peak_reserved": 4527751168,
+          "loss": 0.23958580195903778
+        },
+        {
+          "ms": 692.5442991778255,
+          "peak_allocated": 3955535360,
+          "peak_reserved": 4529848320,
+          "loss": 0.19395244121551514
+        },
+        {
+          "ms": 654.0962001308799,
+          "peak_allocated": 3926314496,
+          "peak_reserved": 4529848320,
+          "loss": 0.20526957511901855
+        }
+      ],
+      "median_ms": 654.0962001308799,
+      "peak_allocated": 4121198080,
+      "peak_reserved": 4529848320
+    },
+    "baseline512": {
+      "size": 512,
+      "batch": 1,
+      "field": [
+        576,
+        512
+      ],
+      "reference": "796ff4f",
+      "tile_override": null,
+      "telemetry": true,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "torch": "2.6.0+cu124",
+      "samples": [
+        {
+          "ms": 664.8062001913786,
+          "peak_allocated": 6109282304,
+          "peak_reserved": 6526337024,
+          "loss": 0.31329700350761414
+        },
+        {
+          "ms": 675.4559995606542,
+          "peak_allocated": 6021148672,
+          "peak_reserved": 6526337024,
+          "loss": 0.2967608571052551
+        },
+        {
+          "ms": 667.2497000545263,
+          "peak_allocated": 6053408768,
+          "peak_reserved": 6528434176,
+          "loss": 0.2571793794631958
+        }
+      ],
+      "median_ms": 667.2497000545263,
+      "peak_allocated": 6109282304,
+      "peak_reserved": 6528434176
+    },
+    "gather320": {
+      "size": 320,
+      "batch": 1,
+      "field": [
+        320,
+        320
+      ],
+      "reference": "working-tree",
+      "tile_override": null,
+      "telemetry": false,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "torch": "2.6.0+cu124",
+      "samples": [
+        {
+          "ms": 469.7186993435025,
+          "peak_allocated": 2642525184,
+          "peak_reserved": 2906652672,
+          "loss": 0.2814950942993164
+        },
+        {
+          "ms": 484.7408998757601,
+          "peak_allocated": 2642951680,
+          "peak_reserved": 2906652672,
+          "loss": 0.20114074647426605
+        },
+        {
+          "ms": 479.7291001304984,
+          "peak_allocated": 2649982976,
+          "peak_reserved": 2906652672,
+          "loss": 0.23958605527877808
+        }
+      ],
+      "median_ms": 479.7291001304984,
+      "peak_allocated": 2649982976,
+      "peak_reserved": 2906652672
+    },
+    "gather512b1": {
+      "size": 512,
+      "batch": 1,
+      "field": [
+        576,
+        512
+      ],
+      "reference": "working-tree",
+      "tile_override": null,
+      "telemetry": false,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "torch": "2.6.0+cu124",
+      "samples": [
+        {
+          "ms": 585.1961001753807,
+          "peak_allocated": 4482640896,
+          "peak_reserved": 4687134720,
+          "loss": 0.313297301530838
+        },
+        {
+          "ms": 571.4090997353196,
+          "peak_allocated": 4475791872,
+          "peak_reserved": 4687134720,
+          "loss": 0.2967611849308014
+        },
+        {
+          "ms": 584.9120998755097,
+          "peak_allocated": 4479546368,
+          "peak_reserved": 4724883456,
+          "loss": 0.2571796476840973
+        },
+        {
+          "ms": 584.7064992412925,
+          "peak_allocated": 4499417088,
+          "peak_reserved": 4724883456,
+          "loss": 0.25649499893188477
+        },
+        {
+          "ms": 565.625099465251,
+          "peak_allocated": 4485273088,
+          "peak_reserved": 4724883456,
+          "loss": 0.2443578541278839
+        }
+      ],
+      "median_ms": 584.7064992412925,
+      "peak_allocated": 4499417088,
+      "peak_reserved": 4724883456
+    },
+    "gather320b4": {
+      "size": 320,
+      "batch": 4,
+      "field": [
+        320,
+        320
+      ],
+      "reference": "working-tree",
+      "tile_override": null,
+      "telemetry": false,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "torch": "2.6.0+cu124",
+      "samples": [
+        {
+          "ms": 776.9812997430563,
+          "peak_allocated": 6127279616,
+          "peak_reserved": 6496976896,
+          "loss": 0.2302902191877365
+        },
+        {
+          "ms": 748.5849997028708,
+          "peak_allocated": 6220467200,
+          "peak_reserved": 6603931648,
+          "loss": 0.29044100642204285
+        },
+        {
+          "ms": 750.4109004512429,
+          "peak_allocated": 6229354496,
+          "peak_reserved": 6603931648,
+          "loss": 0.2268010824918747
+        },
+        {
+          "ms": 755.5149998515844,
+          "peak_allocated": 6174263808,
+          "peak_reserved": 6603931648,
+          "loss": 0.21963262557983398
+        },
+        {
+          "ms": 731.9869995117188,
+          "peak_allocated": 6186270720,
+          "peak_reserved": 6603931648,
+          "loss": 0.18970391154289246
+        }
+      ],
+      "median_ms": 750.4109004512429,
+      "peak_allocated": 6229354496,
+      "peak_reserved": 6603931648
+    },
+    "gather512b2": {
+      "size": 512,
+      "batch": 2,
+      "field": [
+        576,
+        512
+      ],
+      "reference": "working-tree",
+      "tile_override": null,
+      "telemetry": false,
+      "precision": "FP32 TF32 off",
+      "seed": 20261017,
+      "gpu": "NVIDIA GeForce RTX 3080",
+      "torch": "2.6.0+cu124",
+      "samples": [
+        {
+          "ms": 1397.4614003673196,
+          "peak_allocated": 7453863424,
+          "peak_reserved": 7883194368,
+          "loss": 0.2809165418148041
+        },
+        {
+          "ms": 1095.4168997704983,
+          "peak_allocated": 7452608512,
+          "peak_reserved": 7883194368,
+          "loss": 0.332260400056839
+        },
+        {
+          "ms": 1044.2364001646638,
+          "peak_allocated": 7453025280,
+          "peak_reserved": 7883194368,
+          "loss": 0.30694934725761414
+        },
+        {
+          "ms": 1152.037499472499,
+          "peak_allocated": 7452264448,
+          "peak_reserved": 7883194368,
+          "loss": 0.22609122097492218
+        },
+        {
+          "ms": 1026.6778003424406,
+          "peak_allocated": 7460547584,
+          "peak_reserved": 7883194368,
+          "loss": 0.2094728648662567
+        }
+      ],
+      "median_ms": 1095.4168997704983,
+      "peak_allocated": 7460547584,
+      "peak_reserved": 7883194368
+    },
+    "teacher_capture": {
+      "all": {
+        "captures": 79,
+        "peak_allocated": 434307072
+      },
+      "needed": {
+        "captures": 12,
+        "peak_allocated": 404967424
+      },
+      "bit_exact": true
+    },
+    "pipeline": {
+      "pipeline_optimized262144": {
+        "reference": "working-tree",
+        "config": "run_v45_cfg.json",
+        "batch_rows": 262144,
+        "overrides": {
+          "steps": 4,
+          "local_teacher": true,
+          "comet_disabled": true,
+          "student_compile": false,
+          "log_every": 2,
+          "vis_every": 0,
+          "ckpt_every": 0
+        },
+        "gpu": "NVIDIA GeForce RTX 3080",
+        "success": true,
+        "total_seconds": 41.790406400337815,
+        "peak_allocated": 5953527808,
+        "peak_reserved": 7082082304
+      },
+      "pipeline_optimized307200": {
+        "reference": "working-tree",
+        "config": "run_v45_cfg.json",
+        "batch_rows": 307200,
+        "overrides": {
+          "steps": 4,
+          "local_teacher": true,
+          "comet_disabled": true,
+          "teacher_batch_rows": 294912,
+          "teacher_overlap": true,
+          "pair_fraction": null,
+          "student_compile": false,
+          "log_every": 2,
+          "vis_every": 0,
+          "ckpt_every": 0
+        },
+        "gpu": "NVIDIA GeForce RTX 3080",
+        "success": true,
+        "total_seconds": 40.97487420029938,
+        "peak_allocated": 6572467200,
+        "peak_reserved": 7616856064
+      },
+      "pipeline_optimized409600_final": {
+        "reference": "working-tree",
+        "config": "run_v45_cfg.json",
+        "batch_rows": 409600,
+        "overrides": {
+          "steps": 4,
+          "local_teacher": true,
+          "comet_disabled": true,
+          "teacher_batch_rows": 294912,
+          "teacher_overlap": true,
+          "pair_fraction": null,
+          "student_compile": false,
+          "log_every": 2,
+          "vis_every": 0,
+          "ckpt_every": 0
+        },
+        "gpu": "NVIDIA GeForce RTX 3080",
+        "success": true,
+        "total_seconds": 72.65802719909698,
+        "peak_allocated": 7612551680,
+        "peak_reserved": 8613003264
+      },
+      "pipeline_resume": {
+        "reference": "working-tree",
+        "config": "run_v45_cfg.json",
+        "batch_rows": 262144,
+        "overrides": {
+          "steps": 5,
+          "local_teacher": true,
+          "comet_disabled": true,
+          "teacher_batch_rows": 294912,
+          "teacher_overlap": true,
+          "pair_fraction": null,
+          "student_compile": false,
+          "log_every": 2,
+          "vis_every": 0,
+          "ckpt_every": 0
+        },
+        "gpu": "NVIDIA GeForce RTX 3080",
+        "success": true,
+        "total_seconds": 27.85864009987563,
+        "peak_allocated": 5612958720,
+        "peak_reserved": 6612320256
+      },
+      "pipeline_resume_rebudget": {
+        "reference": "working-tree",
+        "config": "run_v45_cfg.json",
+        "batch_rows": 294912,
+        "overrides": {
+          "steps": 6,
+          "local_teacher": true,
+          "comet_disabled": true,
+          "teacher_batch_rows": 294912,
+          "teacher_overlap": true,
+          "pair_fraction": null,
+          "student_compile": false,
+          "log_every": 2,
+          "vis_every": 0,
+          "ckpt_every": 0
+        },
+        "gpu": "NVIDIA GeForce RTX 3080",
+        "success": true,
+        "total_seconds": 28.948225599713624,
+        "peak_allocated": 5991067136,
+        "peak_reserved": 7694450688
+      }
+    }
+  }
+}
