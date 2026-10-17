@@ -65,16 +65,23 @@ DEFAULTS = {
     'lr_decay': 0.25,            # 平段后余弦降到 lr_floor 的窗口(占总步数)
     'lr_floor': 1e-5,            # 尾段常数下限(降到这里就不降了,不归零)
     'loss_out': 1.0, 'loss_detail': 0.5, 'loss_feature': 0.5, 'loss_temporal': 1.0,
-    'loss_logit': 1.0,           # blend logit 对齐权重(幅度阀专项;原 0.5 内联)
-    'action_floor': 0.1,         # 教师改动加权:零改动处权重下限(低水平修改压到地板,不学)
-    'action_knee': 0.02,         # 权重半衰点(教师 |合成−输入| 幅度 ≈ 5/255;改动越大权重越满)
-    'loss_texture': 0.0,         # 高频专项权重(2026-10-14 v4.1):hf(out−proxy) 带单独监督,救滑区造纹理
-    'texture_floor': 0.25,       # 高频专项:教师高频改动零处权重下限
+    'loss_logit': 0.3,           # blend logit 对齐权重。2026-10-18:实测 1.0 时它占 loss/out
+                                 # 的 ~80%(无界量 vs rgb/4 的 1e-2 量级),把输出损失整体挤走了;
+                                 # 降到 0.3 仍保留"幅度总阀"作用,但让图像项拿回主导权。
+    'action_floor': 0.25,        # 教师改动加权:零改动处权重下限(低水平修改压到地板,不学)
+    'action_knee': 0.006,        # 权重半衰点。2026-10-18:原 0.02(≈5/255)是给"光线主导 6-13/255
+                                 # 改动"定的口径,而皮肤加纹理是 1-3/255 —— 在该口径下只有 w≈0.22,
+                                 # 梯度被结构性饿死。挪到 0.006(≈1.5/255),2/255 的改动 w≈0.67。
+    'loss_texture': 3.0,         # 高频专项权重(2026-10-14 v4.1):hf(out−proxy) 带单独监督,救滑区造纹理
+    'texture_floor': 0.4,        # 高频专项:教师高频改动零处权重下限
     'texture_knee': 0.005,       # 高频专项:半衰点(≈1.3/255;滑区造纹理 ~2/255 落近满权区)
     'tex_boost': 0.0,            # 滑区加成(2026-10-14 v4.1b):输入平滑像素的高频权重倍增上限
     'tex_sigma': 0.008,          # 滑区加成宽度(|hf(输入)| 尺度 ≈2/255;平滑度高斯窗)
-    'loss_texstat': 0.0,         # 纹理能量统计项(2026-10-15 v4.2):局部 |hf| 幅度匹配教师
-    'texstat_boost': 3.0,        # 统计项滑区加成倍数(造纹理分支的主战场)
+    'loss_texstat': 1.0,         # 纹理能量统计项(2026-10-15 v4.2)。2026-10-18:3.0 时平滑区
+                                 # 有效权重 ≈11.5 vs 形状项 ≈1.2(10:1),目标退化成"造任意能量对的纹理"
+                                 # —— 实测幅度比 0.91 但 corr 仅 0.44 且 10K 步不动。压到 1.0。
+    'texstat_boost': 0.0,        # 统计项滑区加成倍数。2026-10-18 关:它与上面的形状项争夺同一批
+                                 # 平滑区像素,而"抄教师的形状"才是有信息量的目标。
     'ema_every': 1,              # EMA 更新间隔步数(decay 取 ^ema_every,期望等效;省每步发射)
     'pair_fraction': 0.5,        # 时序对采样比例(历史腿:上帧教师输出 -> truncate_half -> 重投影)
     'crop_prob': 0.5,            # 随机原生裁剪(尺度抖动 1-2x);其余整图 resize
@@ -84,6 +91,9 @@ DEFAULTS = {
     'student_precision': 'bf16', 'router_jitter': 0.1, 'student_compile': False,
     'optimizer_fused': None,     # 新 FP32 CUDA 学生默认 fused AdamW；旧结构保持既有优化器
     'moe_z_formula': 'legacy-logits-l2-v1', 'moe_bias_rate': 1e-3,
+    'moe_bias_span_cap': 2.0,    # bias span 上限(0/None = 不限)。2026-10-18:实测最坏层
+                                 # span 4.66 而 top1-top2 margin 仅 0.10,路由完全由均衡项
+                                 # 决定且仍不均衡。2.0 ≈ 仍允许小幅压过内容,但不许失控。
     'ema_bias_policy': 'legacy-average-float-buffers', 'comet_disabled': False,
     'log_every': 100, 'vis_every': 2000, 'ckpt_every': 5000,
     'seed': 20261007,
@@ -369,7 +379,10 @@ def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
 
     out = wl1(s_rgb, t_rgb) + logit_w * pm(
         F.smooth_l1_loss(s_head[..., 3], t_head[..., 3], reduction='none') * w[..., 0])
+    parts = {'rgb': out, 'logit': logit_w * pm(
+        F.smooth_l1_loss(s_head[..., 3], t_head[..., 3], reduction='none') * w[..., 0])}
     out = out + wl1(s_neural, t_neural)
+    parts['neural'] = out - parts['rgb'] - parts['logit']
     if repro is not None:
         ts = torch.as_tensor(t_scale, dtype=s_head.dtype, device=s_head.device)
         ts = ts.view(-1, 1, 1) if ts.ndim else ts
@@ -412,16 +425,25 @@ def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
                 wstat = 1.0 + texstat_boost * torch.exp(-(mag0 / tex_sigma) ** 2)
         stat_v = pm((amp_s - amp_t).abs() * wstat)
         out = out + texstat_w * stat_v
-    return out, s_neural, t_neural, tex_v, stat_v
+    return out, s_neural, t_neural, tex_v, stat_v, parts
 
 
 class FeatureAligner(nn.Module):
-    """形状不匹配的捕获点(d4/ViT)过 1x1 投影:teacher 维 -> student 维,随训练走(5.5)。"""
+    """每个捕获点过 1x1 投影:teacher 维 -> student 维,随训练走(5.5)。
+
+    形状不匹配的点(d4/ViT)从随机初始化起步;同维点(s==t)用恒等初始化,
+    否则续训加载旧 checkpoint 时会把已经学好的对齐关系推回随机基。
+    """
 
     def __init__(self, pairs):
         super().__init__()
-        self.proj = nn.ModuleDict({name: nn.Linear(t_dim, s_dim, bias=False)
-                                   for name, (s_dim, t_dim) in pairs.items()})
+        self.proj = nn.ModuleDict()
+        for name, (s_dim, t_dim) in pairs.items():
+            linear = nn.Linear(t_dim, s_dim, bias=False)
+            if s_dim == t_dim:
+                with torch.no_grad():
+                    linear.weight.copy_(torch.eye(s_dim))
+            self.proj[name] = linear
 
     def forward(self, name, teacher_act):
         key = name.replace('-', '_')
@@ -481,20 +503,69 @@ def lr_at(step, cfg):
 
 def moe_route_metrics(model):
     """路由健康度(逐块聚合):util_worst = 最偏块的最大专家占比(1.0=整块塌缩)、
-    util_max = 各块最大占比均值、dead_frac = 死专家(<1% 利用)占比、entropy = 平均
-    归一化利用熵(1=均匀)。取的是当前 moe_stats(主前向、时序二次前向之前)。"""
+    util_max = 各块最大占比均值、dead_frac = 一行都没拿到的专家占比、entropy = 平均
+    归一化利用熵(1=均匀)。取的是当前 moe_stats(主前向、时序二次前向之前)。
+
+    2026-10-18:dead_frac 的 <1% 门槛在单样本 chunk 上会把大量专家误判成死
+    (一个 chunk 只有 1-3 个样本,16 个专家自然有若干落在 1% 以下)。实测
+    该指标报 0.37,而控制器的 active_optimizer_steps 显示每个专家在 ~99% 的
+    步里都有行。改成按**整个 log 窗口**的行数累计后再判死,口径与路由日志一致。
+    """
     stats = [s for m in model.modules() if hasattr(m, 'moe_stats') for s in m.moe_stats]
     if not stats:
         return None
     umax, dead, ent = [], [], []
     for assign, probs, _logits in stats:
         e_count = probs.shape[-1]
-        f = torch.bincount(assign, minlength=e_count).float() / assign.numel()
+        counts = torch.bincount(assign, minlength=e_count).float()
+        f = counts / assign.numel()
         umax.append(float(f.max()))
-        dead.append(float((f < 0.01).float().mean()))
+        # 单位是"行",不是"占比":chunk 只有 1-3 个样本时,<1% 门槛会把
+        # 拿了少量行的专家也算死。这里只统计整个 chunk 一行都没有的专家。
+        dead.append(float((counts <= 0).float().mean()))
         ent.append(float(-(f * (f + 1e-9).log()).sum() / math.log(e_count)))
     return {'util_max': sum(umax) / len(umax), 'util_worst': max(umax),
             'dead_frac': sum(dead) / len(dead), 'entropy': sum(ent) / len(ent)}
+
+
+def restore_optimizer(optim, saved, model, aligner, old_aligner_keys):
+    """按**参数名字**恢复 AdamW 状态,允许参数集合变化(2026-10-18)。
+
+    加了同维对齐投影后 aligner 参数变多,`load_state_dict` 会因 param_group
+    尺寸不匹配直接抛错。不能按下标恢复 —— 新投影插在 aligner 序列的头部和
+    尾部(s_enc_full / s_enc_d0 在前,s_dec_d0 在后),按下标对齐会把旧动量
+    错配到别的投影上。
+
+    旧参数序列 = 旧模型的 named_parameters() 顺序 + 旧 aligner 的 key 顺序。
+    模型结构本次未变,所以按当前 model 的 named_parameters() 顺序重建即为旧顺序;
+    旧 aligner 只有异维投影,其 key 列表由旧 checkpoint 的 aligner state_dict 给出。
+    """
+    groups = saved.get('param_groups', [])
+    if len(groups) != len(optim.param_groups):
+        raise ValueError('optimizer group count changed; refusing to guess')
+    saved_ids = [pid for group in groups for pid in group.get('params', [])]
+    old_names = [n for n, _ in model.named_parameters()] + ['aligner.' + k for k in old_aligner_keys]
+    current = {n: p for n, p in model.named_parameters()}
+    current.update({'aligner.' + n: p for n, p in aligner.named_parameters()})
+    for group, saved_group in zip(optim.param_groups, groups):
+        for key, value in saved_group.items():
+            if key != 'params':
+                group[key] = value
+    restored = 0
+    for index, name in enumerate(old_names):
+        parameter = current.get(name)
+        state = saved['state'].get(saved_ids[index]) if index < len(saved_ids) else None
+        if parameter is None or state is None:
+            continue
+        if any(torch.is_tensor(v) and v.ndim and tuple(v.shape) != tuple(parameter.shape)
+               for v in state.values()):
+            continue
+        optim.state[parameter] = {k: (v.detach().to(parameter.device) if torch.is_tensor(v) else v)
+                                  for k, v in state.items()}
+        restored += 1
+    fresh = sum(len(g['params']) for g in optim.param_groups) - restored
+    print(f'optimizer: 恢复 {restored} 组状态, {fresh} 组为新参数(无历史动量)')
+    return optim
 
 
 def psnr(a, b):
@@ -616,7 +687,8 @@ def main():
 
     model = StudentNetwork(shape, g).to(device)
     model.capture_enabled = True
-    controller = BiasController(model, cfg['moe_bias_rate']) if shared_routed else None
+    controller = (BiasController(model, cfg['moe_bias_rate'], span_cap=cfg['moe_bias_span_cap'])
+                  if shared_routed else None)
     if controller:
         for module in controller.modules.values():
             module.training_metrics_enabled = True
@@ -629,8 +701,15 @@ def main():
         torch._dynamo.config.cache_size_limit = 1024
         student_fwd = torch.compile(model, dynamic=True)
 
-    # 形状不匹配的特征对(d4/ViT) -> 1x1 投影表。s 维从形状读 —— 曾经硬编码 v0,
+    # 每个捕获点 -> 1x1 投影表。s 维从形状读 —— 曾经硬编码 v0,
     # 非 v0 形状(如 slim 系列 d3=128)会漏建投影,教师维度原样穿透直接崩。
+    #
+    # 2026-10-18 修正:原先只给 s_dim != t_dim 的点建投影,同维点
+    # (s-enc-full / s-enc-d0 / s-dec-d0 都是 32==32)直接逐坐标比余弦 ——
+    # 等于要求两个不同网络的特征基向量对齐,没有可学自由度,残差学不掉。
+    # 实测:9 个有投影的点全降到 0.011-0.064,而这 3 个同维点里
+    # s-dec-d0 卡在 9.24(= 特征损失 88%、真实目标 51%)、s-enc-d0 卡 1.05,
+    # 20K 步只从 23.8 挪到 9.24。同维也需要一个可学的基变换(旋转/缩放)。
     lv = shape['levels']
     s_dims = {'s-enc-full': lv[0]['channels'], 's-enc-d0': lv[1]['channels'],
               's-enc-d1': lv[2]['channels'], 's-enc-d2': lv[3]['channels'],
@@ -647,8 +726,8 @@ def main():
     for s_name in student_alignment():
         if s_name == 's-head':
             continue
-        if s_dims[s_name] != t_dims[s_name]:
-            align_pairs[s_name.replace('-', '_')] = (s_dims[s_name], t_dims[s_name])
+        # 同维也建投影:恒等初始化,再随训练学基变换。
+        align_pairs[s_name.replace('-', '_')] = (s_dims[s_name], t_dims[s_name])
     aligner = FeatureAligner(align_pairs).to(device)
 
     params = list(model.parameters()) + list(aligner.parameters())
@@ -670,8 +749,12 @@ def main():
                     raise ValueError('shared/routed replay provenance changed: ' + key)
             validate_resume_sampling(ckpt, cfg)
         model.load_state_dict(ckpt['model'])
-        aligner.load_state_dict(ckpt['aligner'])
-        optim.load_state_dict(ckpt['optim'])
+        # strict=False:同维对齐投影是 2026-10-18 新增的,旧 checkpoint 里没有这几个
+        # key —— 保持恒等初始化(等价于旧行为)继续训,其余投影照常严格恢复。
+        missing, unexpected = aligner.load_state_dict(ckpt['aligner'], strict=False)
+        if missing or unexpected:
+            print(f"aligner: {len(missing)} 个新增投影用恒等初始化, {len(unexpected)} 个多余 key 忽略")
+        restore_optimizer(optim, ckpt['optim'], model, aligner, list(ckpt['aligner']))
         for group in optim.param_groups:
             group.update(fused=bool(fused_adam), foreach=False if fused_adam else None)
         for state in optim.state.values():
@@ -698,7 +781,7 @@ def main():
     writer = csv.writer(log)
     if new_log:
         writer.writerow(['step', 'lr', 'loss', 'out', 'detail', 'feature', 'temporal',
-                         'psnr_teacher', 'ms'])
+                         'psnr_teacher', 'ms', 'tex', 'stat', 'out_logit'])
 
     print(f"train: {len(source.files)} files, {sizes}², {cfg['batch']} batch, "
           f"{cfg['steps']} steps, device {device}")
@@ -836,7 +919,8 @@ def main():
             group['lr'] = lr
         t0 = time.perf_counter()
         totals = {'out': 0.0, 'detail': 0.0, 'feature': 0.0, 'temporal': 0.0,
-                  'texture': 0.0, 'texstat': 0.0}
+                  'texture': 0.0, 'texstat': 0.0,
+                  'out_rgb': 0.0, 'out_logit': 0.0, 'out_neural': 0.0}
         moe_tot = {}
         feat_detail_acc = {}
         psnrs = []
@@ -928,7 +1012,7 @@ def main():
                 t_head_t = torch.from_numpy(np.stack([p['t_head'] for p in chunk])).to(device)
                 repro_t = (torch.from_numpy(np.stack([p['repro'] for p in chunk])).to(device)
                            if kind == 'pair' else None)
-                out_v, s_neural, t_neural, tex_v, stat_v = output_losses(
+                out_v, s_neural, t_neural, tex_v, stat_v, out_parts = output_losses(
                     s_head_all, t_head_t, proxy_t, repro=repro_t,
                     s_scale=model.blend_scale,
                     t_scale=torch.tensor([p['t_scale'] for p in chunk], device=device),
@@ -959,10 +1043,13 @@ def main():
                     / cfg['batch'])
                 if log_step:
                     fm = finite.to(out_v.dtype)
-                    totals['out'] += float((out_v * fm).sum())
-                    totals['detail'] += float((detail_v * fm).sum())
-                    totals['texture'] += float((tex_v * fm).sum())
-                    totals['texstat'] += float((stat_v * fm).sum())
+                    with torch.no_grad():
+                        totals['out'] += float((out_v.detach() * fm).sum())
+                        totals['detail'] += float((detail_v.detach() * fm).sum())
+                        totals['texture'] += float((tex_v.detach() * fm).sum())
+                        totals['texstat'] += float((stat_v.detach() * fm).sum())
+                        for key in ('rgb', 'logit', 'neural'):
+                            totals['out_' + key] += float((out_parts[key].detach() * fm).sum())
                     if temporal_v is not None:
                         totals['temporal'] += float((temporal_v * fm).sum())
                     mse = ((s_neural.detach() - t_neural.detach()) ** 2).reshape(cnb, -1).mean(1)
@@ -970,7 +1057,7 @@ def main():
                     psnrs.extend(psnr_v[finite].tolist())
                 chunk_loss = chunk_loss + (cfg['loss_feature'] * feat + chunk_moe) * (
                     cnb / cfg['batch'])
-                if torch.isfinite(chunk_loss):
+                if isinstance(chunk_loss, torch.Tensor) and torch.isfinite(chunk_loss):
                     if controller and (cfg['moe_aux'] != 0 or cfg['moe_z'] != 0):
                         controller.observe_regularizer(chunk_moe * (cnb / cfg['batch']))
                     chunk_loss.backward()
@@ -1005,12 +1092,23 @@ def main():
         # comet 上报按 log_every 节流(2026-10-14 提速牌 2:每步 HTTP 上报是墙钟尾巴)。
         if experiment is not None and (step % cfg['log_every'] == 0 or step == cfg['steps'] - 1):
             n = max(1, len(psnrs))
+            # 2026-10-18:loss/total 改为**真实被优化的目标**(含各项权重),
+            # 并补上 texture/texstat/时序;`loss/out` 另拆出图像/纹理分量,
+            # 免得"out 掉了 80% 是 logit lane"这种失衡再从遥测里看不见。
             metrics = {
+                'loss/objective': (cfg['loss_out'] * totals['out'] + cfg['loss_detail'] * totals['detail']
+                                   + cfg['loss_feature'] * totals['feature']
+                                   + cfg['loss_temporal'] * totals['temporal']) / n,
                 'loss/total': (totals['out'] + totals['detail'] + totals['feature']) / n,
                 'loss/out': totals['out'] / n,
                 'loss/detail': totals['detail'] / n,
                 'loss/feature': totals['feature'] / n,
                 'loss/texture': totals['texture'] / n,
+                'loss/texstat': totals['texstat'] / n,
+                'loss/temporal': totals['temporal'] / n,
+                'loss/out_rgb': totals['out_rgb'] / n,
+                'loss/out_logit': totals['out_logit'] / n,
+                'loss/out_neural': totals['out_neural'] / n,
                 'psnr/teacher': sum(psnrs) / n,
                 'train/lr': lr,
                 'train/ms': ms,
@@ -1036,7 +1134,9 @@ def main():
                    f"{(totals['out'] + totals['detail'] + totals['feature'] + totals['temporal']) / n:.5f}",
                    f"{totals['out'] / n:.5f}", f"{totals['detail'] / n:.5f}",
                    f"{totals['feature'] / n:.5f}", f"{totals['temporal'] / n:.5f}",
-                   f'{sum(psnrs) / pn:.2f}', f'{ms:.0f}']
+                   f'{sum(psnrs) / pn:.2f}', f'{ms:.0f}',
+                   f"{totals['texture'] / n:.5f}", f"{totals['texstat'] / n:.5f}",
+                   f"{totals['out_logit'] / n:.5f}"]
             writer.writerow(row)
             log.flush()
             print(f"step {step:6d}  lr {lr:.2e}  out {totals['out'] / n:.5f}  "
@@ -1048,7 +1148,7 @@ def main():
                      if aux_val > 0 else "")
                   + f"  {ms:.0f} ms"
                   + f"  wait {t_wait * 1000:.0f} comp {t_comp * 1000:.0f}"
-                    f" opt {t_opt * 1000:.0f}")
+                    f" opt {t_opt * 1000:.0f}", flush=True)
 
         if cfg['vis_every'] and step % cfg['vis_every'] == 0 and step > 0:
             # 可视化只许看不许杀:2026-10-12 vis 块 NameError 杀过一次 28h 跑,套保险。

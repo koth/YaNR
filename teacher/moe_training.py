@@ -60,11 +60,16 @@ def validate_resume_sampling(checkpoint, cfg):
 class BiasController:
     VERSION = 'row-load-step-bias-v1'
 
-    def __init__(self, model, rate=1e-3):
+    def __init__(self, model, rate=1e-3, span_cap=None):
         self.modules = {n: m for n, m in model.named_modules() if isinstance(m, RoutedModule)}
         if not self.modules:
             raise ValueError('bias controller requires shared/routed modules')
         self.rate = float(rate)
+        # 2026-10-18:纯符号积分器在内容偏好强的层会 windup —— 实测最坏层 bias span
+        # 涨到 4.66,而 top1-top2 的 logit margin 只有 0.10(45x)。那些层的路由已经
+        # 完全由 bias 决定(等于固定分配),负载却仍有 66% 压在一个专家上:控制器
+        # 打不赢又停不下来。给 span 一个上限,超出后整体按比例缩放,保持相对次序。
+        self.span_cap = None if span_cap is None else float(span_cap)
         self.pending = {n: torch.zeros(16, dtype=torch.int64, device=m.router_bias.device) for n, m in self.modules.items()}
         self.last_active_step = {n: torch.full((16,), -1, dtype=torch.int64, device=m.router_bias.device) for n, m in self.modules.items()}
         self.updated_steps = {n: torch.zeros(16, dtype=torch.int64, device=m.router_bias.device) for n, m in self.modules.items()}
@@ -136,6 +141,11 @@ class BiasController:
             before = module.router_bias.clone()
             module.router_bias.add_(self.rate * (load.sum().float() / 16 - load.float()).sign())
             module.router_bias.sub_(module.router_bias.mean())
+            if self.span_cap is not None:
+                bias = module.router_bias
+                span = bias.max() - bias.min()
+                if float(span) > self.span_cap:
+                    bias.mul_(self.span_cap / float(span))
             self.last_load[name] = load.clone()
             active = load > 0
             self.last_active_step[name][active] = step

@@ -1,0 +1,98 @@
+{
+ "action_floor": 0.25,
+ "action_knee": 0.006,
+ "automask_prob": 1.0,
+ "batch": 8,
+ "batch_rows": 1179648,
+ "ckpt_every": 2000,
+ "clip": 1.0,
+ "comet_disabled": false,
+ "comet_key": null,
+ "comet_project": "dlss-student",
+ "comet_workspace": null,
+ "crop_prob": 0.5,
+ "degrade_prob": 0.5,
+ "ema": 0.999,
+ "ema_bias_policy": "copy-after-optimizer-controller-v1",
+ "ema_every": 4,
+ "log_every": 100,
+ "loss_detail": 0.5,
+ "loss_feature": 0.5,
+ "loss_logit": 0.3,
+ "loss_out": 1.0,
+ "loss_temporal": 1.0,
+ "loss_texstat": 1.0,
+ "loss_texture": 3.0,
+ "lr": 0.0002,
+ "lr_decay": 0.25,
+ "lr_floor": 1e-05,
+ "lr_hold": 0.5,
+ "moe_aux": 0.0,
+ "moe_bias_rate": 0.001,
+ "moe_bias_span_cap": 2.0,
+ "moe_z": 0.0,
+ "moe_z_formula": "logsumexp-square-v1",
+ "optimizer_fused": null,
+ "overfit": 0,
+ "pair_fraction": 0.35,
+ "router_jitter": 0.0,
+ "seed": 20261007,
+ "shape": "shapes/student_shared_moe_v1.json",
+ "size": [
+  320,
+  512
+ ],
+ "size_weights": [
+  0.7,
+  0.3
+ ],
+ "skin_range": [
+  -1,
+  -1
+ ],
+ "source": {
+  "shape_sha256": "e0e8d58213937c542acc04d0883a63a77a332d22659bd96f8be069d42e70b512",
+  "student_commit": "unavailable",
+  "student_source_sha256": {
+   "moe_training.py": "6a0327c52647e0ada029436d82842670f30740b9e2eabd715ff7c534553eb686",
+   "nr_shared_moe.py": "69457c6d059aabc5af887ba4ee09ba933e7dbb3d344baf550ec54191f5b2f548",
+   "nr_student.py": "d5b76d6203b892dcd01b357d1d4098c64edbf39d7975910783b6b7cdb0cb76bb",
+   "train_distill.py": "8a59b9e25b7b3a544df494a52cb66bb72e04d66a8f8f889dbd9db5cc894bd6a9"
+  },
+  "teacher_commit": "unavailable",
+  "teacher_manifest_sha256": "1f0d82c4323c081ec4d3510c51aa3cb49aa4c7821c6141e1727b3a7274236c20",
+  "teacher_source_sha256": {
+   "nr_kernels.cu": "4952bfe91587b3732742134bd2bff3600b401a56fe18a750cae5eecd9ae64cf7",
+   "nr_model.py": "dbafbd42bb6ad3db6605b27fda5e43130e8dd793d246b92f42a1a38cf7ad3a1c",
+   "nr_network.py": "bf98fb08c22e303415d4b46b92f2b95543f95649f144ae1009a289bcd83c1964",
+   "nr_torch.py": "9678ce92746d368323380004702e6ffbd6acb3a7acf04d3512718f65216d5fb5"
+  }
+ },
+ "steps": 60000,
+ "structure_range": [
+  1,
+  1
+ ],
+ "student_compile": false,
+ "student_precision": "fp32",
+ "style_range": [
+  2,
+  2
+ ],
+ "teacher_batch_rows": 589824,
+ "teacher_overlap": true,
+ "teacher_weights": "/home/koth/klss/models/nr",
+ "teacher_workers": 2,
+ "tex_boost": 0.0,
+ "tex_sigma": 0.008,
+ "texstat_boost": 0.0,
+ "texture_floor": 0.4,
+ "texture_knee": 0.005,
+ "tone_range": [
+  1,
+  1
+ ],
+ "vis_every": 2000,
+ "warmup": 4000,
+ "wd": 0.01
+}
