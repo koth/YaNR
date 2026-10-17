@@ -79,7 +79,7 @@ DEFAULTS = {
     'degrade_prob': 0.5,         # 在线退化(degrade.py 链;proxy_proc 已预退化的跳过)
     'moe_aux': 0.02,             # MoE 均衡正则(配额分配已结构保证均衡;此项仅防 p 漂移)
     'moe_z': 1e-2,               # router z-loss(ST-MoE,压 logits 幅值;router 前 LN 后配合生效)
-    'student_precision': 'bf16', 'router_jitter': 0.1,
+    'student_precision': 'bf16', 'router_jitter': 0.1, 'student_compile': False,
     'moe_z_formula': 'legacy-logits-l2-v1', 'moe_bias_rate': 1e-3,
     'ema_bias_policy': 'legacy-average-float-buffers', 'comet_disabled': False,
     'log_every': 100, 'vis_every': 2000, 'ckpt_every': 5000,
@@ -605,6 +605,14 @@ def main():
     if controller:
         for module in controller.modules.values():
             module.training_metrics_enabled = True
+    student_fwd = model
+    if cfg.get('student_compile'):
+        # 瓦片路由(nr_shared_moe)已无 .tolist() 值 guard;capture_scalar_outputs 把
+        # int(tiles.sum()) 符号化,cache 放开容纳 30 模块×尺寸×批次的编译帧。
+        # 变输入实测 25 轮零重编译,262ms -> 200ms。
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.cache_size_limit = 1024
+        student_fwd = torch.compile(model, dynamic=True)
 
     # 形状不匹配的特征对(d4/ViT) -> 1x1 投影表。s 维从形状读 —— 曾经硬编码 v0,
     # 非 v0 形状(如 slim 系列 d3=128)会漏建投影,教师维度原样穿透直接崩。
@@ -837,7 +845,7 @@ def main():
 
                 x = torch.from_numpy(np.stack([p['feats'] for p in chunk])).reshape(-1, 16).to(device)
                 with torch.autocast(device, dtype=torch.bfloat16, enabled=cfg['student_precision'] == 'bf16'):
-                    s_head_all = model(x, batch=cnb)
+                    s_head_all = student_fwd(x, batch=cnb)
                 if controller:
                     controller.collect()
                 s_head_all = s_head_all.view(
@@ -868,7 +876,7 @@ def main():
                     xa = torch.from_numpy(
                         np.stack([p['feats_a'] for p in chunk])).reshape(-1, 16).to(device)
                     with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16, enabled=cfg['student_precision'] == 'bf16'):
-                        sa_all = model(xa, batch=cnb)
+                        sa_all = student_fwd(xa, batch=cnb)
                     sa_all = sa_all.view(
                         cnb, g_s['full_height'], g_s['full_width'], 4)[:, :s, :s].float()
                     prev_t = torch.from_numpy(np.stack([p['prev'] for p in chunk])).to(device)

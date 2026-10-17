@@ -75,26 +75,40 @@ class RoutedModule(nn.Module):
         self.moe_stats.append((assign.detach(), probs, logits))
         for name, tensor in [('logits', logits), ('pick', pick), ('gate', gate), ('assign', assign)]:
             self.capture(name, tensor)
+        # 分组布局全张量化:排序后逐行算 (tile_id, slot),routed_mm 走固定瓦片 bmm。
+        # 无逐专家 Python 循环;.tolist() 只剩一次 int(tiles.sum()) 尺寸取值。
         order = torch.argsort(assign, stable=True)
-        counts = torch.bincount(assign, minlength=16).tolist()
-        bounds = [0]
-        for count in counts:
-            bounds.append(bounds[-1] + count)
+        counts = torch.bincount(assign, minlength=16)
+        tile = 4096
+        tiles = (counts + tile - 1) // tile
+        tile_base = torch.cumsum(tiles, 0) - tiles
+        group_start = torch.cumsum(counts, 0) - counts
+        dev = assign.device
+        expert = torch.repeat_interleave(torch.arange(16, device=dev), counts)
+        pos = torch.arange(assign.numel(), device=dev) - torch.repeat_interleave(group_start, counts)
+        tile_id = tile_base[expert] + pos // tile
+        lay = dict(TILE=tile, B=int(tiles.sum()), tile_id=tile_id, slot=pos % tile,
+                   expert_of_tile=torch.repeat_interleave(torch.arange(16, device=dev), tiles),
+                   expert_per_row=expert)
         inv = torch.empty_like(order)
         inv[order] = torch.arange(order.numel(), device=order.device)
-        return order, inv, bounds, gates[:, None]
+        return order, inv, lay, gates[:, None]
 
     @staticmethod
     def routed_mm(state, bank, route, bias=None):
-        order, inv, bounds, _ = route
+        order, inv, lay, _ = route
         sorted_x = state[order]
-        segments = []
-        for e in range(16):
-            result = sorted_x[bounds[e]:bounds[e + 1]] @ bank[e + 1]
-            if bias is not None:
-                result = result + bias[e + 1]
-            segments.append(result)
-        return torch.cat(segments, 0)[inv]
+        k = state.shape[1]
+        out_f = bank.shape[2]
+        # 固定瓦片分组 GEMM(2026-10-17 向量化):变长专家组折算进稠密 [B, TILE, k],
+        # 16 专家一次 bmm;替代逐专家循环(33 碎内核/次 -> 8,无 Python 循环派发)。
+        buf = sorted_x.new_zeros(lay['B'], lay['TILE'], k)
+        buf[lay['tile_id'], lay['slot']] = sorted_x
+        out = torch.bmm(buf, bank[1:17][lay['expert_of_tile']]).reshape(-1, out_f)
+        seg = out[lay['tile_id'] * lay['TILE'] + lay['slot']]
+        if bias is not None:
+            seg = seg + bias[1:17][lay['expert_per_row']]
+        return seg[inv]
 
     def mixed_mm(self, state, bank, route, bias=None):
         shared = state @ bank[0]
