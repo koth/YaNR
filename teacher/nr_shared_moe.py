@@ -247,7 +247,8 @@ class SharedRoutedLinear(RoutedModule):
 class SharedRoutedBlock(RoutedModule):
     split_token_stats = True
 
-    def __init__(self, channels, hidden, attn=True, phase_index=0, token=False):
+    def __init__(self, channels, hidden, attn=True, phase_index=0, token=False,
+                 window=8, dilation=1):
         super().__init__(channels, token)
         from nr_student import WindowAttention, VitAttention
         from nr_geometry import window_phase
@@ -265,7 +266,8 @@ class SharedRoutedBlock(RoutedModule):
             initialize_bank(self.qkv); initialize_bank(self.proj)
             self.aux_attn = nn.Parameter(torch.ones(channels))
             self.attention = (VitAttention(channels) if token else
-                              WindowAttention(channels, 8, window_phase(phase_index)))
+                              WindowAttention(channels, window, window_phase(phase_index),
+                                              dilation=dilation))
 
     def forward(self, state, width, height, batch=1):
         # For token blocks width=tokens, height=padded, matching existing ViT API.

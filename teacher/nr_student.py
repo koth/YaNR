@@ -98,14 +98,21 @@ def cosine_norm(x):
 
 
 @lru_cache(maxsize=32)
-def _window_indices(width, height, win, shift_x, shift_y, batch, device):
-    """Geometry is static: resolve boolean selections on CPU once, not per GPU forward."""
-    wx, wy = (width + shift_x + win - 1) // win, (height + shift_y + win - 1) // win
-    ox = (torch.arange(wx) * win - shift_x).view(-1, 1).expand(wx, wy).reshape(-1)
-    oy = (torch.arange(wy) * win - shift_y).view(1, -1).expand(wx, wy).reshape(-1)
+def _window_indices(width, height, win, shift_x, shift_y, batch, device, dilation=1):
+    """Geometry is static: resolve boolean selections on CPU once, not per GPU forward.
+
+    2026-10-18 窗口膨胀:dilation=1 与旧实现逐位相同;dilation>1 时窗内第 k 个槽位取
+    x0 + k*dilation,**槽位数仍是 win²**,但覆盖 (win-1)*dilation+1 个像素。槽位数不变
+    意味着 prior 形状不变 -> 零新增参数、旧 checkpoint 可直接加载。
+    """
+    extent = (win - 1) * dilation + 1
+    wx = (width + shift_x + extent - 1) // extent
+    wy = (height + shift_y + extent - 1) // extent
+    ox = (torch.arange(wx) * extent - shift_x).view(-1, 1).expand(wx, wy).reshape(-1)
+    oy = (torch.arange(wy) * extent - shift_y).view(1, -1).expand(wx, wy).reshape(-1)
     slot = torch.arange(win * win)
-    fx = (ox[:, None] + (slot % win)[None, :]).reshape(-1)
-    fy = (oy[:, None] + (slot // win)[None, :]).reshape(-1)
+    fx = (ox[:, None] + ((slot % win) * dilation)[None, :]).reshape(-1)
+    fy = (oy[:, None] + ((slot // win) * dilation)[None, :]).reshape(-1)
     valid = (fx >= 0) & (fx < width) & (fy >= 0) & (fy < height)
     index = fy.clamp(0, height - 1) * width + fx.clamp(0, width - 1)
     if batch > 1:
@@ -123,12 +130,16 @@ class WindowAttention(nn.Module):
     PHASES[i & 3]);前向不传 phase —— 既是语义事实,也让 torch.compile 图稳定。
     """
 
-    def __init__(self, channels, window=WINDOW, shift=(0, 0)):
+    def __init__(self, channels, window=WINDOW, shift=(0, 0), dilation=1):
         super().__init__()
         assert channels % HEAD_DIM == 0
         self.heads = channels // HEAD_DIM
         self.window = window
         self.slots = window * window
+        # 2026-10-18:窗口膨胀。槽位数(prior 形状)不变,只把窗内采样步长放大,
+        # 于是每层用同样的参数覆盖更大范围。dilation=1 时与原行为逐位相同。
+        self.dilation = int(dilation)
+        self.extent = (window - 1) * self.dilation + 1
         self.shift_x, self.shift_y = shift
         self.scale = nn.Parameter(torch.ones(self.heads))
         self.prior = nn.Parameter(torch.zeros(self.heads, self.slots, self.slots))
@@ -142,11 +153,12 @@ class WindowAttention(nn.Module):
         slots = self.slots
         win = self.window
         shift_x, shift_y = self.shift_x, self.shift_y
-        windows_x = (width + shift_x + win - 1) // win
-        windows_y = (height + shift_y + win - 1) // win
+        windows_x = (width + shift_x + self.extent - 1) // self.extent
+        windows_y = (height + shift_y + self.extent - 1) // self.extent
         windows = windows_x * windows_y
 
-        index, valid, valid_index, valid_slots = _window_indices(width, height, win, shift_x, shift_y, batch, qkv.device)
+        index, valid, valid_index, valid_slots = _window_indices(
+            width, height, win, shift_x, shift_y, batch, qkv.device, self.dilation)
         if batch > 1:
             windows = windows * batch
             rows = rows * batch
@@ -601,14 +613,19 @@ class MoEVitBlock(nn.Module):
 
 
 def make_block(level, phase_index):
-    """按形状条目构造块(2.3-2.6);相位索引即教师的每级计数器值。"""
+    """按形状条目构造块(2.3-2.6);相位索引即教师的每级计数器值。
+
+    `window_dilation`(2026-10-18)可逐级设置,默认 1 = 原行为。
+    """
     kind = level['kind']
     ch = level['channels']
     attn = level.get('attn', True)
     window = level.get('window_slots', WINDOW)
+    dilation = int(level.get('window_dilation', 1))
     if kind == 'shared_routed_moe':
         from nr_shared_moe import SharedRoutedBlock
-        return SharedRoutedBlock(ch, level['hidden'], attn=attn, phase_index=phase_index)
+        return SharedRoutedBlock(ch, level['hidden'], attn=attn, phase_index=phase_index,
+                                 window=window, dilation=dilation)
     if kind == 'ffn':
         return FFNBlock(ch, level['hidden'], attn=attn, window=window, phase_index=phase_index)
     if kind == 'expert':
