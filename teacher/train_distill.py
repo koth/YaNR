@@ -377,10 +377,14 @@ def output_losses(s_head, t_head, proxy, repro=None, s_scale=1.0, t_scale=1.0,
         ww = w if wm is None else wm
         return pm((a - b).abs() * ww)
 
-    out = wl1(s_rgb, t_rgb) + logit_w * pm(
+    # 2026-10-18:这里曾把 parts['rgb'] 赋成"rgb+logit"的值,于是 loss/out_rgb 虚高、
+    # loss/out_neural 被相应压低 —— 读遥测时会误以为 rgb 项占了 out 的一半。
+    # 现在三项各自独立计算,out 仍是三者之和,拆分口径与总量一致。
+    rgb_v = wl1(s_rgb, t_rgb)
+    logit_v = logit_w * pm(
         F.smooth_l1_loss(s_head[..., 3], t_head[..., 3], reduction='none') * w[..., 0])
-    parts = {'rgb': out, 'logit': logit_w * pm(
-        F.smooth_l1_loss(s_head[..., 3], t_head[..., 3], reduction='none') * w[..., 0])}
+    out = rgb_v + logit_v
+    parts = {'rgb': rgb_v, 'logit': logit_v}
     out = out + wl1(s_neural, t_neural)
     parts['neural'] = out - parts['rgb'] - parts['logit']
     if repro is not None:
