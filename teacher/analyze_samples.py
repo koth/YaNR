@@ -44,11 +44,16 @@ def noise_var(shape, it, rng):
     return float(band(e, it).var())
 
 
+def psnr(a, b):
+    mse = float(((a - b) ** 2).mean())
+    return 10 * np.log10(1.0 / max(mse, 1e-12))
+
+
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else '/home/koth/klss/teacher/samples'
     rng = np.random.default_rng(7)
-    print(f'{"目录":<6}{"尺寸":>11}{"Dt":>7}{"a":>7}{"corr":>7}{"amp":>7}'
-          f'{"m_dt":>7}{"m_ds":>7}{"sgn":>6}')
+    print(f'{"目录":<6}{"尺寸":>11}{"s-t":>7}{"t-in":>7}{"s-in":>7}'
+          f'{"Dt":>7}{"a":>7}{"corr":>7}{"amp":>7}{"m_dt":>7}{"m_ds":>7}{"sgn":>6}')
     for d in sorted(x for x in glob.glob(os.path.join(root, 't*')) if os.path.isdir(x)):
         src = [f for f in glob.glob(os.path.join(d, '*'))
                if os.path.basename(f) not in ('nr.png', 'teacher.png')]
@@ -58,6 +63,9 @@ def main():
         teacher = load(os.path.join(d, 'teacher.png'))
         student = load(os.path.join(d, 'nr.png'))
         h, w = proxy.shape[:2]
+        # 三个 PSNR 一起给:s-t 是保真度,t-in / s-in 是两者各自改了多少 ——
+        # 只看 s-t 无法判断学生是"改得准"还是"干脆没改"。
+        q_st, q_ti, q_si = psnr(student, teacher), psnr(teacher, proxy), psnr(student, proxy)
         hp = band(proxy, 2)
         tex = np.abs(hp).mean(2) >= np.percentile(np.abs(hp).mean(2), 75)
         dt = band(teacher, 9) - band(proxy, 9)
@@ -74,7 +82,8 @@ def main():
         aa, bb = x * 255, y * 255
         act = np.abs(aa) > 0.5
         sgn = float((np.sign(aa[act]) == np.sign(bb[act])).mean()) if act.any() else float('nan')
-        print(f'{os.path.basename(d):<6}{w}x{h:<7}{x.std() * 255:7.2f}{a:7.2f}{corr:7.2f}'
+        print(f'{os.path.basename(d):<6}{w}x{h:<7}{q_st:7.2f}{q_ti:7.2f}{q_si:7.2f}'
+              f'{x.std() * 255:7.2f}{a:7.2f}{corr:7.2f}'
               f'{amp:7.2f}{aa.mean():+7.2f}{bb.mean():+7.2f}{sgn:6.2f}', flush=True)
 
 
