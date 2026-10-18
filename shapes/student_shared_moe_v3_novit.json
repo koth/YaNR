@@ -1,0 +1,28 @@
+{
+  "name": "student_shared_moe_v3_novit",
+  "comment": "v1 的消融版:vit.blocks=3 -> 0,即完全去掉 66.45M 的 ViT 块,只保留 vit_in/vit_out 的降采样通路(该通路约 2.5M)。其余层级与 v1 完全一致。目的:验证占 83% 参数的 ViT 是否真的在出活 —— hook 消融显示去掉后 8-64px 相关只变 ±0.01。参数总量预计约 15M。",
+  "architecture": "shared-routed-moe-v1",
+  "routing": {
+    "shared_experts": 1,
+    "routed_experts": 16,
+    "top_k": 1,
+    "spatial_granularity": "window8",
+    "vit_granularity": "token",
+    "selection": "fp32-argmax-with-bias-v1",
+    "tie_break": "lowest-index",
+    "gate": "softmax-selected-times-routed-v1",
+    "fusion": "sub-layer-mean-single-attention-v1",
+    "fusion_scale": 0.5,
+    "jitter": 0.0,
+    "transitions": "expertized"
+  },
+  "levels": [
+    {"level": "full", "kind": "shared_routed_moe", "channels": 32, "hidden": 32, "blocks": 2, "attn": false},
+    {"level": "d0", "kind": "shared_routed_moe", "channels": 32, "hidden": 32, "blocks": 4, "attn": true},
+    {"level": "d1", "kind": "shared_routed_moe", "channels": 32, "hidden": 32, "blocks": 4, "attn": true},
+    {"level": "d2", "kind": "shared_routed_moe", "channels": 64, "hidden": 32, "blocks": 2, "attn": true},
+    {"level": "d3", "kind": "shared_routed_moe", "channels": 128, "hidden": 32, "blocks": 2, "attn": true},
+    {"level": "d4", "kind": "shared_routed_moe", "channels": 192, "hidden": 32, "blocks": 2, "attn": true}
+  ],
+  "vit": {"kind": "shared_routed_moe", "channels": 384, "ffn": 928, "blocks": 0, "tokens_level": "d5"}
+}

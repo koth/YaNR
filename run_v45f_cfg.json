@@ -1,0 +1,80 @@
+{
+ "action_floor": 0.25,
+ "action_knee": 0.006,
+ "automask_prob": 1.0,
+ "batch": 8,
+ "batch_rows": 1179648,
+ "ckpt_every": 2000,
+ "clip": 1.0,
+ "comet_disabled": false,
+ "comet_key": null,
+ "comet_project": "dlss-student",
+ "comet_workspace": null,
+ "crop_prob": 0.5,
+ "degrade_prob": 0.5,
+ "ema": 0.999,
+ "ema_bias_policy": "copy-after-optimizer-controller-v1",
+ "ema_every": 4,
+ "log_every": 100,
+ "loss_detail": 0.5,
+ "loss_feature": 0.5,
+ "loss_logit": 0.3,
+ "loss_out": 1.0,
+ "loss_temporal": 1.0,
+ "loss_texstat": 2.5,
+ "loss_texture": 3.0,
+ "lr": 0.0002,
+ "lr_decay": 0.25,
+ "lr_floor": 1e-05,
+ "lr_hold": 0.5,
+ "moe_aux": 0.0,
+ "moe_bias_rate": 0.001,
+ "moe_bias_span_cap": 2.0,
+ "moe_z": 0.0,
+ "moe_z_formula": "logsumexp-square-v1",
+ "optimizer_fused": null,
+ "overfit": 0,
+ "pair_fraction": 0.35,
+ "router_jitter": 0.0,
+ "seed": 20261007,
+ "shape": "shapes/student_shared_moe_v4_novit_wide.json",
+ "size": [
+  320,
+  512
+ ],
+ "size_weights": [
+  0.7,
+  0.3
+ ],
+ "skin_range": [
+  -1,
+  -1
+ ],
+ "steps": 30000,
+ "structure_range": [
+  1,
+  1
+ ],
+ "student_compile": false,
+ "student_precision": "fp32",
+ "style_range": [
+  2,
+  2
+ ],
+ "teacher_batch_rows": 589824,
+ "teacher_overlap": true,
+ "teacher_weights": "/home/koth/klss/models/nr",
+ "teacher_workers": 1,
+ "tex_boost": 0.0,
+ "tex_sigma": 0.008,
+ "texstat_boost": 0.0,
+ "texture_floor": 0.4,
+ "texture_knee": 0.005,
+ "tone_range": [
+  1,
+  1
+ ],
+ "vis_every": 2000,
+ "warmup": 4000,
+ "wd": 0.01
+}

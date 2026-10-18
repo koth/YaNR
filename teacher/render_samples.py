@@ -65,9 +65,11 @@ def main():
     parser.add_argument('--checkpoint', default='/home/koth/keep_tmp/v45d_56k/ckpt.pt')
     parser.add_argument('--name', default='nr.png', help='输出文件名')
     parser.add_argument('--only', nargs='+', help='只跑指定子目录')
+    parser.add_argument('--device', default=None, choices=('cpu', 'cuda'),
+                        help='强制设备;默认 cuda 可用就用 cuda。GPU 被训练占用时用 cpu')
     args = parser.parse_args()
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     dirs = sorted(d for d in glob.glob(os.path.join(args.samples, 't*')) if os.path.isdir(d))
     if args.only:
         dirs = [d for d in dirs if os.path.basename(d) in args.only]

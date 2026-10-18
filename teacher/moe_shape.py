@@ -49,8 +49,12 @@ def validate(shape):
         value = vit.get(key)
         if type(value) is not int or value < 32 or value % 32:
             raise ValueError('ViT channels/ffn must be positive multiples of 32')
-    if type(vit.get('blocks')) is not int or vit['blocks'] < 1:
-        raise ValueError('ViT needs at least one block')
+    # 2026-10-18:允许 blocks=0 —— 即完全去掉 ViT 块,只保留 vit_in/vit_out 的降采样通路。
+    # 动机:实测 v4.5 的 3 个 ViT 块占了 83% 参数(66.45M),但 forward hook 消融显示
+    # 去掉它们后 8-64px 的相关变化在 ±0.01 内(只丢最低频 0.11)。要验证"这些参数是不是
+    # 白放在这里",最直接的做法就是把块数设 0 重训一次,而不是继续在空间部分微调。
+    if type(vit.get('blocks')) is not int or vit['blocks'] < 0:
+        raise ValueError('ViT block count must be a non-negative integer')
     if vit['channels'] > 1024:
         raise ValueError('shared/routed router supports at most 1024 input channels')
     if 'experts' in vit and vit['experts'] != 17:
