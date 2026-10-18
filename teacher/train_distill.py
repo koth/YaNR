@@ -584,6 +584,9 @@ def main():
                         help='image root(s), recursive')
     parser.add_argument('-o', '--out', required=True, help='run directory')
     parser.add_argument('--resume', help='checkpoint .pt')
+    parser.add_argument('--allow-provenance-change', action='store_true',
+                        help='允许 shape_sha256 变化后继续续训(窗口膨胀等零参数结构改动);'
+                             '默认拒绝,教师侧来源变化仍然一律拒绝')
     parser.add_argument('--shape')
     parser.add_argument('--teacher-weights', dest='teacher_weights')
     parser.add_argument('--size', type=str,
@@ -750,6 +753,11 @@ def main():
             old_source = ckpt.get('source', {})
             for key in ('teacher_manifest_sha256', 'shape_sha256', 'teacher_source_sha256'):
                 if old_source.get(key) != cfg['source'].get(key):
+                    # 形状文件改动(如窗口膨胀)会让 shape_sha256 变。参数集完全一致时
+                    # 续训是有意义的(换更大的窗口继续学),但必须显式开启,默认仍然拒绝。
+                    if args.allow_provenance_change and key == 'shape_sha256':
+                        print(f'警告: 形状已变更({key}),按 --allow-provenance-change 继续')
+                        continue
                     raise ValueError('shared/routed replay provenance changed: ' + key)
             validate_resume_sampling(ckpt, cfg)
         model.load_state_dict(ckpt['model'])
@@ -785,7 +793,7 @@ def main():
     writer = csv.writer(log)
     if new_log:
         writer.writerow(['step', 'lr', 'loss', 'out', 'detail', 'feature', 'temporal',
-                         'psnr_teacher', 'ms', 'tex', 'stat', 'out_logit'])
+                         'psnr_teacher', 'ms', 'tex', 'stat', 'out_logit', 'grad_norm'])
 
     print(f"train: {len(source.files)} files, {sizes}², {cfg['batch']} batch, "
           f"{cfg['steps']} steps, device {device}")
@@ -1071,7 +1079,9 @@ def main():
         t_opt0 = time.perf_counter()
         if controller and log_step:
             controller.capture_gradients()
-        torch.nn.utils.clip_grad_norm_(params, cfg['clip'])
+        # 裁剪前的全局梯度范数(2026-10-18):此前返回值被丢弃,导致"clip=1.0 到底
+        # 吃掉了多少步长"只能靠猜 —— 若范数远大于 1,实际步长就是 lr/norm。
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(params, cfg['clip']))
         optim.step()
         if controller:
             controller.apply(step)
@@ -1116,6 +1126,7 @@ def main():
                 'psnr/teacher': sum(psnrs) / n,
                 'train/lr': lr,
                 'train/ms': ms,
+                'train/grad_norm': grad_norm,
             }
             if moe_tot:                                         # MoE 路由健康度(坍缩监控)
                 nb = max(1, len(psnrs))
@@ -1140,14 +1151,14 @@ def main():
                    f"{totals['feature'] / n:.5f}", f"{totals['temporal'] / n:.5f}",
                    f'{sum(psnrs) / pn:.2f}', f'{ms:.0f}',
                    f"{totals['texture'] / n:.5f}", f"{totals['texstat'] / n:.5f}",
-                   f"{totals['out_logit'] / n:.5f}"]
+                   f"{totals['out_logit'] / n:.5f}", f'{grad_norm:.2f}']
             writer.writerow(row)
             log.flush()
             print(f"step {step:6d}  lr {lr:.2e}  out {totals['out'] / n:.5f}  "
                   f"detail {totals['detail'] / n:.5f}  feat {totals['feature'] / n:.5f}  "
                   f"temp {totals['temporal'] / n:.5f}  tex {totals['texture'] / n:.5f}"
                   f"  stat {totals['texstat'] / n:.5f}  "
-                  f"psnr(t) {sum(psnrs) / len(psnrs):.2f}"
+                  f"psnr(t) {sum(psnrs) / len(psnrs):.2f}  gnorm {grad_norm:.1f}"
                   + (f"  moe_aux {aux_val:.3f} umax {moe_tot.get('util_worst', 0.0) / max(1, len(psnrs)):.2f}"
                      if aux_val > 0 else "")
                   + f"  {ms:.0f} ms"
