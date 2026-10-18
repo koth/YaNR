@@ -1,0 +1,28 @@
+{
+  "name": "student_routed2_v1",
+  "comment": "16 个路由专家、每 token 激活 top-2、无共享专家。去掉共享专家的依据:实测 v4.5 的 bank 轴 0(共享支路)在 d3/d4 占到 FFN 输出的 62-74%,却不专门化,是深层容量的黑洞。融合改为 (g1*E1 + g2*E2) * 0.5,两个门控仍沿用 16*softmax(z),因此两路各按自身置信度进入。层级宽度沿用 v4_novit_wide(无 ViT)。",
+  "architecture": "shared-routed-moe-v1",
+  "routing": {
+    "shared_experts": 0,
+    "routed_experts": 16,
+    "top_k": 2,
+    "spatial_granularity": "window8",
+    "vit_granularity": "token",
+    "selection": "fp32-argmax-with-bias-v1",
+    "tie_break": "lowest-index",
+    "gate": "softmax-selected-times-routed-v1",
+    "fusion": "sub-layer-mean-single-attention-v1",
+    "fusion_scale": 0.5,
+    "jitter": 0.0,
+    "transitions": "expertized"
+  },
+  "levels": [
+    {"level": "full", "kind": "shared_routed_moe", "channels": 32, "hidden": 32, "blocks": 2, "attn": false},
+    {"level": "d0", "kind": "shared_routed_moe", "channels": 32, "hidden": 32, "blocks": 4, "attn": true},
+    {"level": "d1", "kind": "shared_routed_moe", "channels": 64, "hidden": 64, "blocks": 4, "attn": true},
+    {"level": "d2", "kind": "shared_routed_moe", "channels": 96, "hidden": 64, "blocks": 4, "attn": true},
+    {"level": "d3", "kind": "shared_routed_moe", "channels": 192, "hidden": 64, "blocks": 4, "attn": true},
+    {"level": "d4", "kind": "shared_routed_moe", "channels": 256, "hidden": 64, "blocks": 4, "attn": true}
+  ],
+  "vit": {"kind": "shared_routed_moe", "channels": 384, "ffn": 928, "blocks": 0, "tokens_level": "d5"}
+}

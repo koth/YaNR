@@ -1,7 +1,10 @@
 """Versioned contract and exact parameter ledger for the shared/routed prototype.
 
 Pure stdlib: candidates can be audited before allocating GPU/torch weights.
-Bank axis 0 is the trainable shared expert; axes 1..16 are routed experts.
+2026-10-18:去掉共享专家 —— bank 轴 0..15 全是路由专家,每 token 激活 top-2。
+原设计里轴 0 是可训练共享专家、轴 1..16 是路由专家,融合为
+(shared + g·routed)·0.5;实测该共享支路在 d3/d4 占到 FFN 输出的 62-74%
+却不专门化,因此移除,两路都改为被路由的专家。
 """
 import copy
 import math
@@ -9,7 +12,7 @@ import math
 ARCHITECTURE = 'shared-routed-moe-v1'
 KIND = 'shared_routed_moe'
 LEVELS = ('full', 'd0', 'd1', 'd2', 'd3', 'd4')
-ROUTING = dict(shared_experts=1, routed_experts=16, top_k=1,
+ROUTING = dict(shared_experts=0, routed_experts=16, top_k=2,
                spatial_granularity='window8', vit_granularity='token',
                selection='fp32-argmax-with-bias-v1', tie_break='lowest-index',
                gate='softmax-selected-times-routed-v1',
@@ -40,8 +43,8 @@ def validate(shape):
             raise ValueError('each spatial level needs at least two blocks')
         if type(level.get('attn')) is not bool:
             raise ValueError('each spatial level needs explicit attn boolean')
-        if 'experts' in level and level['experts'] != 17:
-            raise ValueError('shared/routed banks always contain exactly 17 experts')
+        if 'experts' in level and level['experts'] != 16:
+            raise ValueError('shared/routed banks always contain exactly 16 routed experts')
     vit = shape.get('vit', {})
     if vit.get('kind') != KIND or vit.get('tokens_level') != 'd5':
         raise ValueError('shared/routed ViT kind/tokens_level mismatch')
@@ -57,8 +60,8 @@ def validate(shape):
         raise ValueError('ViT block count must be a non-negative integer')
     if vit['channels'] > 1024:
         raise ValueError('shared/routed router supports at most 1024 input channels')
-    if 'experts' in vit and vit['experts'] != 17:
-        raise ValueError('shared/routed ViT always contains exactly 17 experts')
+    if 'experts' in vit and vit['experts'] != 16:
+        raise ValueError('shared/routed ViT always contains exactly 16 routed experts')
     return shape
 
 
@@ -89,17 +92,17 @@ def ledger(shape):
 
     def transition(prefix, ci, co):
         router(prefix, ci)
-        add(prefix + '.weight', [17, ci, co])
-        add(prefix + '.bias', [17, co])
+        add(prefix + '.weight', [16, ci, co])
+        add(prefix + '.bias', [16, co])
 
     def block(prefix, c, h, attn, vit=False):
         router(prefix, c)
-        add(prefix + '.expand', [17, c, h])
-        add(prefix + ('.contract' if vit else '.narrow'), [17, h, c])
+        add(prefix + '.expand', [16, c, h])
+        add(prefix + ('.contract' if vit else '.narrow'), [16, h, c])
         add(prefix + '.aux_ffn', [c])
         if attn:
-            add(prefix + '.qkv', [17, c, 3 * c])
-            add(prefix + '.proj', [17, c, c])
+            add(prefix + '.qkv', [16, c, 3 * c])
+            add(prefix + '.proj', [16, c, c])
             add(prefix + '.aux_attn', [c])
             add(prefix + '.attention.scale', [c // 32])
             if not vit:

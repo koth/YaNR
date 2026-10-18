@@ -11,6 +11,14 @@ from torch import nn
 from torch.nn import functional as F
 
 
+ROUTED_EXPERTS = 16   # 2026-10-18:去掉共享专家后,bank 轴 0..15 全是路由专家
+TOP_K = 2             # 每 token 激活两个专家
+# 两支都是 silu 专家路径(旧设计里一支是线性 shared),silu 非零均值,两条相加会把
+# 直流偏置翻倍。实测 0.5 时启动 psnr 只有 6.9 dB、gnorm 66(旧结构 16.3 dB / 9.0)。
+# 0.25 让两支合量回到旧口径(旧:1 线性 + 1 激活 ×0.5;新:2 激活 ×0.25)。
+FUSION = 0.25
+
+
 def route_tile_rows(rows):
     """Bound padding by the actual problem size, particularly deep ViT groups.
 
@@ -83,12 +91,22 @@ class _ExpertWeights(torch.autograd.Function):
 
 
 def select(logits, bias):
-    """Selection uses frozen bias; differentiable gate uses unbiased FP32 logits."""
+    """Selection uses frozen bias; differentiable gate uses unbiased FP32 logits.
+
+    2026-10-18:去掉共享专家、改为 top-2。每个被选专家的门控仍沿用
+    gate = 16 * softmax(z)[e](与 top-1 同一口径),这样两个专家各按自身置信度
+    进入,路由支路幅度大约是原来的两倍 —— 正是为了解决"共享支路在 d3/d4
+    占到 62-74% 却不专门化"的实测问题。
+
+    选择用 argsort(stable=True) 而不是 topk:契约要求并列时取最小索引,
+    torch.topk 不保证这一点。
+    """
     if logits.dtype != torch.float32 or bias.dtype != torch.float32:
         raise TypeError('shared/routed router logits and bias must be FP32')
     probabilities = logits.softmax(-1)
-    pick = (logits + bias).argmax(-1)  # torch argmax: first (smallest) index on ties.
-    gate = 16 * probabilities.gather(1, pick[:, None]).squeeze(1)
+    ranking = torch.argsort(-(logits + bias), dim=-1, stable=True)
+    pick = ranking[:, :TOP_K]                       # [rows, 2],并列取最小索引
+    gate = 16 * probabilities.gather(1, pick)       # [rows, 2]
     return pick, gate, probabilities
 
 
@@ -145,14 +163,25 @@ class RoutedModule(nn.Module):
                 top = logits.topk(2, dim=1).values
                 self.training_metrics.update(gate_mean=gates.mean(), gate_max=gates.max(),
                                              score_margin_mean=(top[:, 0] - top[:, 1]).mean())
+        # 负载统计按"每个被选中的(行, 专家)对"记:top-2 时一行贡献两条。
+        flat_assign = assign.reshape(-1)
         if self.token and self.split_token_stats and batch > 1:
             # Keep the existing per-sample auxiliary-loss population, even
             # though the projections/attention now execute in one batch.
             self.moe_stats.extend(zip(assign.detach().chunk(batch), probs.chunk(batch), logits.chunk(batch)))
         else:
-            self.moe_stats.append((assign.detach(), probs, logits))
+            self.moe_stats.append((flat_assign.detach(), probs, logits))
         for name, tensor in [('logits', logits), ('pick', pick), ('gate', gate), ('assign', assign)]:
             self.capture(name, tensor)
+        return (*self._pack_route(assign[:, 0], gates[:, 0]),
+                self._pack_route(assign[:, 1], gates[:, 1]))
+
+    @staticmethod
+    def _pack_route(assign, gate):
+        """把一维 assign 编成固定瓦片分组布局;top-2 时对两个 pick 各调一次。
+
+        返回 (order, inv, lay, gate[:, None]),`routed_mm` 直接消费。
+        """
         # One scalar size read per route; reuse its compact layout in all four
         # projections. Never impose a 4096-row minimum on small/deep layers.
         order = torch.argsort(assign, stable=True)
@@ -178,49 +207,55 @@ class RoutedModule(nn.Module):
                    expert_per_row=expert)
         inv = torch.empty_like(order)
         inv[order] = torch.arange(order.numel(), device=order.device)
-        return order, inv, lay, gates[:, None]
+        return order, inv, lay, gate[:, None]
 
     @staticmethod
     def routed_mm(state, bank, route, bias=None):
-        order, inv, lay, _ = route
+        # route 可能是 5 元组(top-2 的整体路由)或 4 元组(单个槽位),取前四项。
+        order, inv, lay, _ = route[:4]
         sorted_x = _Permutation.apply(state, order, inv)
         out_f = bank.shape[2]
         # 固定瓦片分组 GEMM(2026-10-17 向量化):变长专家组折算进稠密 [B, TILE, k],
         # 16 专家一次 bmm;替代逐专家循环(33 碎内核/次 -> 8,无 Python 循环派发)。
         buf = _TilePack.apply(sorted_x, lay['packed_rows'], lay['packed_valid'], lay['flat_slots'])
-        weights = _ExpertWeights.apply(bank[1:17], lay['expert_of_tile'], lay['tiles'])
+        weights = _ExpertWeights.apply(bank[0:ROUTED_EXPERTS], lay['expert_of_tile'], lay['tiles'])
         out = torch.bmm(buf.view(lay['B'], lay['TILE'], state.shape[1]), weights).reshape(-1, out_f)
         seg = _TileUnpack.apply(out, lay['flat_slots'], lay['packed_rows'], lay['packed_valid'])
         if bias is not None:
-            seg = seg + bias[1:17][lay['expert_per_row']]
+            seg = seg + bias[0:ROUTED_EXPERTS][lay['expert_per_row']]
         return _Permutation.apply(seg, inv, order)
 
     def mixed_mm(self, state, bank, route, bias=None):
-        shared, routed = self.expert_pair(state, state, bank, route, bias)
+        first, second = self.expert_pair(state, bank, route, bias)
         if self.training_metrics_enabled and self.training and torch.is_grad_enabled():
             with torch.no_grad():
-                self.training_metrics.update(shared_projection_rms=shared.square().mean().sqrt(),
-                                             routed_projection_rms=routed.square().mean().sqrt())
-        shared, routed = self.diagnostic_branches(shared, routed)
-        return (shared + route[3] * routed) * 0.5
+                self.training_metrics.update(
+                    shared_projection_rms=first.square().mean().sqrt(),
+                    routed_projection_rms=second.square().mean().sqrt())
+        first, second = self.diagnostic_branches(first, second)
+        return (route[3] * first + route[4][3] * second) * FUSION
 
     @staticmethod
-    def expert_pair(shared_state, routed_state, bank, route, bias=None):
-        shared = shared_state @ bank[0]
-        if bias is not None:
-            shared = shared + bias[0]
-        return shared, RoutedModule.routed_mm(routed_state, bank, route, bias)
+    def expert_pair(state, bank, route, bias=None):
+        """top-2、无共享专家:返回两个被选专家各自的输出。
 
-    def diagnostic_branches(self, shared, routed):
+        2026-10-18 去掉共享专家(bank 轴 0 现在也是路由专家)。原来的
+        (F_shared + g·F_e)·0.5 里共享支路在 d3/d4 占 62-74% 却不专门化,
+        实测是深层的容量黑洞。现在两路都来自被路由的专家。
+        """
+        return (RoutedModule.routed_mm(state, bank, route, bias),
+                RoutedModule.routed_mm(state, bank, route[4], bias))
+
+    def diagnostic_branches(self, first, second):
         if self.branch_mode != 'full' and self.training:
             raise ValueError('branch removal is an eval-only diagnostic')
         if self.branch_mode == 'remove_shared':
-            shared = torch.zeros_like(shared)
+            first = torch.zeros_like(first)
         elif self.branch_mode == 'remove_routed':
-            routed = torch.zeros_like(routed)
+            second = torch.zeros_like(second)
         elif self.branch_mode != 'full':
             raise ValueError('unknown branch diagnostic mode')
-        return shared, routed
+        return first, second
 
 
 def initialize_bank(bank):
@@ -232,8 +267,8 @@ def initialize_bank(bank):
 class SharedRoutedLinear(RoutedModule):
     def __init__(self, inputs, outputs, token=False):
         super().__init__(inputs, token)
-        self.weight = nn.Parameter(torch.empty(17, inputs, outputs))
-        self.bias = nn.Parameter(torch.empty(17, outputs))
+        self.weight = nn.Parameter(torch.empty(ROUTED_EXPERTS, inputs, outputs))
+        self.bias = nn.Parameter(torch.empty(ROUTED_EXPERTS, outputs))
         initialize_bank(self.weight)
         nn.init.uniform_(self.bias, -1 / math.sqrt(inputs), 1 / math.sqrt(inputs))
 
@@ -252,17 +287,17 @@ class SharedRoutedBlock(RoutedModule):
         super().__init__(channels, token)
         from nr_student import WindowAttention, VitAttention
         from nr_geometry import window_phase
-        self.expand = nn.Parameter(torch.empty(17, channels, hidden))
+        self.expand = nn.Parameter(torch.empty(ROUTED_EXPERTS, channels, hidden))
         name = 'contract' if token else 'narrow'
-        self.register_parameter(name, nn.Parameter(torch.empty(17, hidden, channels)))
+        self.register_parameter(name, nn.Parameter(torch.empty(ROUTED_EXPERTS, hidden, channels)))
         self.contract_name = name
         initialize_bank(self.expand)
         initialize_bank(getattr(self, name))
         self.aux_ffn = nn.Parameter(torch.ones(channels))
         self.attn = attn
         if attn:
-            self.qkv = nn.Parameter(torch.empty(17, channels, 3 * channels))
-            self.proj = nn.Parameter(torch.empty(17, channels, channels))
+            self.qkv = nn.Parameter(torch.empty(ROUTED_EXPERTS, channels, 3 * channels))
+            self.proj = nn.Parameter(torch.empty(ROUTED_EXPERTS, channels, channels))
             initialize_bank(self.qkv); initialize_bank(self.proj)
             self.aux_attn = nn.Parameter(torch.ones(channels))
             self.attention = (VitAttention(channels) if token else
@@ -271,18 +306,22 @@ class SharedRoutedBlock(RoutedModule):
 
     def forward(self, state, width, height, batch=1):
         # For token blocks width=tokens, height=padded, matching existing ViT API.
-        route = self.route(state, width, height, batch)
+        route = self.route(state, width, height, batch)      # top-2:route[4] 是第二个专家
         contract = getattr(self, self.contract_name)
-        shared_hidden, routed_hidden = self.expert_pair(state, state, self.expand, route)
-        shared, routed = self.expert_pair(F.silu(shared_hidden), F.silu(routed_hidden), contract, route)
+        first, second = route, route[4]
+        hidden_a = RoutedModule.routed_mm(state, self.expand, first)
+        hidden_b = RoutedModule.routed_mm(state, self.expand, second)
+        expert_a = RoutedModule.routed_mm(F.silu(hidden_a), contract, first)
+        expert_b = RoutedModule.routed_mm(F.silu(hidden_b), contract, second)
         if self.training_metrics_enabled and self.training and torch.is_grad_enabled():
             with torch.no_grad():
-                self.training_metrics.update(shared_ffn_rms=shared.square().mean().sqrt(),
-                                             routed_ffn_rms=routed.square().mean().sqrt(),
-                                             gated_routed_ffn_rms=(route[3] * routed).square().mean().sqrt())
-        shared, routed = self.diagnostic_branches(shared, routed)
-        ffn = (shared + route[3] * routed) * 0.5
-        self.capture('ffn_shared', shared); self.capture('ffn_routed', routed)
+                # 键名沿用旧口径:shared 槽位 = 第 1 个专家,routed 槽位 = 第 2 个。
+                self.training_metrics.update(shared_ffn_rms=expert_a.square().mean().sqrt(),
+                                             routed_ffn_rms=expert_b.square().mean().sqrt(),
+                                             gated_routed_ffn_rms=(second[3] * expert_b).square().mean().sqrt())
+        expert_a, expert_b = self.diagnostic_branches(expert_a, expert_b)
+        ffn = (first[3] * expert_a + second[3] * expert_b) * FUSION
+        self.capture('ffn_shared', expert_a); self.capture('ffn_routed', expert_b)
         out = state * self.aux_ffn + ffn
         self.capture('ffn', out)
         if self.attn:
