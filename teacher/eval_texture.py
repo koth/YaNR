@@ -124,6 +124,10 @@ def main():
     parser.add_argument('--ckpt', action='append', required=True,
                         help='标签=checkpoint 路径,可重复')
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--teacher-cache', default=None,
+                        help='教师输出的缓存目录。教师(fp8 + CUDA 内核)占显存最多,'
+                             '且对固定图集是确定性的:缓存后只评学生,1.5GB 显存就够,'
+                             '可以在训练进行时并行跑')
     parser.add_argument('-o', '--out', default='eval_texture')
     args = parser.parse_args()
 
@@ -134,26 +138,95 @@ def main():
           f'style {CFG["style"]} tone {CFG["tone"]} struct {CFG["structure"]} '
           f'skin {CFG["skin"]} automask {CFG["automask"]}')
 
-    # 先把教师的输出全部算完并留在 CPU,后面每个 ckpt 复用(教师是确定性的)。
-    teacher = Network(Model(device).load(args.teacher_weights), g)
+    # 教师输出对(图, 尺寸, 档位)是确定性的,而且它的 fp8 + CUDA 内核要吃 1.5GB 以上
+    # 显存 —— 训练占满卡时根本加载不进来。缓存到磁盘后,后续评估只跑学生。
+    cache_dir = args.teacher_cache
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    # 缓存里存的是"教师真实输出"这件事必须可追溯:曾经用假数据填过一次缓存做显存
+    # 测试,文件名与真缓存完全一致 —— 没有来源记录就会静默算出错误结论。
+    def provenance_path():
+        return os.path.join(cache_dir, '_provenance.json')
+
+    def write_provenance():
+        if not cache_dir:
+            return
+        import hashlib
+        digest = hashlib.sha256()
+        for name in sorted(os.listdir(args.teacher_weights)) if os.path.isdir(
+                args.teacher_weights) else [args.teacher_weights]:
+            p = os.path.join(args.teacher_weights, name)
+            if os.path.isfile(p):
+                digest.update(name.encode())
+                digest.update(os.path.getsize(p).to_bytes(8, 'little'))
+        with open(provenance_path(), 'w') as fh:
+            json.dump({'teacher_weights': args.teacher_weights,
+                       'teacher_files_digest': digest.hexdigest()[:16],
+                       'width': args.width, 'height': args.height, 'regime': CFG,
+                       'seed': args.seed,
+                       'images': [os.path.basename(p) for p in args.images]}, fh, indent=1)
+
+    def cache_paths(path):
+        stem = f'{os.path.basename(path)}.{args.width}x{args.height}.s{CFG["style"]}' \
+               f't{CFG["tone"]}k{CFG["structure"]}'
+        return (os.path.join(cache_dir, stem + '.feats.npy'),
+                os.path.join(cache_dir, stem + '.teacher.npy'))
+
+    def cached(path):
+        return bool(cache_dir) and all(os.path.exists(q) for q in cache_paths(path))
+
+    computed = {}
+    todo = [p for p in args.images if not cached(p)]
+
+    if cache_dir and os.path.exists(provenance_path()):
+        with open(provenance_path()) as fh:
+            prov = json.load(fh)
+        print(f'缓存来源: teacher={prov["teacher_weights"]} '
+              f'digest={prov["teacher_files_digest"]} regime={prov["regime"]}')
+    elif cache_dir and not todo:
+        print('警告: 缓存全部命中但没有 _provenance.json,无法确认是教师真实输出')
+
+    if todo:
+        teacher = Network(Model(device).load(args.teacher_weights), g)
+        for path in todo:
+            proxy = np.asarray(Image.open(path).convert('RGB').resize(
+                (args.width, args.height), Image.LANCZOS), dtype=np.float32) / 255.0
+            feats = torch.from_numpy(build_features(
+                proxy, g, args.seed, CFG['style'], CFG['tone'], CFG['structure'],
+                CFG['skin'], CFG['automask'])).to(device)
+            with torch.no_grad():
+                head = teacher.record(feats)
+                head = head.float().cpu().numpy().reshape(g['full_height'],
+                                                          g['full_width'], 4)
+            tout = np.clip(proxy + head[:args.height, :args.width, :3] / 4.0, 0, 1)
+            feats_cpu = feats.cpu()
+            if cache_dir:
+                feats_path, t_path = cache_paths(path)
+                np.save(feats_path, feats_cpu.numpy())
+                np.save(t_path, tout)
+            computed[path] = {'name': os.path.basename(path), 'proxy': proxy,
+                              'teacher': tout, 'feats': feats_cpu}
+            del feats, head
+            torch.cuda.empty_cache()
+        del teacher
+        torch.cuda.empty_cache()
+        write_provenance()
+        print(f'teacher 计算 {len(todo)} 张' + (f',已缓存到 {cache_dir}' if cache_dir else ''))
+    else:
+        print(f'teacher 全部命中缓存({len(args.images)} 张),无需加载教师')
+
     cache = []
     for path in args.images:
+        if path in computed:
+            cache.append(computed[path])
+            continue
+        feats_path, t_path = cache_paths(path)
         proxy = np.asarray(Image.open(path).convert('RGB').resize(
             (args.width, args.height), Image.LANCZOS), dtype=np.float32) / 255.0
-        feats = torch.from_numpy(build_features(
-            proxy, g, args.seed, CFG['style'], CFG['tone'], CFG['structure'],
-            CFG['skin'], CFG['automask'])).to(device)
-        with torch.no_grad():
-            head = teacher.record(feats)
-            head = head.float().cpu().numpy().reshape(g['full_height'], g['full_width'], 4)
-        tout = np.clip(proxy + head[:args.height, :args.width, :3] / 4.0, 0, 1)
         cache.append({'name': os.path.basename(path), 'proxy': proxy,
-                      'teacher': tout, 'feats': feats.cpu()})
-        del feats, head
-        torch.cuda.empty_cache()
-    del teacher
-    torch.cuda.empty_cache()
-    print(f'teacher done: {len(cache)} 张')
+                      'teacher': np.load(t_path),
+                      'feats': torch.from_numpy(np.load(feats_path))})
 
     shape = load_student_shape(SHAPE)
     report = {}
