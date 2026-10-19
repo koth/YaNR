@@ -19,6 +19,16 @@ BANK_NAMES = {'expand', 'narrow', 'contract', 'qkv', 'proj', 'weight'}
 TRANSITIONS = {'enc_trans', 'dec_trans', 'vit_in', 'vit_out'}
 
 
+def _routing(shape):
+    """bank 轴数与共享槽数从形状的 routing 段读,不写死 17。
+
+    2026-10-18 去掉共享专家后是 7 个纯路由专家、top-1;(轴数, 共享槽, top_k)。
+    """
+    r = shape.get('routing') or {}
+    return (int(r.get('routed_experts', 7)), int(r.get('shared_experts', 0)),
+            int(r.get('top_k', 1)))
+
+
 def sha256(path):
     digest = hashlib.sha256()
     with Path(path).open('rb') as handle:
@@ -40,18 +50,18 @@ def _bank_layout(name, shape):
     parts = name.split('.')
     new = shape.get('architecture') == ARCHITECTURE
     if parts[0] in TRANSITIONS:
-        return (17, 1, 1) if new else None
+        return _routing(shape) if new else None
     if parts[0] in ('enc_blocks', 'dec_blocks') and len(parts) >= 4:
         config = next((lv for lv in shape['levels'] if lv['level'] == parts[1]), None)
         if config is None:
             raise ValueError('tensor references unknown level: ' + name)
         if new and config['kind'] == 'shared_routed_moe':
-            return 17, 1, 1
+            return _routing(shape)
         if config['kind'] == 'moe':
             return int(config['experts']), 0, 1
     if parts[0] == 'vit_blocks':
         if new:
-            return 17, 1, 1
+            return _routing(shape)
         experts = int(shape['vit'].get('experts', 0))
         if experts >= 2:
             return experts, 0, 1
