@@ -26,19 +26,33 @@ Engine::Engine(const std::string& package_dir, int width, int height, bool cpu_p
     const auto& model = manifest.at("model");
     if (model.at("kind").str() != "student") throw std::runtime_error("expected a student package");
     const auto shape = jsonread::read(relative_file(root, model.at("shapeFile").str()));
-    const bool shared_routed = shape.has("architecture");
+    const std::string architecture = shape.has("architecture") ? shape.at("architecture").str() : "";
+    cnn_ = architecture == "cnn_unet_moe8";
+    const bool shared_routed = shared_routed_ = architecture == "shared-routed-moe-v1";
+    if (!architecture.empty() && !cnn_ && !shared_routed)
+        throw std::runtime_error("unsupported architecture: " + architecture);
     if (shared_routed) {
         if (shape.at("architecture").str() != "shared-routed-moe-v1" ||
             model.at("architecture").str() != "shared-routed-moe-v1" ||
-            model.at("precision").str() != "fp32-tf32-off" || model.at("biasPolicy").str() != "frozen-inference" ||
-            model.at("expertLayout").str() != "bank[shared,routed0..15,in,out]")
+            model.at("precision").str() != "fp32-tf32-off" || model.at("biasPolicy").str() != "frozen-inference")
             throw std::runtime_error("incompatible shared/routed package contract");
+        const auto& routing = shape.at("routing");
+        shared_experts_ = static_cast<int>(routing.at("shared_experts").integer());
+        routed_experts_ = routing.at("routed_experts").positive();
+        if ((shared_experts_ != 0 && shared_experts_ != 1) || routed_experts_ > 16)
+            throw std::runtime_error("unsupported expert bank layout");
+        const std::string layout = shared_experts_ ? "bank[shared,routed0..15,in,out]" :
+            "bank[routed0.." + std::to_string(routed_experts_ - 1) + ",in,out]";
+        // Older exporters used the shared-bank label for the routed-only bank.
+        if (model.at("expertLayout").str() != layout &&
+            !(shared_experts_ == 0 && model.at("expertLayout").str() == "bank[shared,routed0..15,in,out]"))
+            throw std::runtime_error("incompatible expert layout");
         for (const auto* owner : {&shape, &model}) {
             const auto& r = owner->at("routing");
             if (r.at("fusion_scale").kind != jsonread::Value::Number || r.at("fusion_scale").number != 0.5 ||
                 r.at("jitter").kind != jsonread::Value::Number || r.at("jitter").number != 0.0)
                 throw std::runtime_error("shared/routed requires fusion_scale=0.5 and jitter=0");
-            if (r.at("shared_experts").integer() != 1 || r.at("routed_experts").integer() != 16 || r.at("top_k").integer() != 1 ||
+            if (r.at("shared_experts").integer() != shared_experts_ || r.at("routed_experts").integer() != routed_experts_ || r.at("top_k").integer() != 1 ||
                 r.at("spatial_granularity").str() != "window8" || r.at("vit_granularity").str() != "token" ||
                 r.at("selection").str() != "fp32-argmax-with-bias-v1" || r.at("tie_break").str() != "lowest-index" ||
                 r.at("gate").str() != "softmax-selected-times-routed-v1" ||
@@ -46,8 +60,12 @@ Engine::Engine(const std::string& package_dir, int width, int height, bool cpu_p
                 r.at("transitions").str() != "expertized")
                 throw std::runtime_error("incompatible shared/routed routing semantics");
         }
-        if (cpu_pack) throw std::runtime_error("shared-routed-moe-v1 requires the CUDA backend; CPU execution is unsupported");
     }
+    // Early CNN exports declare the architecture only in shape.json. Tensor
+    // dtypes and every CNN tensor shape are still validated below.
+    if (cnn_ && ((model.has("architecture") && model.at("architecture").str() != architecture) ||
+                 (model.has("precision") && model.at("precision").str() != "fp32-tf32-off")))
+        throw std::runtime_error("incompatible CNN package contract");
     struct Stage { size_t offset, bytes; };
     std::map<std::string, Stage> stages;
     for (const auto& entry : manifest.at("stages").list()) {
@@ -95,6 +113,49 @@ Engine::Engine(const std::string& package_dir, int width, int height, bool cpu_p
     if (blend.shape != std::vector<int>{1}) throw std::runtime_error("invalid blend_scale");
     blend_scale_ = blend.data[0];
 
+    if (cnn_) {
+        if (shape.at("experts").positive() != 8) throw std::runtime_error("CNN requires eight experts");
+        static const char* names[] = {"full", "d0", "d1", "d2", "d3", "d4", "d5"};
+        auto expect = [&](const std::string& key, std::vector<int> dims) {
+            if (t(key).shape != dims) throw std::runtime_error("CNN tensor shape mismatch: " + key);
+        };
+        auto norm = [&](const std::string& p, int c) { expect(p + ".weight", {c}); expect(p + ".bias", {c}); };
+        auto conv = [&](const std::string& p, int ci, int co, int k) {
+            expect(p + ".weight", {co, ci, k, k}); expect(p + ".bias", {co});
+        };
+        for (int i = 0; i < 7; ++i) {
+            const std::string name = names[i];
+            int c = cnn_channels_[i] = shape.at("channels").at(name).positive();
+            if (c % 8 || c > 1024) throw std::runtime_error("CNN channels must be a multiple of eight, at most 1024");
+            int h = shape.at("expert_hidden").at(name).positive();
+            if (i == 0) { conv("stem.0", 16, c, 3); norm("stem.1", c); }
+            else { conv("enc_proj." + name + ".0", cnn_channels_[i - 1], c, 1); norm("enc_proj." + name + ".1", c); }
+            for (int side = 0; side < (i == 6 ? 1 : 2); ++side) {
+                int count = static_cast<int>(shape.at(side ? "blocks_dec" : "blocks_enc").at(name).integer());
+                if (count > 128) throw std::runtime_error("too many CNN blocks");
+                auto& bs = blocks_[side][name];
+                for (int j = 0; j < count; ++j) {
+                    BlockCfg cfg; cfg.kind = "cnn"; cfg.hidden = h; cfg.experts = 8; bs.push_back(cfg);
+                    const std::string p = std::string(side ? "dec." : "enc.") + name + "." + std::to_string(j);
+                    norm(p + ".norm1", c); norm(p + ".norm2", c); conv(p + ".conv", c, c, 3);
+                    conv(p + ".ffn.router", c, 8, 1); expect(p + ".aux", {1, c, 1, 1});
+                    for (int e = 0; e < 8; ++e) {
+                        std::string b = p + ".ffn.bank." + std::to_string(e);
+                        expect(b + ".0.weight", {h, c}); expect(b + ".0.bias", {h});
+                        expect(b + ".2.weight", {c, h}); expect(b + ".2.bias", {c});
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < 6; ++i) {
+            conv(std::string("merge.") + names[i] + ".0", cnn_channels_[i + 1] + cnn_channels_[i], cnn_channels_[i], 3);
+            norm(std::string("merge.") + names[i] + ".1", cnn_channels_[i]);
+        }
+        norm("head_norm", cnn_channels_[0]); conv("head", cnn_channels_[0], 4, 1);
+        prepare_cnn_weights();
+        return;
+    }
+
     static const char* levels[] = {"full", "d0", "d1", "d2", "d3", "d4"};
     static const int phases[4][2] = {{0, 0}, {4, 4}, {4, 0}, {0, 4}};
     std::map<std::string, jsonread::Value> configs;
@@ -111,10 +172,13 @@ Engine::Engine(const std::string& package_dir, int width, int height, bool cpu_p
         cfg.hidden = lv.at("hidden").positive();
         cfg.attn = lv.has("attn") ? lv.at("attn").flag() : true;
         cfg.window = cfg.attn ? (lv.has("window_slots") ? lv.at("window_slots").positive() : 8) : 0;
+        cfg.dilation = lv.has("window_dilation") ? lv.at("window_dilation").positive() : 1;
+        if (cfg.dilation > 8 || (cfg.dilation != 1 && !shared_routed))
+            throw std::runtime_error("window dilation requires a routed student and must be at most eight");
         if (cfg.kind == "shared_routed_moe") {
             if (!shared_routed || channels > 1024 || cfg.hidden % 32 || (cfg.attn && cfg.window != 8) || lv.at("blocks").positive() < 2)
                 throw std::runtime_error("invalid shared/routed spatial configuration");
-            cfg.experts = 17; cfg.narrow = channels;
+            cfg.experts = shared_experts_ + routed_experts_; cfg.narrow = channels;
         }
         else if (shared_routed) throw std::runtime_error("shared/routed shape requires all layers expertized");
         else if (cfg.kind == "expert") { cfg.experts = channels / 32; cfg.narrow = 32; }
@@ -151,25 +215,26 @@ Engine::Engine(const std::string& package_dir, int width, int height, bool cpu_p
     if (shared_routed) {
         if (vit.at("kind").str() != "shared_routed_moe" || vit.at("channels").positive() % 32 || vit.at("channels").positive() > 1024 || cfg.hidden % 32)
             throw std::runtime_error("invalid shared/routed ViT configuration");
-        cfg.experts = 17;
+        cfg.experts = shared_experts_ + routed_experts_;
+        const int E = cfg.experts, R = routed_experts_;
         auto expect = [&](const std::string& n, std::vector<int> dims) {
             if (t(n).shape != dims) throw std::runtime_error("shared/routed tensor shape mismatch: " + n);
         };
         auto router = [&](const std::string& p, int c) {
             expect(p + ".router.0.weight", {c}); expect(p + ".router.0.bias", {c});
-            expect(p + ".router.1.weight", {16, c}); expect(p + ".router_bias", {16});
+            expect(p + ".router.1.weight", {R, c}); expect(p + ".router_bias", {R});
         };
         auto block = [&](const std::string& p, int c, int h, bool attn, bool global) {
-            router(p, c); expect(p + ".expand", {17, c, h});
-            expect(p + (global ? ".contract" : ".narrow"), {17, h, c}); expect(p + ".aux_ffn", {c});
+            router(p, c); expect(p + ".expand", {E, c, h});
+            expect(p + (global ? ".contract" : ".narrow"), {E, h, c}); expect(p + ".aux_ffn", {c});
             if (attn) {
-                expect(p + ".qkv", {17, c, c * 3}); expect(p + ".proj", {17, c, c});
+                expect(p + ".qkv", {E, c, c * 3}); expect(p + ".proj", {E, c, c});
                 expect(p + ".aux_attn", {c}); expect(p + ".attention.scale", {c / 32});
                 if (!global) expect(p + ".attention.prior", {c / 32, 64, 64});
             }
         };
         auto transition = [&](const std::string& p, int ci, int co) {
-            router(p, ci); expect(p + ".weight", {17, ci, co}); expect(p + ".bias", {17, co});
+            router(p, ci); expect(p + ".weight", {E, ci, co}); expect(p + ".bias", {E, co});
         };
         for (int i = 0; i < 6; ++i) {
             int c = configs.at(levels[i]).at("channels").positive();
@@ -183,8 +248,9 @@ Engine::Engine(const std::string& package_dir, int width, int height, bool cpu_p
         }
         int c = vit.at("channels").positive(), last = configs.at("d4").at("channels").positive();
         transition("vit_in", last, c); transition("vit_out", c, last);
-        for (int j = 0; j < vit.at("blocks").positive(); ++j) block("vit_blocks." + std::to_string(j), c, cfg.hidden, true, true);
+        for (int j = 0; j < static_cast<int>(vit.at("blocks").integer()); ++j) block("vit_blocks." + std::to_string(j), c, cfg.hidden, true, true);
     }
-    vit_blocks_.assign(vit.at("blocks").positive(), cfg);
+    if (vit.at("blocks").integer() > 128) throw std::runtime_error("too many ViT blocks");
+    vit_blocks_.assign(static_cast<size_t>(vit.at("blocks").integer()), cfg);
     if (cpu_pack) pack_weights();
 }

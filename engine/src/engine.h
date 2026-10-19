@@ -17,6 +17,7 @@ struct BlockCfg {
     int hidden = 0, experts = 0, narrow = 0;
     int branches = 0, bc = 0, mc = 0;
     int window = 0, shift_x = 0, shift_y = 0;
+    int dilation = 1;
 };
 
 struct Tensor {
@@ -85,6 +86,20 @@ public:
 private:
     friend class CudaEngine;
     void pack_weights();
+    void prepare_cnn_weights();
+    void cnn_forward(const float* features, float* head);
+    void cnn_block(const std::string& prefix, float* state, int width, int height) const;
+    void cnn_conv(const float* in, float* out, int width, int height, const std::string& prefix) const;
+    void cnn_norm(const float* in, float* out, int rows, int channels, const std::string& prefix, bool act) const;
+    void routed_transition(const float* in, float* out, int width, int height,
+                           int inputs, int outputs, const std::string& prefix, bool windows) const;
+    void routed_block(const BlockCfg& cfg, const std::string& prefix, float* state,
+                      int width, int height, bool global) const;
+    struct Route { std::vector<int> pick, order, offsets; std::vector<float> gate; };
+    Route route(const float* state, int width, int height, int channels,
+                const std::string& prefix, bool windows) const;
+    std::vector<float> routed_projection(const float* in, int rows, int inputs, int outputs,
+                const std::string& weight, const Route& route, const std::string& contract = {}) const;
     const Tensor& t(const std::string& name) const;
     const float* w(const std::string& name) const { return t(name).data; }
     int dim(const std::string& name, int i) const { return t(name).shape[i]; }
@@ -126,6 +141,10 @@ private:
     std::vector<char> bin_;        // whole weight file
     std::unordered_map<std::string, Tensor> tensors_;
     std::unordered_map<std::string, std::vector<float>> packed_;   // [K][N] 打包权重(gemm.h)
+    std::unordered_map<std::string, std::vector<float>> cnn_weights_; // NHWC convolution / expert banks
+    bool cnn_ = false, shared_routed_ = false;
+    int shared_experts_ = 0, routed_experts_ = 0;
+    int cnn_channels_[7]{};
     std::unordered_map<std::string, Wq> packed_i8_;                // 线性 [N][Kp] int8
     std::unordered_map<std::string, Wq> expert_i8_;                // 专家 [e*N][Kp] int8
     mutable std::map<uint64_t, std::vector<int>> perm_cache_;      // 窗口槽序排列缓存

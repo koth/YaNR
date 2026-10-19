@@ -337,7 +337,45 @@ $env:OMP_NUM_THREADS = '8'
     --engine-build engine/build/Release --bisect
 ```
 
-共享 + Top-1 的 17 专家原型使用独立 `shared-routed-moe-v1` 包，仅支持原生 CUDA 后端。
-结构契约、未训练随机包生成、逐层对账、完整前向门禁与显存/profile 诊断命令见
-[`teacher/SHARED_MOE.md`](../teacher/SHARED_MOE.md)；阶段测量见
-[`teacher/SHARED_MOE_REPORT.md`](../teacher/SHARED_MOE_REPORT.md)。旧包和默认入口继续使用既有语义。
+## 当前 MoE 与 CNN 学生
+
+CPU 和原生 CUDA 均可从包内 `shape.json` 自动识别：
+
+- `nr_shared_moe.py`：当前 7 专家 Top-1、无共享分支，支持 `vit.blocks=0`、
+  窗口膨胀及冻结的 router bias。gate 为 `E * softmax(logits)[pick]`，子层融合系数为 0.5。
+  也保留旧的 1 个共享 + 16 个路由专家 Top-1 包。
+- `nr_cnn_unet.py`：完整七级 CNN U-Net，支持 3×3/1×1 卷积、8 组 GroupNorm、
+  `align_corners=False` 双线性缩放、拼接跳连和像素级 8 专家 FFN。
+  CNN 的 gate 为 `softmax(logits)[pick]`，保留专家的两层 bias 和独立 SiLU。
+
+两条新路径使用 FP32（关闭 TF32），CPU 不支持 `NR_INT8=1`。
+历史 Top-2 shape 不属于当前 Python 模型契约，引擎会明确拒绝。
+
+先在有 PyTorch 的环境打包 checkpoint，再把目录交给现有图片/视频入口：
+
+```powershell
+python teacher/make_student_package.py --shape shapes/cnn_unet_moe8.json `
+    --checkpoint runs/cnn/ckpt.pt -o weights/cnn
+# MoE 使用 --shape shapes/student_routed7_v1.json
+engine/build-cuda/gpu_engine.exe photo.jpg --weights weights/cnn -o out/cnn.png
+engine/build/Release/cpu_engine.exe photo.jpg --weights weights/cnn -o out/cnn_cpu.png
+```
+
+`convert_weights.py --shape student` 和 `check_package.py` 也支持两种模型。
+重新构建后，下面的检查无需训练权重，会导出完整生产 shape 并验证四种尺寸、
+逐层输出、路由选择、CUDA eager/Graph/repeat 一致性：
+
+```powershell
+.venv/Scripts/python.exe teacher/check_native_students.py
+.venv/Scripts/python.exe teacher/check_native_students.py --edge-cases --sizes 320x320 320x512
+engine/build-cuda/shared_moe_check.exe --quick
+```
+
+可用 `--package weights/cnn` 检查自己的包，或 `--cpu-only` 只测 CPU。
+完整模型算术测试会轮换 CNN 各块的优势专家以避开 argmax 临界点；
+独立 CUDA fixture 覆盖混合路由、并列取最小索引、偏置选择、空专家和非整齐通道。
+真实权重若出现几乎相同的 logits，FP32 运算顺序差异可能让少数像素换专家，
+此时逐元素严格对账会报错，需要结合最早出现差异的路由判断。
+
+旧共享原型的设计与历史测量见 [`teacher/SHARED_MOE.md`](../teacher/SHARED_MOE.md)
+和 [`teacher/SHARED_MOE_REPORT.md`](../teacher/SHARED_MOE_REPORT.md)。

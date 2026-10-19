@@ -63,6 +63,12 @@ engine/build-cuda/shared_moe_check.exe
 
 `prototype_shared_moe.py` 保存种子、候选参数/成本、逐张量审计、实际负载、门控、分支 RMS 和包往返逐位一致记录。原型包标明 `untrainedPrototype=true`，有独立版本化 routing/precision/layout、shape SHA256、冻结零偏置来源和分片 SHA256。公共参数和 buffer 分开计数；审计拒绝缺失过渡或不匹配 bank。旧包继续走原来的 Python/C++ 分支；CPU 加载此新包明确报错。
 
+`audit_moe.py` 从 shape 读取路由数，并支持原 CNN 的逐专家 Linear、16 专家 CNN、
+Fast CNN 的 packed `w1/b1/w2/b2`。默认不套用历史原型的 80M / 公共参数 1% 预算；
+对当前 7 专家模型仍严格检查命名、形状和过渡完整性。若专门验收原来的预算，显式
+加 `--prototype-budget`；原型生成器内部仍启用该门槛。审计只需 Python 标准库，
+`python -S -m unittest discover -s teacher -p test_audit_moe.py -v` 可检查统计逻辑。
+
 跨实现检查显式使用 raw head `atol=3e-5, rtol=2e-4`，并报告 max/mean/p99/RMS；合成 RGB 使用 head/4。该阈值覆盖大图 FP32 不同累加树的微小误差。四个小尺寸通常只有几 e-6；原图选择单独精确比较，不允许路由差异被数值容差掩盖。大图可加 `--routes-only` 只保留路由 capture，仍检查 eager/Graph 和完整 head。
 
 `check_shared_moe.py` 共用 features，逐层精确比较选择，数值比较 gate/FFN/QKV/attention/过渡/head，检查 eager/Graph/重复执行。默认尺寸包括 320²、512²、320×512、137×201。原图检查可单独运行，输出全部放在 `tmp`，不修改样例：

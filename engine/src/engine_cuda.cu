@@ -232,18 +232,20 @@ __global__ void group_copy(const float* in, float* out, const int* row_group, in
 }
 
 #include "shared_moe_cuda.cuh"
+#include "cnn_cuda.cuh"
 
 // q/k/v are packed [window, head, slot, channel]. Invalid window keys stay zero,
 // but remain in the softmax denominator: the trained window mask is query-only.
 template<int Window>
 __global__ void window_qkv(const float* qkv, float* packed, int width, int height,
-                           int heads, int runtime_win, int sx, int sy, const float* scale, int tasks) {
+                           int heads, int runtime_win, int sx, int sy, const float* scale, int tasks, int dilation = 1) {
     const int win = Window ? Window : runtime_win;
     int item = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     if (item >= tasks) return; // Whole warps are inactive; normalization stays warp-wide.
-    int slots = win * win, wy = (height + sy + win - 1) / win;
+    int extent = (win - 1) * dilation + 1;
+    int slots = win * win, wy = (height + sy + extent - 1) / extent;
     int slot = item % slots, wh = item / slots, head = wh % heads, window = wh / heads;
-    int x = window / wy * win - sx + slot % win, y = window % wy * win - sy + slot / win;
+    int x = window / wy * extent - sx + slot % win * dilation, y = window % wy * extent - sy + slot / win * dilation;
     int c = threadIdx.x % 32;
     float q = 0, k = 0, v = 0;
     if (x >= 0 && x < width && y >= 0 && y < height) {
@@ -269,12 +271,13 @@ __device__ float warp_max(float v) {
 }
 template<int Window>
 __global__ void window_attend(const float* packed, float* out, const float* prior,
-                              int width, int height, int heads, int runtime_win, int sx, int sy) {
+                              int width, int height, int heads, int runtime_win, int sx, int sy, int dilation = 1) {
     extern __shared__ float shared[];
     const int win = Window ? Window : runtime_win;
     int wh = blockIdx.x, head = wh % heads, window = wh / heads;
-    int slots = win * win, wy = (height + sy + win - 1) / win;
-    int ox = window / wy * win - sx, oy = window % wy * win - sy;
+    int extent = (win - 1) * dilation + 1;
+    int slots = win * win, wy = (height + sy + extent - 1) / extent;
+    int ox = window / wy * extent - sx, oy = window % wy * extent - sy;
     float* queries = shared;
     float* values = queries + slots * 32;
     float* keys = values + slots * 32;
@@ -291,7 +294,7 @@ __global__ void window_attend(const float* packed, float* out, const float* prio
     __syncthreads();
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int query = warp; query < slots; query += blockDim.x / 32) {
-        int x = ox + query % win, y = oy + query / win;
+        int x = ox + query % win * dilation, y = oy + query / win * dilation;
         if (x < 0 || x >= width || y < 0 || y >= height) continue;
         float scores[Window ? (Window * Window + 31) / 32 : 8], mx = -CUDART_INF_F;
 #pragma unroll
@@ -414,6 +417,10 @@ struct CudaEngine::Impl {
     bool debugging = false, uploaded = false;
     bool capture_routes_only = false;
     bool shared_routed = false;
+    bool cnn = false;
+    int shared_experts = 0, routed_experts = 0;
+    int cnn_channels[7]{};
+    Buffer<float> cnn_columns, cnn_normed, cnn_conv_out, cnn_cat;
     bool profiling = false;
     bool capturing = false;
     struct EventPair { std::string name; cudaEvent_t begin, end; };
@@ -508,37 +515,38 @@ struct CudaEngine::Impl {
         Scope profile(*this, "routed_gemm:" + key);
         if (N == 32) {
             dim3 blocks((rows + 31) / 32 + 15, 1);
-            sr_grouped_gemm<32><<<blocks, 256, 0, stream>>>(in, w(key), out, sr_offsets.p, sr_tiles.p, K, N, act);
+            sr_grouped_gemm<32><<<blocks, 256, 0, stream>>>(in, w(key), out, sr_offsets.p, sr_tiles.p, K, N, act, routed_experts, shared_experts);
         } else {
             dim3 blocks((rows + 31) / 32 + 15, (N + 63) / 64);
-            sr_grouped_gemm<64><<<blocks, 256, 0, stream>>>(in, w(key), out, sr_offsets.p, sr_tiles.p, K, N, act);
+            sr_grouped_gemm<64><<<blocks, 256, 0, stream>>>(in, w(key), out, sr_offsets.p, sr_tiles.p, K, N, act, routed_experts, shared_experts);
         }
     }
     void shared_route(const float* state, int width, int height, int ch, const std::string& p, bool windows) {
         Scope profile(*this, "route:" + p);
         int rows = width * height, items = windows ? ((width + 7) / 8) * ((height + 7) / 8) : rows;
-        route_norm.resize(static_cast<size_t>(items) * ch); logits.resize(static_cast<size_t>(items) * 16);
-        pick.resize(items); gates.resize(items); counts.resize(16); ids0.resize(items); ids1.resize(items);
+        const int E = routed_experts;
+        route_norm.resize(static_cast<size_t>(items) * ch); logits.resize(static_cast<size_t>(items) * E);
+        pick.resize(items); gates.resize(items); counts.resize(E); ids0.resize(items); ids1.resize(items);
         sr_keys0.resize(items); sr_keys1.resize(items); sr_lengths_buf.resize(items); sr_item_offsets.resize(items);
-        sr_offsets.resize(17); sr_tiles.resize(17); row_group.resize(rows); group_in.resize(static_cast<size_t>(rows) * ch);
+        sr_offsets.resize(E + 1); sr_tiles.resize(E + 1); row_group.resize(rows); group_in.resize(static_cast<size_t>(rows) * ch);
         {
         Scope math(*this, "router_math:" + p);
-        cu(cudaMemsetAsync(counts.p, 0, 16 * sizeof(int), stream));
+        cu(cudaMemsetAsync(counts.p, 0, E * sizeof(int), stream));
         sr_router<<<items, 512, 0, stream>>>(state, logits.p, w(p + ".router.0.weight"), w(p + ".router.0.bias"),
-            w(p + ".router.1.weight"), w(p + ".router_bias"), pick.p, gates.p, counts.p, width, height, ch, windows);
+            w(p + ".router.1.weight"), w(p + ".router_bias"), pick.p, gates.p, counts.p, width, height, ch, windows, E);
         }
         {
         Scope grouping(*this, "grouping:" + p);
         if (items <= 4096) {
-            sr_compact_map<<<16, 256, 0, stream>>>(pick.p, counts.p, row_group.p, sr_offsets.p, sr_tiles.p,
-                                                  items, width, height, windows);
+            sr_compact_map<<<E, 256, 0, stream>>>(pick.p, counts.p, row_group.p, sr_offsets.p, sr_tiles.p,
+                                                  items, width, height, windows, E);
             group_copy<<<grid(static_cast<size_t>(rows) * ch), 256, 0, stream>>>(state, group_in.p, row_group.p, rows, ch, true);
         } else {
         // Radix sort is asymptotically better for large full-resolution grids.
         // sr_pick also supplies stable unit IDs for this path.
-        cu(cudaMemsetAsync(counts.p, 0, 16 * sizeof(int), stream));
+        cu(cudaMemsetAsync(counts.p, 0, E * sizeof(int), stream));
         sr_pick<<<grid(items), 256, 0, stream>>>(logits.p, w(p + ".router_bias"), pick.p, gates.p,
-            sr_keys0.p, ids0.p, counts.p, items, width, height, windows);
+            sr_keys0.p, ids0.p, counts.p, items, width, height, windows, E, float(E));
         size_t sort_bytes = 0, scan_bytes = 0;
         cu(cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, sr_keys0.p, sr_keys1.p, ids0.p, ids1.p, items, 0, 4, stream));
         sr_sort_temp.resize(sort_bytes);
@@ -547,13 +555,13 @@ struct CudaEngine::Impl {
         cu(cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, sr_lengths_buf.p, sr_item_offsets.p, items, stream));
         sr_scan_temp.resize(scan_bytes);
         cu(cub::DeviceScan::ExclusiveSum(sr_scan_temp.p, scan_bytes, sr_lengths_buf.p, sr_item_offsets.p, items, stream));
-        sr_descriptors<<<1, 32, 0, stream>>>(counts.p, sr_offsets.p, sr_tiles.p);
+        sr_descriptors<<<1, 32, 0, stream>>>(counts.p, sr_offsets.p, sr_tiles.p, E);
         sr_pack<<<items, 128, 0, stream>>>(state, group_in.p, row_group.p, ids1.p, sr_item_offsets.p, width, height, ch, windows);
         }
         }
-        record("logits-" + p, logits.p, static_cast<size_t>(items) * 16);
+        record("logits-" + p, logits.p, static_cast<size_t>(items) * E);
         record("gate-" + p, gates.p, items); record_int("pick-" + p, pick.p, items);
-        record_int("load-" + p, counts.p, 16);
+        record_int("load-" + p, counts.p, E);
         record_int("row-group-" + p, row_group.p, rows);
     }
     void mix(const float* shared, const float* routed, float* out, const std::string& p,
@@ -561,8 +569,8 @@ struct CudaEngine::Impl {
              const float* original = nullptr, const float* aux_scale = nullptr, bool attention_tail = false) {
         Scope profile(*this, "fusion:" + p);
         sr_mix<<<grid(static_cast<size_t>(width) * height * channels), 256, 0, stream>>>
-            (shared, routed, out, row_group.p, pick.p, gates.p, bias, original, aux_scale,
-             width, height, channels, windows, attention_tail);
+            (shared_experts ? shared : nullptr, routed, out, row_group.p, pick.p, gates.p, bias, original, aux_scale,
+             width, height, channels, windows, attention_tail, shared_experts);
     }
     void shared_transition(const float* in, float* out, int width, int height, int K, int N,
                            const std::string& p, bool windows) {
@@ -570,7 +578,7 @@ struct CudaEngine::Impl {
         int rows = width * height;
         shared_route(in, width, height, K, p, windows);
         shared_out.resize(static_cast<size_t>(rows) * N); group_ffn.resize(static_cast<size_t>(rows) * N);
-        shared_mm(in, shared_out.p, rows, K, N, p + ".weight");
+        if (shared_experts) shared_mm(in, shared_out.p, rows, K, N, p + ".weight");
         routed_mm(group_in.p, group_ffn.p, rows, K, N, p + ".weight");
         mix(shared_out.p, group_ffn.p, out, p, width, height, N, windows, w(p + ".bias"));
         record("output-" + p, out, static_cast<size_t>(rows) * N);
@@ -585,20 +593,20 @@ struct CudaEngine::Impl {
         if (ch == 32 && hidden == 32) {
             {
                 Scope profile(*this, "shared_gemm:" + p + ".fused_ffn");
-                sr_ffn32<false><<<(rows + 31) / 32, 256, 0, stream>>>(state, w(p + ".expand"), w(contract), shared_out.p, nullptr, nullptr, rows);
+                if (shared_experts) sr_ffn32<false><<<(rows + 31) / 32, 256, 0, stream>>>(state, w(p + ".expand"), w(contract), shared_out.p, nullptr, nullptr, rows);
             }
             {
                 Scope profile(*this, "routed_gemm:" + p + ".fused_ffn");
-                sr_ffn32<true><<<(rows + 31) / 32 + 15, 256, 0, stream>>>(group_in.p, w(p + ".expand"), w(contract), group_ffn.p, sr_offsets.p, sr_tiles.p, rows);
+                sr_ffn32<true><<<(rows + 31) / 32 + 15, 256, 0, stream>>>(group_in.p, w(p + ".expand"), w(contract), group_ffn.p, sr_offsets.p, sr_tiles.p, rows, routed_experts, shared_experts);
             }
         } else {
         shared_hidden.resize(static_cast<size_t>(rows) * hidden); group_hidden.resize(static_cast<size_t>(rows) * hidden);
-        shared_mm(state, shared_hidden.p, rows, ch, hidden, p + ".expand", true);
+        if (shared_experts) shared_mm(state, shared_hidden.p, rows, ch, hidden, p + ".expand", true);
         routed_mm(group_in.p, group_hidden.p, rows, ch, hidden, p + ".expand", true);
-        shared_mm(shared_hidden.p, shared_out.p, rows, hidden, ch, contract);
+        if (shared_experts) shared_mm(shared_hidden.p, shared_out.p, rows, hidden, ch, contract);
         routed_mm(group_hidden.p, group_ffn.p, rows, hidden, ch, contract);
         }
-        record("ffn_shared-" + p, shared_out.p, static_cast<size_t>(rows) * ch);
+        if (shared_experts) record("ffn_shared-" + p, shared_out.p, static_cast<size_t>(rows) * ch);
         if (debugging) {
             projected.resize(static_cast<size_t>(rows) * ch);
             group_copy<<<grid(static_cast<size_t>(rows) * ch), 256, 0, stream>>>(group_ffn.p, projected.p, row_group.p, rows, ch, false);
@@ -610,7 +618,7 @@ struct CudaEngine::Impl {
             group_res.resize(static_cast<size_t>(rows) * ch); group_qkv.resize(static_cast<size_t>(rows) * ch * 3);
             shared_qkv.resize(static_cast<size_t>(rows) * ch * 3); qkv.resize(static_cast<size_t>(rows) * ch * 3);
             group_copy<<<grid(static_cast<size_t>(rows) * ch), 256, 0, stream>>>(residual.p, group_res.p, row_group.p, rows, ch, true);
-            shared_mm(residual.p, shared_qkv.p, rows, ch, ch * 3, p + ".qkv");
+            if (shared_experts) shared_mm(residual.p, shared_qkv.p, rows, ch, ch * 3, p + ".qkv");
             routed_mm(group_res.p, group_qkv.p, rows, ch, ch * 3, p + ".qkv");
             mix(shared_qkv.p, group_qkv.p, qkv.p, p, width, height, ch * 3, !global);
             record("qkv-" + p, qkv.p, static_cast<size_t>(rows) * ch * 3);
@@ -618,7 +626,7 @@ struct CudaEngine::Impl {
             record("att-" + p, attended.p, static_cast<size_t>(rows) * ch);
             group_att.resize(static_cast<size_t>(rows) * ch);
             group_copy<<<grid(static_cast<size_t>(rows) * ch), 256, 0, stream>>>(attended.p, group_att.p, row_group.p, rows, ch, true);
-            shared_mm(attended.p, shared_out.p, rows, ch, ch, p + ".proj");
+            if (shared_experts) shared_mm(attended.p, shared_out.p, rows, ch, ch, p + ".proj");
             routed_mm(group_att.p, group_ffn.p, rows, ch, ch, p + ".proj");
             mix(shared_out.p, group_ffn.p, state, p, width, height, ch, !global, nullptr, residual.p, w(p + ".aux_attn"), true);
         } else cu(cudaMemcpyAsync(state, residual.p, static_cast<size_t>(rows) * ch * sizeof(float), cudaMemcpyDeviceToDevice, stream));
@@ -659,7 +667,9 @@ struct CudaEngine::Impl {
         } else {
             int win = cfg.window;
             if (win < 1 || win > 8) throw std::runtime_error("CUDA window size must be between 1 and 8");
-            int windows = ((width + cfg.shift_x + win - 1) / win) * ((height + cfg.shift_y + win - 1) / win);
+            int extent = (win - 1) * cfg.dilation + 1;
+            int windows = ((width + cfg.shift_x + extent - 1) / extent) * ((height + cfg.shift_y + extent - 1) / extent);
+            if (cfg.dilation != 1) cu(cudaMemsetAsync(attended.p, 0, size_t(rows) * ch * sizeof(float), stream));
             packed.resize(static_cast<size_t>(windows) * heads * win * win * 96);
             int tasks = windows * heads * win * win;
             auto scale = w(p + ".attention.scale");
@@ -668,26 +678,26 @@ struct CudaEngine::Impl {
             // occupancy of one 32-thread block per slot, without changing sums.
             if (win == 4)
                 window_qkv<4><<<qkv_blocks, 256, 0, stream>>>
-                    (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, scale, tasks);
+                    (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, scale, tasks, cfg.dilation);
             else if (win == 8)
                 window_qkv<8><<<qkv_blocks, 256, 0, stream>>>
-                    (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, scale, tasks);
+                    (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, scale, tasks, cfg.dilation);
             else
                 window_qkv<0><<<qkv_blocks, 256, 0, stream>>>
-                    (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, scale, tasks);
+                    (qkv.p, packed.p, width, height, heads, win, cfg.shift_x, cfg.shift_y, scale, tasks, cfg.dilation);
             // Constant windows keep softmax scores in registers and eliminate
             // dynamic array indexing in the common trained 4x4/8x8 kernels.
             auto prior = w(p + ".attention.prior");
             int shared_bytes = (win * win * 96 + 32) * sizeof(float);
             if (win == 4)
                 window_attend<4><<<windows * heads, 128, shared_bytes, stream>>>
-                    (packed.p, attended.p, prior, width, height, heads, win, cfg.shift_x, cfg.shift_y);
+                    (packed.p, attended.p, prior, width, height, heads, win, cfg.shift_x, cfg.shift_y, cfg.dilation);
             else if (win == 8)
                 window_attend<8><<<windows * heads, 512, shared_bytes, stream>>>
-                    (packed.p, attended.p, prior, width, height, heads, win, cfg.shift_x, cfg.shift_y);
+                    (packed.p, attended.p, prior, width, height, heads, win, cfg.shift_x, cfg.shift_y, cfg.dilation);
             else
                 window_attend<0><<<windows * heads, 128, shared_bytes, stream>>>
-                    (packed.p, attended.p, prior, width, height, heads, win, cfg.shift_x, cfg.shift_y);
+                    (packed.p, attended.p, prior, width, height, heads, win, cfg.shift_x, cfg.shift_y, cfg.dilation);
         }
     }
     int route(const float* state, int width, int height, int ch, int E, const std::string& p, bool windows) {
@@ -797,7 +807,111 @@ struct CudaEngine::Impl {
         } else cu(cudaMemcpyAsync(state, residual.p, static_cast<size_t>(rows) * ch * sizeof(float), cudaMemcpyDeviceToDevice, stream));
         record("blk-" + p, state, static_cast<size_t>(rows) * ch);
     }
+    void cnn_conv(const float* in, float* out, int width, int height, const std::string& p) {
+        Scope profile(*this, "convolution:" + p);
+        int O = dim(p + ".weight", 0), I = dim(p + ".weight", 1), k = dim(p + ".weight", 2);
+        int rows = width * height, K = I * k * k, tile = k == 1 ? rows : 4096;
+        if (k != 1) cnn_columns.resize(size_t(std::min(tile, rows)) * K);
+        const float one = 1, zero = 0;
+        for (int start = 0; start < rows; start += tile) {
+            int count = std::min(tile, rows - start);
+            const float* columns = in;
+            if (k != 1) {
+                cnn_im2col<<<grid(size_t(count) * K), 256, 0, stream>>>(in, cnn_columns.p, start, count, width, height, I, k);
+                columns = cnn_columns.p;
+            }
+            blas(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, O, count, K, &one,
+                            w("cnn:" + p + ".weight"), O, columns, K, &zero, out + size_t(start) * O, O));
+        }
+        epilogue<<<grid(size_t(rows) * O), 256, 0, stream>>>(out, rows, O, w(p + ".bias"), false, nullptr, nullptr);
+    }
+    void cnn_norm(const float* in, float* out, int rows, int channels, const std::string& p, bool act) {
+        Scope profile(*this, "group_norm:" + p);
+        cnn_group_norm<<<8, 256, 0, stream>>>(in, out, rows, channels, w(p + ".weight"), w(p + ".bias"), act);
+    }
+    void cnn_block(const std::string& p, int width, int height) {
+        Scope profile(*this, "block:" + p);
+        int rows = width * height, ch = dim(p + ".conv.weight", 0), h = dim(p + ".ffn.bank.0.0.weight", 0);
+        size_t size = size_t(rows) * ch;
+        cnn_normed.resize(size); cnn_conv_out.resize(size);
+        cnn_norm(x.p, cnn_normed.p, rows, ch, p + ".norm1", true);
+        cnn_conv(cnn_normed.p, cnn_conv_out.p, width, height, p + ".conv");
+        cnn_add<<<grid(size), 256, 0, stream>>>(x.p, cnn_conv_out.p, size);
+        cnn_norm(x.p, cnn_normed.p, rows, ch, p + ".norm2", false);
+        logits.resize(size_t(rows) * 8);
+        cnn_conv(cnn_normed.p, logits.p, width, height, p + ".ffn.router");
+        pick.resize(rows); gates.resize(rows); counts.resize(8); ids0.resize(rows); ids1.resize(rows);
+        sr_keys0.resize(rows); sr_keys1.resize(rows); sr_offsets.resize(9); sr_tiles.resize(9);
+        sr_lengths_buf.resize(rows); sr_item_offsets.resize(rows); row_group.resize(rows); group_in.resize(size);
+        group_hidden.resize(size_t(rows) * h); group_ffn.resize(size);
+        cu(cudaMemsetAsync(counts.p, 0, 8 * sizeof(int), stream));
+        sr_pick<<<grid(rows), 256, 0, stream>>>(logits.p, nullptr, pick.p, gates.p, sr_keys0.p, ids0.p, counts.p, rows, rows, 1, false, 8, 1.f, true);
+        if (rows <= 4096) {
+            sr_compact_map<<<8, 256, 0, stream>>>(pick.p, counts.p, row_group.p, sr_offsets.p, sr_tiles.p, rows, rows, 1, false, 8);
+        } else {
+            size_t sort_bytes = 0;
+            cu(cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, sr_keys0.p, sr_keys1.p, ids0.p, ids1.p, rows, 0, 3, stream));
+            sr_sort_temp.resize(sort_bytes);
+            cu(cub::DeviceRadixSort::SortPairs(sr_sort_temp.p, sort_bytes, sr_keys0.p, sr_keys1.p, ids0.p, ids1.p, rows, 0, 3, stream));
+            // Pixel routes have unit length; sorted positions already are offsets.
+            sr_lengths<<<grid(rows), 256, 0, stream>>>(ids1.p, sr_lengths_buf.p, rows, rows, 1, false);
+            size_t scan_bytes = 0;
+            cu(cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, sr_lengths_buf.p, sr_item_offsets.p, rows, stream));
+            sr_scan_temp.resize(scan_bytes);
+            cu(cub::DeviceScan::ExclusiveSum(sr_scan_temp.p, scan_bytes, sr_lengths_buf.p, sr_item_offsets.p, rows, stream));
+            sr_descriptors<<<1, 32, 0, stream>>>(counts.p, sr_offsets.p, sr_tiles.p, 8);
+            sr_pack<<<rows, 128, 0, stream>>>(cnn_normed.p, group_in.p, row_group.p, ids1.p, sr_item_offsets.p, rows, 1, ch, false);
+        }
+        if (rows <= 4096) group_copy<<<grid(size), 256, 0, stream>>>(cnn_normed.p, group_in.p, row_group.p, rows, ch, true);
+        const std::string f = "cnn:" + p + ".ffn";
+        dim3 expand_grid((rows + 31) / 32 + 7, (h + 63) / 64), narrow_grid((rows + 31) / 32 + 7, (ch + 63) / 64);
+        sr_grouped_gemm<64><<<expand_grid, 256, 0, stream>>>(group_in.p, w(f + ".expand"), group_hidden.p, sr_offsets.p, sr_tiles.p, ch, h, true, 8, 0, w(f + ".expand_bias"));
+        sr_grouped_gemm<64><<<narrow_grid, 256, 0, stream>>>(group_hidden.p, w(f + ".narrow"), group_ffn.p, sr_offsets.p, sr_tiles.p, h, ch, false, 8, 0, w(f + ".narrow_bias"));
+        cnn_ffn_add<<<grid(size), 256, 0, stream>>>(x.p, group_ffn.p, row_group.p, gates.p, w(p + ".aux"), rows, ch);
+        record("blk-" + p, x.p, size); record("logits-" + p + ".ffn", logits.p, size_t(rows) * 8);
+        record("gate-" + p + ".ffn", gates.p, rows); record_int("pick-" + p + ".ffn", pick.p, rows);
+    }
+    void run_cnn() {
+        profile_cursor = 0;
+        const char* names[] = {"full", "d0", "d1", "d2", "d3", "d4", "d5"};
+        int widths[7], heights[7], rows[7]; size_t max_state = 0, max_up = 0;
+        for (int i = 0; i < 7; ++i) {
+            widths[i] = i ? g.levels[i-1].width : g.full_width;
+            heights[i] = i ? g.levels[i-1].height : g.full_height;
+            rows[i] = widths[i] * heights[i];
+            max_state = std::max(max_state, size_t(rows[i]) * cnn_channels[i]);
+            if (i < 6) { skip[i].resize(size_t(rows[i]) * cnn_channels[i]); max_up = std::max(max_up, size_t(rows[i]) * cnn_channels[i+1]); }
+        }
+        x.resize(max_state); up.resize(std::max(max_state, max_up));
+        cnn_conv(features.p, x.p, widths[0], heights[0], "stem.0"); cnn_norm(x.p, x.p, rows[0], cnn_channels[0], "stem.1", true);
+        for (int i = 0; i < 7; ++i) {
+            if (i) {
+                cnn_resize<<<grid(size_t(rows[i]) * cnn_channels[i-1]), 256, 0, stream>>>(x.p, up.p, widths[i-1], heights[i-1], widths[i], heights[i], cnn_channels[i-1]);
+                cnn_conv(up.p, x.p, widths[i], heights[i], std::string("enc_proj.") + names[i] + ".0");
+                cnn_norm(x.p, x.p, rows[i], cnn_channels[i], std::string("enc_proj.") + names[i] + ".1", true);
+            }
+            const auto& bs = blocks[0].at(names[i]);
+            for (size_t j = 0; j < bs.size(); ++j) cnn_block(std::string("enc.") + names[i] + "." + std::to_string(j), widths[i], heights[i]);
+            record(i == 6 ? "s-vit" : std::string("s-enc-") + names[i], x.p, size_t(rows[i]) * cnn_channels[i]);
+            if (i < 6) cu(cudaMemcpyAsync(skip[i].p, x.p, size_t(rows[i]) * cnn_channels[i] * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        }
+        for (int i = 5; i >= 0; --i) {
+            int ci = cnn_channels[i+1], c = cnn_channels[i];
+            cnn_resize<<<grid(size_t(rows[i]) * ci), 256, 0, stream>>>(x.p, up.p, widths[i+1], heights[i+1], widths[i], heights[i], ci);
+            cnn_cat.resize(size_t(rows[i]) * (ci + c));
+            cnn_concat<<<grid(size_t(rows[i]) * (ci + c)), 256, 0, stream>>>(up.p, skip[i].p, cnn_cat.p, rows[i], ci, c);
+            cnn_conv(cnn_cat.p, x.p, widths[i], heights[i], std::string("merge.") + names[i] + ".0");
+            cnn_norm(x.p, x.p, rows[i], c, std::string("merge.") + names[i] + ".1", true);
+            const auto& bs = blocks[1].at(names[i]);
+            for (size_t j = 0; j < bs.size(); ++j) cnn_block(std::string("dec.") + names[i] + "." + std::to_string(j), widths[i], heights[i]);
+            record(std::string("s-dec-") + names[i], x.p, size_t(rows[i]) * c);
+        }
+        cnn_norm(x.p, x.p, rows[0], cnn_channels[0], "head_norm", true);
+        cnn_conv(x.p, head.p, widths[0], heights[0], "head"); record("s-head", head.p, size_t(rows[0]) * 4);
+        cu(cudaGetLastError());
+    }
     void run() {
+        if (cnn) { run_cnn(); return; }
         profile_cursor = 0;
         const char* names[] = {"full", "d0", "d1", "d2", "d3", "d4"};
         int widths[6], heights[6], channels[6], rows[6];
@@ -871,7 +985,9 @@ CudaEngine::CudaEngine(const Engine& model, int device) : impl_(std::make_unique
     cudaDeviceProp properties{}; cu(cudaGetDeviceProperties(&properties, device));
     p.name = properties.name; p.g = model.geom_; p.vit = model.vit_blocks_;
     p.blocks[0] = model.blocks_[0]; p.blocks[1] = model.blocks_[1];
-    p.shared_routed = !p.vit.empty() && p.vit[0].kind == "shared_routed_moe";
+    p.shared_routed = model.shared_routed_; p.cnn = model.cnn_;
+    p.shared_experts = model.shared_experts_; p.routed_experts = model.routed_experts_;
+    std::copy_n(model.cnn_channels_, 7, p.cnn_channels);
     cu(cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking));
     cu(cudaEventCreate(&p.start)); cu(cudaEventCreate(&p.stop));
     for (auto& event : p.io_events) cu(cudaEventCreate(&event));
@@ -889,6 +1005,12 @@ CudaEngine::CudaEngine(const Engine& model, int device) : impl_(std::make_unique
         auto buffer = std::make_unique<Buffer<float>>(); buffer->resize(n);
         cu(cudaMemcpyAsync(buffer->p, kv.second.data, n * sizeof(float), cudaMemcpyHostToDevice, p.stream));
         p.weights.emplace(kv.first, std::move(buffer)); p.shapes.emplace(kv.first, kv.second.shape);
+    }
+    for (const auto& kv : model.cnn_weights_) {
+        const std::string key = "cnn:" + kv.first;
+        auto buffer = std::make_unique<Buffer<float>>(); buffer->resize(kv.second.size());
+        cu(cudaMemcpyAsync(buffer->p, kv.second.data(), kv.second.size() * sizeof(float), cudaMemcpyHostToDevice, p.stream));
+        p.weights.emplace(key, std::move(buffer));
     }
     p.features.resize(static_cast<size_t>(p.g.full_rows) * 16);
     p.head.resize(static_cast<size_t>(p.g.full_rows) * 4);

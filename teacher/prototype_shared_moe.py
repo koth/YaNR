@@ -53,7 +53,7 @@ def main():
     write_package(model, model.state_dict(), args.output, shape_path,
                   extra=dict(untrainedPrototype=True, initializationSeed=args.seed, biasSource='zero-initialized',
                              source=provenance(shape_path, args.teacher_weights), generator='teacher/prototype_shared_moe.py'))
-    audit = audit_package(args.output, verify=True)
+    audit = audit_package(args.output, verify=True, prototype_budget=True)
     if not audit['budget']['pass']:
         raise AssertionError(audit['budget'])
     loaded, _ = load_student_package(args.output, 320, 320, args.device)

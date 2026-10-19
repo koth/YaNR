@@ -48,8 +48,7 @@ def convert_student(ckpt_path, out, stages, size=512, shape_json=None, student_s
     """
     import torch
     from nr_geometry import geometry_from_valid
-    from nr_package import write_package
-    from nr_student import StudentNetwork, load_student_shape
+    from nr_package import build_student, write_package
 
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     use_ema = student_state == 'ema' and 'ema' in ckpt
@@ -60,10 +59,9 @@ def convert_student(ckpt_path, out, stages, size=512, shape_json=None, student_s
     if not shape_path or not os.path.isfile(shape_path):
         raise SystemExit(f'shape json not found: {shape_path!r} (pass --shape-json)')
 
-    shape = load_student_shape(shape_path)
     g = geometry_from_valid(size, size)
     torch.manual_seed(0)
-    model = StudentNetwork(shape, g).eval()
+    model = build_student(shape_path, g).eval()
     model.load_state_dict(state)                            # strict:形状与权重必须一致
 
     extra = {'trainConfig': {k: v for k, v in cfg.items()

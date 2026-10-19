@@ -128,6 +128,52 @@ void fixture(int width, int height, bool windows, int K, int N) {
     cudaGraphExecDestroy(executable); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
 }
 
+// Current routed-only banks and CNN's biased pixel FFNs share packing/GEMM,
+// but deliberately use different gates. Exercise ties, controller bias,
+// empty experts, and K/N tails independently of model argmax sensitivity.
+void modern_fixture(int E, int K, int N, bool cnn) {
+    const int rows = 117;
+    std::vector<float> input(rows * K), bank(E * K * N), bias(E * N), z(rows * E), rb(E);
+    for (int i = 0; i < rows * K; ++i) input[i] = (i * 17 % 127 - 63) / 128.f;
+    for (int i = 0; i < E * K * N; ++i) bank[i] = (i * 19 % 131 - 65) / 512.f;
+    for (int i = 0; i < E * N; ++i) bias[i] = (i * 7 % 17 - 8) / 32.f;
+    Device<float> dx(rows * K), dw(E * K * N), db(E * N), dz(rows * E), drb(E), gates(rows), packed(rows * K), output(rows * N);
+    Device<int> pick(rows), keys(rows), ids(rows), counts(E), map(rows), offsets(E + 1), tiles(E + 1);
+    dx.upload(input); dw.upload(bank); db.upload(bias);
+    for (int mode = 0; mode < 6; ++mode) {
+        std::fill(rb.begin(), rb.end(), 0.f);
+        if (mode == 3 && !cnn) rb[E - 1] = 2;
+        for (int i = 0; i < rows; ++i) for (int e = 0; e < E; ++e)
+            z[i * E + e] = mode == 0 || mode == 3 ? 0.f : e == (mode == 1 ? E - 1 : i % E) ? 1.f : -2.f;
+        if (mode == 4) for (int i = 0; i < rows; ++i) z[i * E + (i + 1) % E] = 1.f - 1e-6f;
+        if (mode == 5) for (int i = 0; i < rows; ++i) for (int e = 0; e < E; ++e) z[i * E + e] = e == E - 1 ? 0.f : -1e-8f;
+        dz.upload(z); drb.upload(rb); check(cudaMemset(counts.p, 0, E * sizeof(int)));
+        sr_pick<<<1, 256>>>(dz.p, cnn ? nullptr : drb.p, pick.p, gates.p, keys.p, ids.p, counts.p, rows, rows, 1, false, E, cnn ? 1.f : float(E), cnn);
+        sr_compact_map<<<E, 256>>>(pick.p, counts.p, map.p, offsets.p, tiles.p, rows, rows, 1, false, E);
+        gather_rows<<<(rows * K + 255) / 256, 256>>>(dx.p, packed.p, map.p, rows, K);
+        dim3 tasks((rows + 31) / 32 + E - 1, (N + 63) / 64);
+        sr_grouped_gemm<64><<<tasks, 256>>>(packed.p, dw.p, output.p, offsets.p, tiles.p, K, N, cnn, E, 0, cnn ? db.p : nullptr);
+        check(cudaDeviceSynchronize());
+        auto picks = pick.download(), mapping = map.download(); auto actual = output.download(), actual_gates = gates.download();
+        for (int i = 0; i < rows; ++i) {
+            int best = 0;
+            for (int e = 1; e < E; ++e) if (z[i * E + e] + rb[e] > z[i * E + best] + rb[best]) best = e;
+            if (mode == 5 && cnn) best = 0; // softmax rounds every probability to 1/E
+            if (picks[i] != best) throw std::runtime_error("modern pick/tie mismatch");
+            double den = 0; for (int e = 0; e < E; ++e) den += std::exp(double(z[i * E + e]));
+            float gate = float((cnn ? 1 : E) * std::exp(double(z[i * E + best])) / den);
+            if (std::abs(gate - actual_gates[i]) > 2e-6f) throw std::runtime_error("modern gate mismatch");
+            for (int c = 0; c < N; ++c) {
+                float value = 0;
+                for (int k = 0; k < K; ++k) value = std::fma(input[i * K + k], bank[(best * K + k) * N + c], value);
+                if (cnn) { value += bias[best * N + c]; value /= 1.f + std::exp(-value); }
+                if (std::abs(value - actual[mapping[i] * N + c]) > 3e-7f) throw std::runtime_error("modern GEMM/bias/activation mismatch");
+            }
+        }
+    }
+    std::printf("PASS modern experts=%d K=%d N=%d cnn=%d\n", E, K, N, cnn);
+}
+
 int main(int argc, char**) {
     if (argc > 1) repetitions = 1; // --quick for compute-sanitizer, correctness unchanged
     try {
@@ -136,6 +182,9 @@ int main(int argc, char**) {
         fixture(320, 320, true, 32, 32);
         fixture(20, 20, true, 192, 192);
         fixture(100, 1, false, 384, 384);
+        modern_fixture(7, 32, 32, false);
+        modern_fixture(8, 24, 13, true);
+        modern_fixture(8, 13, 24, true);
         return 0;
     } catch (const std::exception& error) { std::fprintf(stderr, "%s\n", error.what()); return 1; }
 }

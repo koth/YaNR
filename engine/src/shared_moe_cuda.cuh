@@ -2,7 +2,7 @@
 // anonymous namespace. No capacity quotas and no CPU group descriptors.
 __global__ void sr_router(const float* state, float* logits, const float* gamma, const float* beta,
                          const float* weight, const float* bias, int* pick, float* gates, int* counts,
-                         int width, int height, int channels, bool windows) {
+                         int width, int height, int channels, bool windows, int experts = 16) {
     __shared__ float pooled[1024];
     __shared__ float normalized[1024];
     __shared__ float scores[16];
@@ -33,19 +33,19 @@ __global__ void sr_router(const float* state, float* logits, const float* gamma,
     __syncthreads();
     int e = tid / 32, lane = tid % 32;
     float sum = 0;
-    for (int c = lane; c < channels; c += 32)
+    if (e < experts) for (int c = lane; c < channels; c += 32)
         sum = __fmaf_rn(normalized[c], weight[e * channels + c], sum);
     for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffff, sum, d);
-    if (!lane) scores[e] = logits[item * 16 + e] = sum;
+    if (!lane && e < experts) scores[e] = logits[item * experts + e] = sum;
     __syncthreads();
     if (!tid) {
         int best = 0; float mx = scores[0], den = 0;
-        for (int j = 1; j < 16; ++j) {
+        for (int j = 1; j < experts; ++j) {
             if (scores[j] + bias[j] > scores[best] + bias[best]) best = j;
             mx = fmaxf(mx, scores[j]);
         }
-        for (int j = 0; j < 16; ++j) den += expf(scores[j] - mx);
-        pick[item] = best; gates[item] = 16 * expf(scores[best] - mx) / den;
+        for (int j = 0; j < experts; ++j) den += expf(scores[j] - mx);
+        pick[item] = best; gates[item] = experts * expf(scores[best] - mx) / den;
         int rows = windows ? min(8, width - item % nw * 8) * min(8, height - item / nw * 8) : 1;
         atomicAdd(counts + best, rows);
     }
@@ -55,7 +55,7 @@ __global__ void sr_router(const float* state, float* logits, const float* gamma,
 // Counts are actual field rows. Avoid radix sort/scan launch chains on small
 // deep grids, and never stage a largest-group-sized capacity per expert.
 __global__ void sr_compact_map(const int* pick, const int* counts, int* row_group,
-                              int* offsets, int* tiles, int items, int width, int height, bool windows) {
+                              int* offsets, int* tiles, int items, int width, int height, bool windows, int experts = 16) {
     using Scan = cub::BlockScan<int, 256>;
     __shared__ typename Scan::TempStorage storage;
     __shared__ int running, base;
@@ -67,7 +67,7 @@ __global__ void sr_compact_map(const int* pick, const int* counts, int* row_grou
         int t = 0;
         for (int j = 0; j < e; ++j) t += (counts[j] + 31) / 32;
         tiles[e] = t;
-        if (e == 15) { offsets[16] = base + counts[e]; tiles[16] = t + (counts[e] + 31) / 32; }
+        if (e == experts - 1) { offsets[experts] = base + counts[e]; tiles[experts] = t + (counts[e] + 31) / 32; }
     }
     __syncthreads();
     for (int i = 0; i < items; i += 256) {
@@ -91,19 +91,28 @@ __global__ void sr_compact_map(const int* pick, const int* counts, int* row_grou
 }
 __global__ void sr_pick(const float* logits, const float* bias, int* pick,
                        float* gates, int* keys, int* ids, int* counts,
-                       int items, int width, int height, bool windows) {
+                       int items, int width, int height, bool windows, int experts = 16, float gate_scale = 16, bool probability_pick = false) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= items) return;
     int best = 0;
-    float mx = logits[i * 16];
-    for (int e = 1; e < 16; ++e) {
-        if (logits[i * 16 + e] + bias[e] > logits[i * 16 + best] + bias[best]) best = e;
-        mx = fmaxf(mx, logits[i * 16 + e]);
+    float mx = logits[i * experts];
+    for (int e = 1; e < experts; ++e) {
+        if (logits[i * experts + e] + (bias ? bias[e] : 0) > logits[i * experts + best] + (bias ? bias[best] : 0)) best = e;
+        mx = fmaxf(mx, logits[i * experts + e]);
     }
     float den = 0;
-    for (int e = 0; e < 16; ++e) den += expf(logits[i * 16 + e] - mx);
+    for (int e = 0; e < experts; ++e) den += expf(logits[i * experts + e] - mx);
+    // CNN selects argmax AFTER FP32 softmax. Near-equal logits can round to
+    // identical probabilities, in which case the lowest index must win.
+    if (probability_pick) {
+        best = 0; float maximum = expf(logits[i * experts] - mx) / den;
+        for (int e = 1; e < experts; ++e) {
+            float probability = expf(logits[i * experts + e] - mx) / den;
+            if (probability > maximum) { best = e; maximum = probability; }
+        }
+    }
     pick[i] = best; keys[i] = best; ids[i] = i;
-    gates[i] = 16 * expf(logits[i * 16 + best] - mx) / den;
+    gates[i] = gate_scale * expf(logits[i * experts + best] - mx) / den;
     int nw = (width + 7) / 8;
     int rows = windows ? min(8, width - i % nw * 8) * min(8, height - i / nw * 8) : 1;
     atomicAdd(counts + best, rows);
@@ -116,10 +125,10 @@ __global__ void sr_lengths(const int* ids, int* lengths, int items, int width, i
     lengths[i] = windows ? min(8, width - id % nw * 8) * min(8, height - id / nw * 8) : 1;
 }
 
-__global__ void sr_descriptors(const int* counts, int* offsets, int* tiles) {
+__global__ void sr_descriptors(const int* counts, int* offsets, int* tiles, int experts = 16) {
     if (threadIdx.x) return;
     offsets[0] = 0; tiles[0] = 0;
-    for (int e = 0; e < 16; ++e) {
+    for (int e = 0; e < experts; ++e) {
         offsets[e + 1] = offsets[e] + counts[e];
         tiles[e + 1] = tiles[e] + (counts[e] + 31) / 32;
     }
@@ -148,10 +157,10 @@ __global__ void sr_pack(const float* state, float* grouped, int* row_group,
 // tile masking adds arithmetic only, never padding rows in packed storage.
 template<int BN> __global__ void sr_grouped_gemm(const float* in, const float* bank, float* out,
                               const int* offsets, const int* tiles,
-                              int K, int N, bool act) {
+                              int K, int N, bool act, int experts = 16, int bank_offset = 1, const float* bias = nullptr) {
     int task = blockIdx.x, e = 0;
-    while (e < 16 && task >= tiles[e + 1]) ++e;
-    if (e == 16) return;
+    while (e < experts && task >= tiles[e + 1]) ++e;
+    if (e == experts) return;
     int start = offsets[e], count = offsets[e + 1] - start;
     int tile_m = (task - tiles[e]) * 32, tile_n = blockIdx.y * BN;
     int tid = threadIdx.x, r = tid / (BN / 4), c = (tid % (BN / 4)) * 4;
@@ -159,15 +168,15 @@ template<int BN> __global__ void sr_grouped_gemm(const float* in, const float* b
     __shared__ float a[32][16];
     __shared__ float b[16][BN];
     float acc[RPT][4] = {};
-    const float* weight = bank + static_cast<size_t>(e + 1) * K * N;
+    const float* weight = bank + static_cast<size_t>(e + bank_offset) * K * N;
     for (int k0 = 0; k0 < K; k0 += 16) {
         for (int j = tid; j < 32 * 16; j += 256) {
             int mr = j / 16, kc = j % 16;
-            a[mr][kc] = tile_m + mr < count ? in[static_cast<size_t>(start + tile_m + mr) * K + k0 + kc] : 0;
+            a[mr][kc] = tile_m + mr < count && k0 + kc < K ? in[static_cast<size_t>(start + tile_m + mr) * K + k0 + kc] : 0;
         }
         for (int j = tid; j < 16 * BN; j += 256) {
             int kr = j / BN, nc = j % BN;
-            b[kr][nc] = tile_n + nc < N ? weight[static_cast<size_t>(k0 + kr) * N + tile_n + nc] : 0;
+            b[kr][nc] = tile_n + nc < N && k0 + kr < K ? weight[static_cast<size_t>(k0 + kr) * N + tile_n + nc] : 0;
         }
         __syncthreads();
         #pragma unroll
@@ -188,6 +197,7 @@ template<int BN> __global__ void sr_grouped_gemm(const float* in, const float* b
             int nc = tile_n + c + j;
             if (mr < count && nc < N) {
                 float value = acc[i][j];
+                if (bias) value += bias[(e + bank_offset) * N + nc];
                 if (act) value = value / (1 + expf(-value));
                 out[static_cast<size_t>(start + mr) * N + nc] = value;
             }
@@ -198,14 +208,14 @@ template<int BN> __global__ void sr_grouped_gemm(const float* in, const float* b
 __global__ void sr_mix(const float* shared, const float* routed, float* out,
                       const int* row_group, const int* pick, const float* gates,
                       const float* bias, const float* original, const float* aux,
-                      int width, int height, int channels, bool windows, bool attention) {
+                      int width, int height, int channels, bool windows, bool attention, int bank_offset = 1) {
     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= static_cast<size_t>(width) * height * channels) return;
     int row = i / channels, c = i % channels;
     int item = windows ? row / width / 8 * ((width + 7) / 8) + row % width / 8 : row;
-    float s = shared[i] + (bias ? bias[c] : 0);
+    float s = shared ? shared[i] + (bias ? bias[c] : 0) : 0;
     float r = routed[static_cast<size_t>(row_group[row]) * channels + c] +
-              (bias ? bias[(pick[item] + 1) * channels + c] : 0);
+              (bias ? bias[(pick[item] + bank_offset) * channels + c] : 0);
     float value = (s + gates[item] * r) * 0.5f;
     if (original) value = attention ? original[i] + aux[c] * value : original[i] * aux[c] + value;
     out[i] = value;
@@ -221,14 +231,14 @@ __global__ void sr_int_float(const int* input, float* output, int n) {
 // Shared branch uses all field rows directly; routed branch uses compact rows.
 template<bool ROUTED> __global__ void sr_ffn32(const float* in, const float* expand,
                                             const float* contract, float* out,
-                                            const int* offsets, const int* tiles, int rows) {
+                                            const int* offsets, const int* tiles, int rows, int experts = 16, int bank_offset = 1) {
     int task = blockIdx.x, e = 0, start = 0, count = rows, tile = task * 32;
     if (ROUTED) {
-        while (e < 16 && task >= tiles[e + 1]) ++e;
-        if (e == 16) return;
+        while (e < experts && task >= tiles[e + 1]) ++e;
+        if (e == experts) return;
         start = offsets[e]; count = offsets[e + 1] - start;
         tile = (task - tiles[e]) * 32;
-        ++e;
+        e += bank_offset;
     }
     __shared__ float a[32][32], b[32][32];
     int tid = threadIdx.x, row = tid / 8, col = tid % 8 * 4;

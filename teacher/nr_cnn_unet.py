@@ -28,7 +28,7 @@ def level_size(g, name):
 
 
 def load_cnn_shape(path):
-    with open(path) as fh:
+    with open(path, encoding='utf-8') as fh:
         cfg = json.load(fh)
     for name in ORDER:
         if name not in cfg['channels']:

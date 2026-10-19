@@ -20,8 +20,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nr_geometry import geometry_from_valid                  # noqa: E402
-from nr_package import load_student_package, read_package   # noqa: E402
-from nr_student import StudentNetwork, load_student_shape   # noqa: E402
+from nr_package import build_student, load_student_package, read_package   # noqa: E402
 from run_image import build_features                        # noqa: E402
 
 
@@ -45,7 +44,7 @@ def main():
     if not shape_path or not os.path.isfile(shape_path):
         raise SystemExit(f'shape json not found: {shape_path!r}(pass --shape)')
     torch.manual_seed(0)
-    ref_model = StudentNetwork(load_student_shape(shape_path), g).to(device).eval()
+    ref_model = build_student(shape_path, g, device).eval()
     ref_model.load_state_dict(ref_state)
 
     # ---- 包:sha256 校验 + 权重往返。

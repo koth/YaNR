@@ -543,8 +543,9 @@ void Engine::window_attention(float* qkv, float* out, int rows, int width, int h
     const int slots = win * win;
     const float* prior = w(prefix + ".attention.prior");
     const float* scale = w(prefix + ".attention.scale");
-    const int windows_x = (width + cfg.shift_x + win - 1) / win;
-    const int windows_y = (height + cfg.shift_y + win - 1) / win;
+    const int extent = (win - 1) * cfg.dilation + 1;
+    const int windows_x = (width + cfg.shift_x + extent - 1) / extent;
+    const int windows_y = (height + cfg.shift_y + extent - 1) / extent;
     const int windows = windows_x * windows_y;
 
 #pragma omp parallel
@@ -555,9 +556,9 @@ void Engine::window_attention(float* qkv, float* out, int rows, int width, int h
 #pragma omp for schedule(static)
         for (int widx = 0; widx < windows; widx++) {
             int wx = widx / windows_y, wy = widx % windows_y;
-            int ox = wx * win - cfg.shift_x, oy = wy * win - cfg.shift_y;
+            int ox = wx * extent - cfg.shift_x, oy = wy * extent - cfg.shift_y;
             for (int s = 0; s < slots; s++) {
-                int fx = ox + (s % win), fy = oy + (s / win);
+                int fx = ox + (s % win) * cfg.dilation, fy = oy + (s / win) * cfg.dilation;
                 valid[s] = (fx >= 0 && fx < width && fy >= 0 && fy < height) ? 1 : 0;
                 index[s] = valid[s] ? fy * width + fx : 0;
             }
@@ -659,6 +660,7 @@ void Engine::ffn_window_block(const BlockCfg& cfg, const std::string& prefix, fl
 
 void Engine::ffn_block(const BlockCfg& cfg, const std::string& prefix, float* state,
                        int rows, int width, int height) const {
+    if (cfg.kind == "shared_routed_moe") { routed_block(cfg, prefix, state, width, height, false); return; }
     ProfTimer block_tm(nullptr, prof_on_ ? &layer_prof_["block:" + prefix] : nullptr);
     if (cfg.kind == "moe") {
         moe_block(cfg, prefix, state, rows, width, height);
@@ -820,6 +822,7 @@ void Engine::ffn_block(const BlockCfg& cfg, const std::string& prefix, float* st
 
 void Engine::vit_block(const BlockCfg& cfg, const std::string& prefix, float* state,
                        int tokens, int padded) const {
+    if (cfg.kind == "shared_routed_moe") { routed_block(cfg, prefix, state, tokens, 1, true); return; }
     ProfTimer block_tm(nullptr, prof_on_ ? &layer_prof_["block:" + prefix] : nullptr);
     if (cfg.kind == "moe_vit") {
         moe_vit_block(cfg, prefix, state, tokens, padded);
@@ -993,6 +996,13 @@ void Engine::moe_vit_block(const BlockCfg& cfg, const std::string& prefix, float
 }
 
 void Engine::forward(const float* features, float* head) {
+    if (cnn_) { cnn_forward(features, head); return; }
+    if (shared_routed_ && int8_) throw std::runtime_error("routed inference requires FP32; disable NR_INT8");
+    auto transition = [&](const float* in, int rows, int K, int N, const std::string& p,
+                          float* out, int width, int height, bool windows) {
+        if (shared_routed_) routed_transition(in, out, width, height, K, N, p, windows);
+        else linear_bias(in, rows, K, N, p, out);
+    };
     const char* order[6] = {"full", "d0", "d1", "d2", "d3", "d4"};
     int ch_full = dim("adapter.weight", 0);
     int dims[6][2], rows[6], chs[6];
@@ -1033,7 +1043,7 @@ void Engine::forward(const float* features, float* head) {
             skip[i].swap(x);                       // 跳连零拷贝:x 复用旧 skip 缓冲
             std::string tn = std::string("enc_trans.") + order[i + 1];
             x.resize((size_t)rows[i + 1] * chs[i + 1]);
-            linear_bias(pooled.data(), rows[i + 1], ch, chs[i + 1], tn, x.data());
+            transition(pooled.data(), rows[i + 1], ch, chs[i + 1], tn, x.data(), dims[i+1][0], dims[i+1][1], true);
             if (debug_on_) debug_["trans-" + std::string(order[i + 1])] = x.snapshot();
         } else {
             skip[i].swap(x);
@@ -1044,13 +1054,13 @@ void Engine::forward(const float* features, float* head) {
     int d5w = geom_.levels[5].width, d5h = geom_.levels[5].height;
     int rows5 = d5w * d5h;
     int ch4 = chs[5];
-    int vit_ch = dim("vit_in.weight", 0);
+    int vit_ch = dim("vit_in.weight", shared_routed_ ? 2 : 0);
     FloatBuffer& pooled = sc_.pooled;
     pooled.resize((size_t)rows5 * ch4);
     box_downsample(skip[5].data(), pooled.data(), dims[5][0], dims[5][1], d5w, d5h, ch4);
     FloatBuffer& vstate = sc_.vstate;
     vstate.resize((size_t)rows5 * vit_ch);
-    linear_bias(pooled.data(), rows5, ch4, vit_ch, "vit_in", vstate.data());
+    transition(pooled.data(), rows5, ch4, vit_ch, "vit_in", vstate.data(), rows5, 1, false);
     if (debug_on_) debug_["trans-vit"] = vstate.snapshot();
     for (size_t j = 0; j < vit_blocks_.size(); j++) {
         std::string p = "vit_blocks." + std::to_string(j);
@@ -1058,7 +1068,7 @@ void Engine::forward(const float* features, float* head) {
     }
     if (debug_on_) debug_["s-vit"] = vstate.snapshot();
     x.resize((size_t)rows5 * ch4);
-    linear_bias(vstate.data(), rows5, vit_ch, ch4, "vit_out", x.data());
+    transition(vstate.data(), rows5, vit_ch, ch4, "vit_out", x.data(), rows5, 1, false);
 
     // ---- 解码:d5 -> d4 -> d3 -> d2 -> d1 -> d0 -> full
     const char* dec[5] = {"d4", "d3", "d2", "d1", "d0"};
@@ -1074,7 +1084,7 @@ void Engine::forward(const float* features, float* head) {
             // 前 prev_rows 行恰好等价、垃圾行无人消费才没炸;这里改成 torch 的行数。
             std::string tn = std::string("dec_trans.") + name;
             up.resize((size_t)prev_rows * ch);
-            linear_bias(x.data(), prev_rows, chs[idx + 1], ch, tn, up.data());
+            transition(x.data(), prev_rows, chs[idx + 1], ch, tn, up.data(), prev_w, prev_h, true);
             std::swap(x, up);
         }
         up.resize((size_t)r * ch);
@@ -1104,6 +1114,7 @@ void Engine::forward(const float* features, float* head) {
             ffn_block(bl[j], p, up.data(), r, lw, lh);
         }
         linear_bias(up.data(), r, ch, 4, "head", head);
+        if (debug_on_) debug_["s-head"] = {head, head + size_t(r) * 4};
     }
     (void)prev_rows;
 }

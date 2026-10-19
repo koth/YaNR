@@ -26,17 +26,34 @@ import torch
 from nr_geometry import geometry_from_valid
 from nr_student import StudentNetwork, load_student_shape
 
-BLOCK_NAME = re.compile(r'^((?:enc_blocks|dec_blocks)\.[A-Za-z0-9_]+\.\d+|vit_blocks\.\d+)\.(.+)$')
+BLOCK_NAME = re.compile(r'^((?:enc_blocks|dec_blocks|enc|dec)\.[A-Za-z0-9_]+\.\d+|vit_blocks\.\d+)\.(.+)$')
+
+
+def build_student(shape_path, geometry, device='cpu'):
+    """Construct a supported student architecture from its shape file."""
+    with open(shape_path, encoding='utf-8') as handle:
+        shape = json.load(handle)
+    if shape.get('architecture') == 'cnn-unet-fast8-v1':
+        from nr_cnn_unet_fast import CNNUNetFast, load_fast_shape
+        return CNNUNetFast(load_fast_shape(shape_path), geometry).to(device)
+    if shape.get('architecture') == 'cnn-single-moe16-v1':
+        from nr_cnn_single import SingleFrameCNN, load_single_shape
+        return SingleFrameCNN(load_single_shape(shape_path), geometry).to(device)
+    if shape.get('architecture') == 'cnn_unet_moe8':
+        from nr_cnn_unet import CNNUNet, load_cnn_shape
+        return CNNUNet(load_cnn_shape(shape_path), geometry).to(device)
+    return StudentNetwork(load_student_shape(shape_path), geometry).to(device)
 
 
 def _block_order(model):
     """块的稳定顺序(与 dump_weights 的 blocks 遍历一致),用于 manifest 的 block 编号。"""
     order = []
-    for side in ('enc_blocks', 'dec_blocks'):
+    cnn = getattr(model, 'cfg', {}).get('architecture') in ('cnn_unet_moe8', 'cnn-single-moe16-v1', 'cnn-unet-fast8-v1')
+    for side in (('enc', 'dec') if cnn else ('enc_blocks', 'dec_blocks')):
         for level, module_list in getattr(model, side).items():
             for i in range(len(module_list)):
                 order.append(f'{side}.{level}.{i}')
-    for i in range(len(model.vit_blocks)):
+    for i in range(len(getattr(model, 'vit_blocks', ()))):
         order.append(f'vit_blocks.{i}')
     return {key: idx for idx, key in enumerate(order)}
 
@@ -93,16 +110,12 @@ def write_package(model, state, out_dir, shape_path, step=-1, stages=3, extra=No
             'sha256': hashlib.sha256(bytes(buffer)).hexdigest(),
         })
 
-    with open(shape_path) as handle:
+    with open(shape_path, encoding='utf-8') as handle:
         shape_text = handle.read()
     if shared and json.loads(shape_text) != model.shape:
         raise ValueError('export shape does not match the shared/routed model')
-    if shared:
-        with open(os.path.join(out_dir, 'shape.json'), 'wb') as handle:
-            handle.write(shape_text.encode('utf-8'))
-    else:
-        with open(os.path.join(out_dir, 'shape.json'), 'w') as handle:
-            handle.write(shape_text)
+    with open(os.path.join(out_dir, 'shape.json'), 'wb') as handle:
+        handle.write(shape_text.encode('utf-8'))
 
     meta = {
         'kind': 'student',
@@ -116,10 +129,19 @@ def write_package(model, state, out_dir, shape_path, step=-1, stages=3, extra=No
     if extra:
         meta.update(extra)
     if shared:
-        from moe_shape import ARCHITECTURE, ROUTING
-        meta.update(architecture=ARCHITECTURE, routing=ROUTING, expertLayout='bank[shared,routed0..15,in,out]',
+        routing = model.shape['routing']
+        layout = ('bank[shared,routed0..15,in,out]' if routing['shared_experts'] else
+                  f"bank[routed0..{routing['routed_experts'] - 1},in,out]")
+        meta.update(architecture=model.shape['architecture'], routing=routing, expertLayout=layout,
                     precision='fp32-tf32-off', biasPolicy='frozen-inference',
                     shapeSha256=hashlib.sha256(shape_text.encode('utf-8')).hexdigest())
+    elif getattr(model, 'cfg', {}).get('architecture') in ('cnn_unet_moe8', 'cnn-single-moe16-v1', 'cnn-unet-fast8-v1'):
+        if json.loads(shape_text) != model.cfg:
+            raise ValueError('export shape does not match the CNN model')
+        meta.update(architecture=model.cfg['architecture'], precision='fp32-tf32-off',
+                    shapeSha256=hashlib.sha256(shape_text.encode('utf-8')).hexdigest())
+        if hasattr(model, 'parameter_ledger'):
+            meta['parameterAudit'] = model.parameter_ledger()
     manifest = {
         'totals': {'blockCount': len(block_idx), 'tensorCount': len(tensors),
                    'paramCount': meta['params']},
@@ -176,8 +198,10 @@ def load_student_package(directory, width, height, device):
     """包 → 可前向的 StudentNetwork(形状从包内 shape.json 自动探测)。"""
     state, manifest = read_package(directory)
     shape_file = manifest['model'].get('shapeFile', 'shape.json')
-    shape = load_student_shape(os.path.join(directory, shape_file))
-    if 'architecture' in shape:
+    shape_path = os.path.join(directory, shape_file)
+    with open(shape_path, encoding='utf-8') as handle:
+        shape = json.load(handle)
+    if shape.get('architecture') == 'shared-routed-moe-v1':
         from moe_shape import ARCHITECTURE, ROUTING
         meta = manifest['model']
         if (meta.get('architecture') != ARCHITECTURE or meta.get('routing') != ROUTING or
@@ -186,8 +210,15 @@ def load_student_package(directory, width, height, device):
         with open(os.path.join(directory, shape_file), 'rb') as handle:
             if hashlib.sha256(handle.read()).hexdigest() != meta.get('shapeSha256'):
                 raise ValueError('shared/routed shape checksum mismatch')
+    elif shape.get('architecture') in ('cnn_unet_moe8', 'cnn-single-moe16-v1', 'cnn-unet-fast8-v1'):
+        meta = manifest['model']
+        if meta.get('architecture') != shape['architecture'] or meta.get('precision') != 'fp32-tf32-off':
+            raise ValueError('package CNN semantics mismatch')
+        with open(shape_path, 'rb') as handle:
+            if hashlib.sha256(handle.read()).hexdigest() != meta.get('shapeSha256'):
+                raise ValueError('CNN shape checksum mismatch')
     g = geometry_from_valid(width, height)
     torch.manual_seed(0)
-    model = StudentNetwork(shape, g).to(device).eval()
+    model = build_student(shape_path, g, device).eval()
     model.load_state_dict(state)
     return model, manifest

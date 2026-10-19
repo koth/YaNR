@@ -77,7 +77,7 @@ if(NR_VNNI AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
 endif()
 message(STATUS "VNNI kernels: AVX=${NR_BUILD_AVX_VNNI}, AVX512=${NR_BUILD_AVX512_VNNI}")
 
-add_library(nr_cpu STATIC src/lanes.cpp src/engine.cpp src/engine_package.cpp
+add_library(nr_cpu STATIC src/lanes.cpp src/engine.cpp src/engine_package.cpp src/engine_modern.cpp
                          src/attn.cpp src/gemm.cpp src/gemm_dispatch.cpp ${NR_VNNI_SOURCES})
 if(NR_BUILD_AVX_VNNI)
   target_compile_definitions(nr_cpu PRIVATE NR_BUILD_AVX_VNNI=1)

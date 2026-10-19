@@ -55,7 +55,7 @@ def student_alignment():
 
 def load_student_shape(path):
     """shapes/*.json(与 cost_model 同一 DSL)。"""
-    with open(path) as fh:
+    with open(path, encoding='utf-8') as fh:
         spec = json.load(fh)
     if 'architecture' in spec:
         from moe_shape import validate

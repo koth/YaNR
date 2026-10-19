@@ -17,6 +17,15 @@ The scalar fixture and fused-kernel tests do not by themselves prove whole-netwo
 boundary/head/output comparisons, upstream commands, and the scope of the latest real-weight check are
 documented in [PARITY.md](PARITY.md).
 
+Independent single-frame CNN training (56M stored / 7M active parameters),
+manifest preparation, fixed holdout evaluation and configuration:
+[SINGLE_FRAME_56M.md](SINGLE_FRAME_56M.md).
+
+Optimized eight-expert CNN U-Net (55.36M deployed parameters), measured speed,
+training configuration and native export: [CNN_UNET_FAST.md](CNN_UNET_FAST.md).
+Operator handoff, required path edits, face indexing, preflight and launch:
+[TRAIN_CNN_UNET_FAST.md](../remote/TRAIN_CNN_UNET_FAST.md).
+
 ## Layout
 
 | path | what it is |

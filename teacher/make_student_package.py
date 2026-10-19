@@ -14,8 +14,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nr_geometry import geometry_from_valid                       # noqa: E402
-from nr_package import write_package                              # noqa: E402
-from nr_student import StudentNetwork, load_student_shape         # noqa: E402
+from nr_package import build_student, write_package               # noqa: E402
 
 
 def main():
@@ -27,9 +26,8 @@ def main():
     ap.add_argument('-o', '--out', required=True)
     a = ap.parse_args()
 
-    shape = load_student_shape(a.shape)
     g = geometry_from_valid(a.size, a.size)
-    model = StudentNetwork(shape, g)
+    model = build_student(a.shape, g)
     ckpt = torch.load(a.checkpoint, map_location='cpu', weights_only=False)
     state = ckpt.get('ema', ckpt.get('model'))
     model.load_state_dict(state)
