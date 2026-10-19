@@ -1,0 +1,43 @@
+ssh: connect to host 10.2.0.16 port 22: Connection timed out
+2026-10-18T09:15:01+08:00 waiting for ssh/vpn...
+ssh: connect to host 10.2.0.16 port 22: Connection timed out
+2026-10-18T09:16:16+08:00 waiting for ssh/vpn...
+ssh: connect to host 10.2.0.16 port 22: Connection timed out
+2026-10-18T09:17:31+08:00 waiting for ssh/vpn...
+ssh: connect to host 10.2.0.16 port 22: Connection timed out
+2026-10-18T09:18:46+08:00 waiting for ssh/vpn...
+ssh: connect to host 10.2.0.16 port 22: Connection timed out
+2026-10-18T09:20:01+08:00 waiting for ssh/vpn...
+ssh: connect to host 10.2.0.16 port 22: Connection timed out
+2026-10-18T09:21:17+08:00 waiting for ssh/vpn...
+ssh: connect to host 10.2.0.16 port 22: Connection timed out
+2026-10-18T09:22:32+08:00 waiting for ssh/vpn...
+ssh: connect to host 10.2.0.16 port 22: Connection timed out
+2026-10-18T09:23:47+08:00 waiting for ssh/vpn...
+ssh: connect to host 10.2.0.16 port 22: Connection timed out
+2026-10-18T09:25:02+08:00 waiting for ssh/vpn...
+2026-10-18T09:26:03+08:00 sync DIV2K_train_HR attempt 1
+2026-10-18T09:27:02+08:00 done DIV2K_train_HR
+2026-10-18T09:27:02+08:00 sync Flickr2K attempt 1
+2026-10-18T09:30:13+08:00 done Flickr2K
+2026-10-18T09:30:13+08:00 sync Full-Resolution attempt 1
+2026-10-18T09:34:37+08:00 done Full-Resolution
+2026-10-18T09:34:37+08:00 sync proxy_proc attempt 1
+2026-10-18T09:35:42+08:00 done proxy_proc
+2026-10-18T09:35:42+08:00 sync rgb attempt 1
+2026-10-18T09:37:20+08:00 done rgb
+2026-10-18T09:37:20+08:00 sync portraits attempt 1
+2026-10-18T09:37:41+08:00 done portraits
+2026-10-18T09:37:41+08:00 sync frames_2k attempt 1
+2026-10-18T09:37:44+08:00 done frames_2k
+2026-10-18T09:37:44+08:00 sync gameplay attempt 1
+2026-10-18T09:59:46+08:00 done gameplay
+2026-10-18T09:59:46+08:00 all roots synced
+DIV2K_train_HR 800
+Flickr2K 2650
+Full-Resolution 6208
+proxy_proc 1600
+rgb 2674
+portraits 4000
+frames_2k 1847
+gameplay 10803

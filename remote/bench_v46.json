@@ -1,0 +1,45 @@
+{
+ "batch": 10,
+ "batch_rows": 1277952,
+ "ckpt_every": 0,
+ "comet_disabled": true,
+ "ema_every": 4,
+ "log_every": 10,
+ "loss_detail": 0.5,
+ "loss_feature": 0.5,
+ "loss_logit": 0.3,
+ "loss_out": 1.0,
+ "loss_texstat": 1.0,
+ "loss_texture": 3.0,
+ "loss_temporal": 1.0,
+ "moe_aux": 0.0,
+ "moe_bias_rate": 0.001,
+ "moe_bias_span_cap": 2.0,
+ "moe_z": 0.0,
+ "moe_z_formula": "logsumexp-square-v1",
+ "optimizer_fused": null,
+ "router_jitter": 0.0,
+ "shape": "/data2/hezm/klss/code/shapes/student_shared_moe_v1.json",
+ "size": [
+  320,
+  512,
+  768
+ ],
+ "size_weights": [
+  0.6,
+  0.2,
+  0.2
+ ],
+ "steps": 30,
+ "student_compile": false,
+ "student_precision": "fp32",
+ "style_range": [
+  2,
+  2
+ ],
+ "teacher_batch_rows": 638976,
+ "teacher_overlap": true,
+ "teacher_weights": "/data2/hezm/klss/models/nr",
+ "teacher_workers": 2,
+ "vis_every": 0
+}

@@ -1,0 +1,4 @@
+ssh_ok
+2026-10-18T10:00:20+08:00 full-data training launched
+comet: https://www.comet.com/koth-chen/dlss-student/7f85a88d589d42b1bbd2f4c192f20dc1
+train: 30582 files, [320, 512, 768]², 10 batch, 50000 steps, device cuda
