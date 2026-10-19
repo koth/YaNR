@@ -79,6 +79,11 @@ DEFAULTS = {
     'tex_sigma': 0.008,          # 滑区加成宽度(|hf(输入)| 尺度 ≈2/255;平滑度高斯窗)
     'loss_texstat': 1.0,         # 纹理能量统计项(2026-10-15 v4.2)。2026-10-18:3.0 时平滑区
                                  # 有效权重 ≈11.5 vs 形状项 ≈1.2(10:1),目标退化成"造任意能量对的纹理"
+    'loss_diversity': 0.0,       # 层内专家多样性(2026-10-18):惩罚 top-2 两个专家在同一批
+                                 # token 上隐藏激活的余弦相似度。参考 ICML 2026 "Synergistic
+                                 # Intra-/Cross-Layer Regularization Losses for MoE Expert
+                                 # Specialization"。与负载均衡正交 —— BiasController 只管
+                                 # 计数,B 管不到"两个专家学成同一个函数"。
                                  # —— 实测幅度比 0.91 但 corr 仅 0.44 且 10K 步不动。压到 1.0。
     'texstat_boost': 0.0,        # 统计项滑区加成倍数。2026-10-18 关:它与上面的形状项争夺同一批
                                  # 平滑区像素,而"抄教师的形状"才是有信息量的目标。
@@ -931,7 +936,7 @@ def main():
             group['lr'] = lr
         t0 = time.perf_counter()
         totals = {'out': 0.0, 'detail': 0.0, 'feature': 0.0, 'temporal': 0.0,
-                  'texture': 0.0, 'texstat': 0.0,
+                  'texture': 0.0, 'texstat': 0.0, 'diversity': 0.0,
                   'out_rgb': 0.0, 'out_logit': 0.0, 'out_neural': 0.0}
         moe_tot = {}
         feat_detail_acc = {}
@@ -1069,6 +1074,18 @@ def main():
                     psnrs.extend(psnr_v[finite].tolist())
                 chunk_loss = chunk_loss + (cfg['loss_feature'] * feat + chunk_moe) * (
                     cnb / cfg['batch'])
+                # 层内专家多样性:同一批 token 上 top-2 两个专家的隐藏激活应互补。
+                # 块在前向里把余弦相似度记进 diversity_terms,这里汇总并清空。
+                div_terms = [t for m in model.modules()
+                             for t in getattr(m, 'diversity_terms', ())]
+                if div_terms:
+                    div_v = torch.stack(div_terms).mean()
+                    chunk_loss = chunk_loss + cfg['loss_diversity'] * div_v
+                    if log_step:
+                        totals['diversity'] += float(div_v.detach()) * cnb
+                    for m in model.modules():
+                        if hasattr(m, 'diversity_terms'):
+                            m.diversity_terms.clear()
                 if isinstance(chunk_loss, torch.Tensor) and torch.isfinite(chunk_loss):
                     if controller and (cfg['moe_aux'] != 0 or cfg['moe_z'] != 0):
                         controller.observe_regularizer(chunk_moe * (cnb / cfg['batch']))
@@ -1119,6 +1136,7 @@ def main():
                 'loss/feature': totals['feature'] / n,
                 'loss/texture': totals['texture'] / n,
                 'loss/texstat': totals['texstat'] / n,
+                'loss/diversity': totals['diversity'] / n,
                 'loss/temporal': totals['temporal'] / n,
                 'loss/out_rgb': totals['out_rgb'] / n,
                 'loss/out_logit': totals['out_logit'] / n,

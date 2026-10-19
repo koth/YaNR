@@ -11,12 +11,13 @@ from torch import nn
 from torch.nn import functional as F
 
 
-ROUTED_EXPERTS = 16   # 2026-10-18:去掉共享专家后,bank 轴 0..15 全是路由专家
-TOP_K = 2             # 每 token 激活两个专家
-# 两支都是 silu 专家路径(旧设计里一支是线性 shared),silu 非零均值,两条相加会把
-# 直流偏置翻倍。实测 0.5 时启动 psnr 只有 6.9 dB、gnorm 66(旧结构 16.3 dB / 9.0)。
-# 0.25 让两支合量回到旧口径(旧:1 线性 + 1 激活 ×0.5;新:2 激活 ×0.25)。
-FUSION = 0.25
+ROUTED_EXPERTS = 7    # 2026-10-18:去掉共享专家后,bank 轴 0..6 全是路由专家
+TOP_K = 1             # 每 token 激活一个专家
+# 旧设计是一支线性 shared(零均值)+ 一支 silu 专家,融合 (shared + g·E)·0.5;
+# 现在两支都是 silu 专家(silu 非零均值,相加会把直流偏置翻倍,实测 0.5 时开局
+# psnr 只有 6.9dB/gnorm 66)。按"激活专家数 × 系数 = 0.5"取,换 TOP_K 量级不跳变:
+# top-2 -> 0.25(实测 step0 psnr 19.8 正常),top-1 -> 0.5。
+FUSION = 0.5 / TOP_K
 
 
 def route_tile_rows(rows):
@@ -35,7 +36,7 @@ def route_tile_rows(rows):
 def row_counts(assign):
     # Fixed output shape; CUDA bincount/repeat_interleave otherwise need a host
     # read to discover their output size, even with minlength=16.
-    return torch.zeros(16, dtype=torch.int64, device=assign.device).scatter_add_(
+    return torch.zeros(ROUTED_EXPERTS, dtype=torch.int64, device=assign.device).scatter_add_(
         0, assign, torch.ones_like(assign))
 
 
@@ -106,7 +107,7 @@ def select(logits, bias):
     probabilities = logits.softmax(-1)
     ranking = torch.argsort(-(logits + bias), dim=-1, stable=True)
     pick = ranking[:, :TOP_K]                       # [rows, 2],并列取最小索引
-    gate = 16 * probabilities.gather(1, pick)       # [rows, 2]
+    gate = ROUTED_EXPERTS * probabilities.gather(1, pick)   # 均匀路由时 =1
     return pick, gate, probabilities
 
 
@@ -130,8 +131,8 @@ class RoutedModule(nn.Module):
 
     def __init__(self, channels, token=False):
         super().__init__()
-        self.router = nn.Sequential(nn.LayerNorm(channels), nn.Linear(channels, 16, bias=False))
-        self.register_buffer('router_bias', torch.zeros(16))
+        self.router = nn.Sequential(nn.LayerNorm(channels), nn.Linear(channels, ROUTED_EXPERTS, bias=False))
+        self.register_buffer('router_bias', torch.zeros(ROUTED_EXPERTS))
         self.token = token
         self.moe_stats = []
         self.capture_enabled = False
@@ -173,8 +174,10 @@ class RoutedModule(nn.Module):
             self.moe_stats.append((flat_assign.detach(), probs, logits))
         for name, tensor in [('logits', logits), ('pick', pick), ('gate', gate), ('assign', assign)]:
             self.capture(name, tensor)
-        return (*self._pack_route(assign[:, 0], gates[:, 0]),
-                self._pack_route(assign[:, 1], gates[:, 1]))
+        primary = self._pack_route(assign[:, 0], gates[:, 0])
+        if TOP_K == 1:
+            return primary
+        return (*primary, self._pack_route(assign[:, 1], gates[:, 1]))
 
     @staticmethod
     def _pack_route(assign, gate):
@@ -233,7 +236,9 @@ class RoutedModule(nn.Module):
                     shared_projection_rms=first.square().mean().sqrt(),
                     routed_projection_rms=second.square().mean().sqrt())
         first, second = self.diagnostic_branches(first, second)
-        return (route[3] * first + route[4][3] * second) * FUSION
+        if TOP_K > 1:
+            return (route[3] * first + route[4][3] * second) * FUSION
+        return route[3] * first * FUSION
 
     @staticmethod
     def expert_pair(state, bank, route, bias=None):
@@ -243,8 +248,10 @@ class RoutedModule(nn.Module):
         (F_shared + g·F_e)·0.5 里共享支路在 d3/d4 占 62-74% 却不专门化,
         实测是深层的容量黑洞。现在两路都来自被路由的专家。
         """
-        return (RoutedModule.routed_mm(state, bank, route, bias),
-                RoutedModule.routed_mm(state, bank, route[4], bias))
+        first = RoutedModule.routed_mm(state, bank, route, bias)
+        if TOP_K == 1:
+            return first, first
+        return first, RoutedModule.routed_mm(state, bank, route[4], bias)
 
     def diagnostic_branches(self, first, second):
         if self.branch_mode != 'full' and self.training:
@@ -294,6 +301,12 @@ class SharedRoutedBlock(RoutedModule):
         initialize_bank(self.expand)
         initialize_bank(getattr(self, name))
         self.aux_ffn = nn.Parameter(torch.ones(channels))
+        # 层内专家多样性(2026-10-18):top-2 的两个专家在同一批 token 上的
+        # 隐藏激活如果高度相似,top-2 就只多花一倍算力、没有收益。这里把它们的
+        # 余弦相似度记下来,由 trainer 汇总成一个惩罚项。
+        # 参考:Synergistic Intra-/Cross-Layer Regularization for MoE Expert
+        # Specialization(ICML 2026, arXiv 2602.14159)的 intra-layer loss。
+        self.diversity_terms = []
         self.attn = attn
         if attn:
             self.qkv = nn.Parameter(torch.empty(ROUTED_EXPERTS, channels, 3 * channels))
@@ -308,20 +321,38 @@ class SharedRoutedBlock(RoutedModule):
         # For token blocks width=tokens, height=padded, matching existing ViT API.
         route = self.route(state, width, height, batch)      # top-2:route[4] 是第二个专家
         contract = getattr(self, self.contract_name)
-        first, second = route, route[4]
-        hidden_a = RoutedModule.routed_mm(state, self.expand, first)
-        hidden_b = RoutedModule.routed_mm(state, self.expand, second)
-        expert_a = RoutedModule.routed_mm(F.silu(hidden_a), contract, first)
-        expert_b = RoutedModule.routed_mm(F.silu(hidden_b), contract, second)
-        if self.training_metrics_enabled and self.training and torch.is_grad_enabled():
-            with torch.no_grad():
-                # 键名沿用旧口径:shared 槽位 = 第 1 个专家,routed 槽位 = 第 2 个。
-                self.training_metrics.update(shared_ffn_rms=expert_a.square().mean().sqrt(),
-                                             routed_ffn_rms=expert_b.square().mean().sqrt(),
-                                             gated_routed_ffn_rms=(second[3] * expert_b).square().mean().sqrt())
-        expert_a, expert_b = self.diagnostic_branches(expert_a, expert_b)
-        ffn = (first[3] * expert_a + second[3] * expert_b) * FUSION
-        self.capture('ffn_shared', expert_a); self.capture('ffn_routed', expert_b)
+        first = route
+        expert_a = RoutedModule.routed_mm(
+            F.silu(RoutedModule.routed_mm(state, self.expand, first)), contract, first)
+        if TOP_K > 1:
+            second = route[4]
+            expert_b = RoutedModule.routed_mm(
+                F.silu(RoutedModule.routed_mm(state, self.expand, second)), contract, second)
+            # 同一批 token 上两个专家的隐藏激活相似度 —— 直接惩罚它,推动互补分工。
+            if self.training and torch.is_grad_enabled():
+                self.diversity_terms.append(
+                    F.cosine_similarity(
+                        RoutedModule.routed_mm(state, self.expand, first),
+                        RoutedModule.routed_mm(state, self.expand, second), dim=-1).mean())
+            if self.training_metrics_enabled and self.training and torch.is_grad_enabled():
+                with torch.no_grad():
+                    self.training_metrics.update(
+                        shared_ffn_rms=expert_a.square().mean().sqrt(),
+                        routed_ffn_rms=expert_b.square().mean().sqrt(),
+                        gated_routed_ffn_rms=(second[3] * expert_b).square().mean().sqrt())
+            expert_a, expert_b = self.diagnostic_branches(expert_a, expert_b)
+            ffn = (first[3] * expert_a + second[3] * expert_b) * FUSION
+            self.capture('ffn_shared', expert_a); self.capture('ffn_routed', expert_b)
+        else:
+            if self.training_metrics_enabled and self.training and torch.is_grad_enabled():
+                with torch.no_grad():
+                    self.training_metrics.update(
+                        shared_ffn_rms=expert_a.square().mean().sqrt(),
+                        routed_ffn_rms=expert_a.square().mean().sqrt(),
+                        gated_routed_ffn_rms=(first[3] * expert_a).square().mean().sqrt())
+            expert_a, _drop = self.diagnostic_branches(expert_a, expert_a)
+            ffn = first[3] * expert_a * FUSION
+            self.capture('ffn_shared', expert_a); self.capture('ffn_routed', expert_a)
         out = state * self.aux_ffn + ffn
         self.capture('ffn', out)
         if self.attn:

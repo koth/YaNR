@@ -12,7 +12,7 @@ import math
 ARCHITECTURE = 'shared-routed-moe-v1'
 KIND = 'shared_routed_moe'
 LEVELS = ('full', 'd0', 'd1', 'd2', 'd3', 'd4')
-ROUTING = dict(shared_experts=0, routed_experts=16, top_k=2,
+ROUTING = dict(shared_experts=0, routed_experts=7, top_k=1,
                spatial_granularity='window8', vit_granularity='token',
                selection='fp32-argmax-with-bias-v1', tie_break='lowest-index',
                gate='softmax-selected-times-routed-v1',
@@ -43,7 +43,7 @@ def validate(shape):
             raise ValueError('each spatial level needs at least two blocks')
         if type(level.get('attn')) is not bool:
             raise ValueError('each spatial level needs explicit attn boolean')
-        if 'experts' in level and level['experts'] != 16:
+        if 'experts' in level and level['experts'] != 7:
             raise ValueError('shared/routed banks always contain exactly 16 routed experts')
     vit = shape.get('vit', {})
     if vit.get('kind') != KIND or vit.get('tokens_level') != 'd5':
@@ -60,7 +60,7 @@ def validate(shape):
         raise ValueError('ViT block count must be a non-negative integer')
     if vit['channels'] > 1024:
         raise ValueError('shared/routed router supports at most 1024 input channels')
-    if 'experts' in vit and vit['experts'] != 16:
+    if 'experts' in vit and vit['experts'] != 7:
         raise ValueError('shared/routed ViT always contains exactly 16 routed experts')
     return shape
 
@@ -87,22 +87,22 @@ def ledger(shape):
     def router(prefix, channels):
         add(prefix + '.router.0.weight', [channels])
         add(prefix + '.router.0.bias', [channels])
-        add(prefix + '.router.1.weight', [16, channels])
-        add(prefix + '.router_bias', [16], False)
+        add(prefix + '.router.1.weight', [7, channels])
+        add(prefix + '.router_bias', [7], False)
 
     def transition(prefix, ci, co):
         router(prefix, ci)
-        add(prefix + '.weight', [16, ci, co])
-        add(prefix + '.bias', [16, co])
+        add(prefix + '.weight', [7, ci, co])
+        add(prefix + '.bias', [7, co])
 
     def block(prefix, c, h, attn, vit=False):
         router(prefix, c)
-        add(prefix + '.expand', [16, c, h])
-        add(prefix + ('.contract' if vit else '.narrow'), [16, h, c])
+        add(prefix + '.expand', [7, c, h])
+        add(prefix + ('.contract' if vit else '.narrow'), [7, h, c])
         add(prefix + '.aux_ffn', [c])
         if attn:
-            add(prefix + '.qkv', [16, c, 3 * c])
-            add(prefix + '.proj', [16, c, c])
+            add(prefix + '.qkv', [7, c, 3 * c])
+            add(prefix + '.proj', [7, c, c])
             add(prefix + '.aux_attn', [c])
             add(prefix + '.attention.scale', [c // 32])
             if not vit:

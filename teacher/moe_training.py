@@ -70,9 +70,10 @@ class BiasController:
         # 完全由 bias 决定(等于固定分配),负载却仍有 66% 压在一个专家上:控制器
         # 打不赢又停不下来。给 span 一个上限,超出后整体按比例缩放,保持相对次序。
         self.span_cap = None if span_cap is None else float(span_cap)
-        self.pending = {n: torch.zeros(16, dtype=torch.int64, device=m.router_bias.device) for n, m in self.modules.items()}
-        self.last_active_step = {n: torch.full((16,), -1, dtype=torch.int64, device=m.router_bias.device) for n, m in self.modules.items()}
-        self.updated_steps = {n: torch.zeros(16, dtype=torch.int64, device=m.router_bias.device) for n, m in self.modules.items()}
+        # 专家数从 router_bias 的长度读,不再硬编码 16(2026-10-18 改成 7 专家 top-1)。
+        self.pending = {n: torch.zeros(m.router_bias.numel(), dtype=torch.int64, device=m.router_bias.device) for n, m in self.modules.items()}
+        self.last_active_step = {n: torch.full((m.router_bias.numel(),), -1, dtype=torch.int64, device=m.router_bias.device) for n, m in self.modules.items()}
+        self.updated_steps = {n: torch.zeros(m.router_bias.numel(), dtype=torch.int64, device=m.router_bias.device) for n, m in self.modules.items()}
         self.step = None; self.last_applied_step = -1; self.microbatches = 0
         self.telemetry = {}; self.last_load = {}
         self.regularizer_gradients = {}
@@ -139,7 +140,7 @@ class BiasController:
         for name, module in self.modules.items():
             load = self.pending[name]
             before = module.router_bias.clone()
-            module.router_bias.add_(self.rate * (load.sum().float() / 16 - load.float()).sign())
+            module.router_bias.add_(self.rate * (load.sum().float() / load.numel() - load.float()).sign())
             module.router_bias.sub_(module.router_bias.mean())
             if self.span_cap is not None:
                 bias = module.router_bias

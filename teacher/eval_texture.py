@@ -124,6 +124,9 @@ def main():
     parser.add_argument('--ckpt', action='append', required=True,
                         help='标签=checkpoint 路径,可重复')
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--shape', default=None,
+                        help='学生形状 JSON;默认 shapes/student_shared_moe_v1.json。'
+                             '不同架构的分枝必须分开跑,一次只比同形状的 checkpoint')
     parser.add_argument('--teacher-cache', default=None,
                         help='教师输出的缓存目录。教师(fp8 + CUDA 内核)占显存最多,'
                              '且对固定图集是确定性的:缓存后只评学生,1.5GB 显存就够,'
@@ -228,7 +231,7 @@ def main():
                       'teacher': np.load(t_path),
                       'feats': torch.from_numpy(np.load(feats_path))})
 
-    shape = load_student_shape(SHAPE)
+    shape = load_student_shape(args.shape or SHAPE)
     report = {}
     for spec in args.ckpt:
         tag, _, path = spec.partition('=')
