@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,7 @@ def natural_key(path):
 
 def build_manifest(cfg, data_root=None, roi_path=None, detect_faces=False, groups_path=None):
     root = Path(data_root or cfg['data_root']).resolve()
+    started = time.perf_counter()
     roi_map, group_map = {}, {}
     if roi_path:
         with open(roi_path, encoding='utf-8') as handle:
@@ -78,6 +80,7 @@ def build_manifest(cfg, data_root=None, roi_path=None, detect_faces=False, group
         paths = sorted((p for p in source_root.rglob('*') if p.suffix.lower() in EXTENSIONS
                         and not excluded.intersection(p.parts)), key=natural_key)
         frame_counts = {}
+        scanned_source = 0
         for path in paths:
             relative = path.relative_to(source_root)
             explicit_group = group_map.get(str(path.resolve()))
@@ -87,6 +90,14 @@ def build_manifest(cfg, data_root=None, roi_path=None, detect_faces=False, group
             frame_counts[group] = frame_index + 1
             if frame_index % int(source.get('frame_stride', 1)):
                 continue
+            # 进度打印:整轮要跑几十万次解码 + Haar 检测,以前只在结束时出一行统计,
+            # 卡住还是慢根本分不清。每 500 张打一次,带已耗时和 ROI 命中数。
+            scanned_source += 1
+            if scanned_source % 500 == 0:
+                elapsed = time.perf_counter() - started
+                rate = scanned_source / elapsed if elapsed > 0 else 0.0
+                print(f'  [{source["name"]}] {scanned_source}/{len(paths)} '
+                      f'total={len(entries)} {elapsed:.0f}s {rate:.1f}/s', flush=True)
             try:
                 image = read_rgb(path)
                 w, h = image.size
@@ -140,13 +151,35 @@ def build_manifest(cfg, data_root=None, roi_path=None, detect_faces=False, group
     fraction = float(cfg.get('val_fraction', .05))
     if not 0 < fraction < 1:
         raise ValueError('val_fraction must be between zero and one')
+    # 2026-10-19:允许按源覆盖验证集比例。连续帧源(如 uhd)用全局 5% 会切走太多,
+    # 而它又必须出现在验证集里(否则验证分布缺一大块);给该源一个更小的
+    # val_fraction 即可,例如 uhd 用 0.01。
+    source_fraction = {s['name']: float(s.get('val_fraction', fraction))
+                       for s in cfg['sources']}
+    for name, value in source_fraction.items():
+        if not 0 < value < 1:
+            raise ValueError(f'{name}.val_fraction must be between zero and one')
     scores = {g: int(hashlib.sha256((str(cfg['seed']) + '/' + g).encode()).hexdigest()[:16], 16) / 2**64
               for g in groups}
-    val_groups = {g for g in groups if scores[g] < fraction}
-    if not val_groups:
-        val_groups.add(min(groups, key=scores.get))
-    if len(val_groups) == len(groups):
-        val_groups.remove(max(groups, key=scores.get))
+    groups_by_source = {}
+    for item in unique:
+        # 必须走 find() 归到并查集的根名字:去重时同一内容的多个组名会被合并,
+        # scores 是按根名字建的。直接存 item['group'] 会 KeyError。
+        groups_by_source.setdefault(item['source'], set()).add(find(item['group']))
+    val_groups = set()
+    for source, owned in groups_by_source.items():
+        # 只有一个组的源无法切分:无论它的哈希分数落在哪,都必须整组进 train。
+        # (gameplay / frames_2k 用 group_by=directory,整个源就是一组;没有这条守卫
+        #  会让整个源被判进 val,训练里一条都不剩 —— 2026-10-19 实际踩到过。)
+        if len(owned) < 2:
+            continue
+        share = source_fraction.get(source, fraction)
+        chosen = {g for g in owned if scores[g] < share}
+        if not chosen:
+            chosen.add(min(owned, key=scores.get))
+        if len(chosen) == len(owned) and len(owned) > 1:
+            chosen.remove(max(owned, key=scores.get))
+        val_groups |= chosen      # 组是跨源共享的:任一源选中即整组进验证,避免泄漏
     for item in unique:
         item['split_group'] = find(item['group'])
         item['split'] = 'val' if item['split_group'] in val_groups else 'train'

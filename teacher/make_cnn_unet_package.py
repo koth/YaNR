@@ -48,6 +48,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--shape', required=True)
     ap.add_argument('--checkpoint', required=True)
+    ap.add_argument('--state', choices=('ema', 'model'), default='ema',
+                    help='取 EMA 还是当前模型权重(默认 ema;checkpoint 无 ema 时用 model)')
     ap.add_argument('-o', '--out', required=True)
     a = ap.parse_args()
 
@@ -55,7 +57,13 @@ def main():
         shape_text = fh.read()
     shape = json.loads(shape_text)
     ckpt = torch.load(a.checkpoint, map_location='cpu', weights_only=False)
-    state = ckpt.get('model', ckpt)
+    if a.state == 'ema':
+        # 导出包里的 *_full.pt 同时带 model 与 ema;EMA 通常更稳,作为默认。
+        if 'ema' not in ckpt:
+            raise SystemExit('checkpoint has no ema; use --state model')
+        state = ckpt['ema']
+    else:
+        state = ckpt.get('model', ckpt)
     step = int(ckpt.get('step', -1))
 
     blocks = block_ids(state)
