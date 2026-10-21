@@ -19,7 +19,7 @@ from nr_geometry import geometry_from_valid
 
 
 EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp'}
-MODES = ('roi_native', 'random_native', 'scaled_crop', 'context')
+MODES = ('roi_native', 'random_native', 'scaled_crop', 'context', 'native1080')
 RESAMPLE = getattr(Image, 'Resampling', Image).LANCZOS
 
 
@@ -230,7 +230,8 @@ class SingleFrameSource:
         if not cfg['context_buckets'] or any(len(b) != 2 or min(b) < 33 for b in cfg['context_buckets']):
             raise ValueError('context buckets must contain valid width/height pairs >=33')
         self.size_prob = self._prob(cfg['size_weights'])
-        self.mode_prob = self._prob([cfg['sampling'][m] for m in MODES])
+        # 新加的 mode 允许在旧配置里缺省(sampling 里没有该键即为 0)。
+        self.mode_prob = self._prob([cfg['sampling'].get(m, 0.0) for m in MODES])
         self.pools = {}
         for size in self.sizes:
             for roi in (False, True):
@@ -286,6 +287,10 @@ class SingleFrameSource:
         if mode == 'context':
             image, scale = self._context(image)
             resized_size = image.size
+        elif mode == 'native1080':
+            # 原生尺寸采样:最大边 <= native_max_side,超出时按 A/B 规则处理。
+            image, box, scale, roi = self._native_max(image, item, rng)
+            resized_size = image.size
         else:
             if mode == 'scaled_crop':
                 span = float(rng.uniform(*self.cfg.get('crop_scale', [1.0, 1.5])))
@@ -306,6 +311,41 @@ class SingleFrameSource:
             image = image.crop(box)  # Native modes NEVER pass through resize.
         return self._pack(item, image, mode, index, dict(original_size=list(original),
                           resized_size=list(resized_size), crop_box=box, scale=scale, roi=roi))
+
+    def _native_max(self, image, item, rng):
+        """原生尺寸采样:保证最大边 <= native_max_side。
+
+        规则(2026-10-21 与产品侧确认):
+          1. 已满足上限 -> 整图,不缩放也不裁剪;
+          2. 超出且有 ROI -> 等概率二选一:
+               A:等比缩放,使最大边等于上限;
+               B:以人脸为中心、保持原图宽高比、最大边等于上限的框做裁剪;
+          3. 超出但没有 ROI -> 只做 A。
+
+        返回 (image, crop_box, scale, roi),字段含义与 sample() 里其它分支一致:
+        box 与 roi 都是**原图坐标**,_pack() 会按 scale/box 映射到实际像素。
+        """
+        limit = int(self.cfg.get('native_max_side', 1080))
+        w, h = image.size
+        if max(w, h) <= limit:
+            return image, None, 1.0, None
+        rois = item.get('rois') or []
+        split = float(self.cfg.get('native_ab_split', 0.5))
+        use_b = bool(rois) and float(rng.random()) < split
+        if not use_b:
+            scale = limit / max(w, h)
+            return (image.resize((max(33, round(w * scale)), max(33, round(h * scale))), RESAMPLE),
+                    None, scale, None)
+        if w >= h:
+            box_w, box_h = limit, max(33, round(limit * h / w))
+        else:
+            box_w, box_h = max(33, round(limit * w / h)), limit
+        roi = rois[int(rng.integers(len(rois)))]
+        cx, cy = (roi[0] + roi[2]) / 2.0, (roi[1] + roi[3]) / 2.0
+        left = int(np.clip(round(cx - box_w / 2.0), 0, max(0, w - box_w)))
+        top = int(np.clip(round(cy - box_h / 2.0), 0, max(0, h - box_h)))
+        box = [left, top, left + box_w, top + box_h]
+        return image.crop(box), box, 1.0, roi
 
     def _context(self, image):
         # Fit inside a finite aspect bucket; return the actual valid rectangle.
