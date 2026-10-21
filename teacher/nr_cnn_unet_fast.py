@@ -254,20 +254,99 @@ def resize_bilinear(x, size):
     return _DeterministicBilinear.apply(x, *size)
 
 
+
+class DenseFFN(nn.Module):
+    """稠密 FFN,用来替代逐像素 top-1 MoE 做消融。
+
+    每像素 FLOPs 与"只激活一个专家"相同(hidden 取该级 expert_hidden),
+    但全部像素共享同一份参数,不再把 FFN 切成 8 份、每份只服务约 1/8 的像素。
+    因此这一替换是单变量对比:算力不变,只改"参数是否碎片化"。
+    """
+
+    def __init__(self, channels, hidden):
+        super().__init__()
+        self.channels, self.hidden = channels, hidden
+        self.w1 = nn.Conv2d(channels, hidden, 1)
+        self.w2 = nn.Conv2d(hidden, channels, 1)
+        for layer, fan_in in ((self.w1, channels), (self.w2, hidden)):
+            nn.init.uniform_(layer.weight, -1 / math.sqrt(fan_in), 1 / math.sqrt(fan_in))
+            nn.init.uniform_(layer.bias, -1 / math.sqrt(fan_in), 1 / math.sqrt(fan_in))
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)))
+
+    def extra_repr(self):
+        return f'{self.channels}->{self.hidden}->{self.channels}'
+
+
+class PixelNorm(nn.Module):
+    """逐像素跨通道归一化:统计量只在 C 维上求,与 H×W 无关。
+
+    替换 nn.GroupNorm(8, C) 的目的:GroupNorm 在整张特征图的 H×W 上求均值/方差,
+    统计量随输入场尺寸变化 —— 320x512 裁剪与 1920x1080 整图的归一化行为不同,
+    这正是"训练用裁剪、部署用整图"之间约 2.5 dB 落差的来源。
+
+    state_dict 键与形状和 GroupNorm 完全一致(weight/bias 各 [C]),
+    所以同名替换后参数名不变,旧 checkpoint 仍可加载(但语义不同,需重训)。
+    """
+
+    def __init__(self, channels, eps=1e-5):
+        super().__init__()
+        self.channels = channels
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x):
+        y = x.permute(0, 2, 3, 1)
+        mean = y.mean(-1, keepdim=True)
+        var = y.var(-1, keepdim=True, unbiased=False)
+        y = (y - mean) * torch.rsqrt(var + self.eps) * self.weight + self.bias
+        return y.permute(0, 3, 1, 2)
+
+    def extra_repr(self):
+        return f'{self.channels}, eps={self.eps}'
+
+
+def swap_group_norm(root):
+    """把树里所有 nn.GroupNorm 就地换成 PixelNorm(保留参数名 weight/bias)。"""
+    swapped = 0
+    for module in list(root.modules()):
+        for name, child in list(module.named_children()):
+            if isinstance(child, nn.GroupNorm):
+                setattr(module, name, PixelNorm(child.num_channels, child.eps))
+                swapped += 1
+    return swapped
+
+
 class CNNUNetFast(CNNUNet):
     def __init__(self, cfg, geometry):
         super().__init__(copy.deepcopy(cfg), geometry)
+        # 2026-10-21:层级顺序可配置。shape 里给 "order" 就能去掉最深层(例如去掉 d5,
+        # 让 d4 当瓶颈),用来验证"最深那级下采样是否在抹掉逐像素细节"。
+        self.order = tuple(cfg['order']) if cfg.get('order') else ORDER
+        self.decode = tuple(reversed(self.order[:-1]))
         for side in (self.enc, self.dec):
             for name, blocks in side.items():
                 for block in blocks:
-                    block.ffn = GroupedExpertFFN.from_legacy(block.ffn)
-                    block.ffn.execution = cfg.get('expert_execution', 'split')
-                    block.ffn.split_max_rows = int(cfg.get('split_max_rows', 131072))
+                    if cfg.get('ffn') == 'dense':
+                        # 2026-10-21 消融:把逐像素 top-1 MoE 换成稠密 FFN。
+                        # hidden 取该级专家 hidden,所以每像素 FLOPs 与一个专家相同,
+                        # 但所有像素共享全部参数(不再把参数切成 8 份各管 1/8 像素)。
+                        block.ffn = DenseFFN(self.channels[name], cfg['expert_hidden'][name])
+                    else:
+                        block.ffn = GroupedExpertFFN.from_legacy(block.ffn)
+                        block.ffn.execution = cfg.get('expert_execution', 'split')
+                        block.ffn.split_max_rows = int(cfg.get('split_max_rows', 131072))
                     if name in cfg.get('rep_levels', ()):
                         original = block.conv
                         block.conv = RepConv3(self.channels[name], bool(cfg.get('deploy', False)))
                         branch = block.conv.reparam if cfg.get('deploy', False) else block.conv.main
                         branch.load_state_dict(original.state_dict())
+        # 2026-10-21:可选把 GroupNorm 换成逐像素归一化(shape 里 norm='pixel'),
+        # 用来验证"归一化依赖场尺寸"是不是裁剪训练/整图部署落差的根源。
+        if cfg.get('norm') == 'pixel':
+            self.swapped_norms = swap_group_norm(self)
         if cfg.get('head_init_std') is not None:
             nn.init.normal_(self.head.weight, std=float(cfg['head_init_std']))
             nn.init.zeros_(self.head.bias)
@@ -279,17 +358,18 @@ class CNNUNetFast(CNNUNet):
         x = features.reshape(batch, fh, fw, 16).permute(0, 3, 1, 2).contiguous()
         x = self.stem(x)
         skips = {}
-        for name in ORDER:
+        order, decode = self.order, self.decode
+        for name in order:
             w, h = level_size(self.g, name)
             x = resize_bilinear(x, (h, w))
             if name != 'full':
                 x = self.enc_proj[name](x)
             for block in self.enc[name]:
                 x = block(x)
-            self._capture_rows('s-vit' if name == 'd5' else 's-enc-' + name, x)
-            if name != 'd5':
+            self._capture_rows('s-vit' if name == order[-1] else 's-enc-' + name, x)
+            if name != order[-1]:
                 skips[name] = x
-        for name in DECODE:
+        for name in decode:
             w, h = level_size(self.g, name)
             x = resize_bilinear(x, (h, w))
             x = self.merge[name](torch.cat((x, skips[name]), dim=1))

@@ -1,0 +1,16 @@
+{
+  "name": "cnn_unet_fast_pixelnorm",
+  "architecture": "cnn-unet-fast8-v1",
+  "experts": 8,
+  "expert_execution": "split",
+  "split_max_rows": 131072,
+  "head_init_std": 0.001,
+  "parameter_targets": {"total": 56287389, "active": 22031293},
+  "deploy": false,
+  "rep_levels": ["full", "d0", "d1", "d2"],
+  "norm": "pixel",
+  "channels": {"full": 32, "d0": 32, "d1": 64, "d2": 128, "d3": 256, "d4": 256, "d5": 480},
+  "blocks_enc": {"full": 2, "d0": 2, "d1": 3, "d2": 3, "d3": 3, "d4": 3, "d5": 2},
+  "blocks_dec": {"full": 2, "d0": 3, "d1": 3, "d2": 3, "d3": 3, "d4": 3},
+  "expert_hidden": {"full": 64, "d0": 64, "d1": 128, "d2": 256, "d3": 448, "d4": 448, "d5": 832}
+}
