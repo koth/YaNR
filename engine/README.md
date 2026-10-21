@@ -146,6 +146,11 @@ TF32 关闭，保持路由和输出精度；`NR_INT8` / `NR_PROFILE` 是 CPU 专
 H2D/D2H 单独报告；整个图片处理的耗时还需加上这些步骤。
 `--dump-dir` 切换到逐步执行并转储与 CPU 相同的中间量，诊断模式不用于测速。
 
+`cnn_unet_fast` 的 CNN CUDA 路径已优化 GroupNorm、im2col 和像素 MoE。
+2026-10-20 本机 RTX 3080 的 FP32 / TF32 off 前向：320² **14.73 ms**、
+512²（field 576×512）**35.69 ms**，分别较优化前快 **3.32× / 3.90×**。
+采样方法、内存占用与数值对账见 [CNN CUDA 性能记录](CNN_CUDA_PERF.md)。
+
 数值校验使用 uv 创建的现有 `.venv`，仅需要 CPU 版 PyTorch 作参考：
 
 ```powershell

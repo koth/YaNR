@@ -421,6 +421,8 @@ struct CudaEngine::Impl {
     int shared_experts = 0, routed_experts = 0;
     int cnn_channels[7]{};
     Buffer<float> cnn_columns, cnn_normed, cnn_conv_out, cnn_cat;
+    Buffer<double> cnn_norm_partial_sums;
+    Buffer<float> cnn_norm_stats_buf;
     bool profiling = false;
     bool capturing = false;
     struct EventPair { std::string name; cudaEvent_t begin, end; };
@@ -817,7 +819,22 @@ struct CudaEngine::Impl {
             int count = std::min(tile, rows - start);
             const float* columns = in;
             if (k != 1) {
-                cnn_im2col<<<grid(size_t(count) * K), 256, 0, stream>>>(in, cnn_columns.p, start, count, width, height, I, k);
+                bool vectorized = k == 3;
+                const auto* source = reinterpret_cast<const float4*>(in);
+                auto* dest = reinterpret_cast<float4*>(cnn_columns.p);
+                int blocks = grid(size_t(count) * K / 4);
+                if (k == 3) {
+                    switch (I) {
+#define CNN_IM2COL_CASE(C) case C: cnn_im2col3_vec<C><<<blocks, 256, 0, stream>>>(source, dest, start, count, width, height); break
+                    CNN_IM2COL_CASE(16); CNN_IM2COL_CASE(32); CNN_IM2COL_CASE(64);
+                    CNN_IM2COL_CASE(96); CNN_IM2COL_CASE(128); CNN_IM2COL_CASE(192);
+                    CNN_IM2COL_CASE(256); CNN_IM2COL_CASE(384); CNN_IM2COL_CASE(480);
+                    CNN_IM2COL_CASE(512); CNN_IM2COL_CASE(736);
+#undef CNN_IM2COL_CASE
+                    default: vectorized = false;
+                    }
+                }
+                if (!vectorized) cnn_im2col<<<grid(size_t(count) * K), 256, 0, stream>>>(in, cnn_columns.p, start, count, width, height, I, k);
                 columns = cnn_columns.p;
             }
             blas(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, O, count, K, &one,
@@ -827,11 +844,40 @@ struct CudaEngine::Impl {
     }
     void cnn_norm(const float* in, float* out, int rows, int channels, const std::string& p, bool act) {
         Scope profile(*this, "group_norm:" + p);
-        cnn_group_norm<<<8, 256, 0, stream>>>(in, out, rows, channels, w(p + ".weight"), w(p + ".bias"), act);
+        size_t count = size_t(rows) * (channels / 8);
+        if (count <= 4096) {
+            cnn_group_norm<<<8, 256, 0, stream>>>(in, out, rows, channels, w(p + ".weight"), w(p + ".bias"), act);
+            return;
+        }
+        bool coalesced = channels == 32 || channels == 64 || channels == 128 || channels == 256;
+        int partial_size = coalesced ? 512 : 4096;
+        int parts = int((count + partial_size - 1) / partial_size);
+        cnn_norm_partial_sums.resize(size_t(parts) * 8);
+        cnn_norm_stats_buf.resize(16);
+        auto partial = [&](bool variance) {
+            switch (channels) {
+#define CNN_NORM_CASE(C) case C: \
+                if (variance) cnn_norm_partial_coalesced<C, true><<<parts, 256, 0, stream>>>(in, cnn_norm_partial_sums.p, cnn_norm_stats_buf.p, rows, parts); \
+                else cnn_norm_partial_coalesced<C, false><<<parts, 256, 0, stream>>>(in, cnn_norm_partial_sums.p, cnn_norm_stats_buf.p, rows, parts); \
+                break
+                CNN_NORM_CASE(32); CNN_NORM_CASE(64); CNN_NORM_CASE(128); CNN_NORM_CASE(256);
+#undef CNN_NORM_CASE
+            default:
+                if (variance) cnn_norm_partial<true><<<dim3(parts, 8), 256, 0, stream>>>(in, cnn_norm_partial_sums.p, cnn_norm_stats_buf.p, rows, channels, parts);
+                else cnn_norm_partial<false><<<dim3(parts, 8), 256, 0, stream>>>(in, cnn_norm_partial_sums.p, cnn_norm_stats_buf.p, rows, channels, parts);
+            }
+        };
+        partial(false);
+        cnn_norm_stats<false><<<8, 256, 0, stream>>>(cnn_norm_partial_sums.p, cnn_norm_stats_buf.p, parts, count);
+        partial(true);
+        cnn_norm_stats<true><<<8, 256, 0, stream>>>(cnn_norm_partial_sums.p, cnn_norm_stats_buf.p, parts, count);
+        cnn_norm_apply<<<grid(size_t(rows) * channels), 256, 0, stream>>>(in, out, cnn_norm_stats_buf.p,
+            w(p + ".weight"), w(p + ".bias"), rows, channels, act);
     }
     void cnn_block(const std::string& p, int width, int height) {
         Scope profile(*this, "block:" + p);
         int rows = width * height, ch = dim(p + ".conv.weight", 0), h = dim(p + ".ffn.bank.0.0.weight", 0);
+        bool fused_ffn = ch == 32 && h == 64;
         size_t size = size_t(rows) * ch;
         cnn_normed.resize(size); cnn_conv_out.resize(size);
         cnn_norm(x.p, cnn_normed.p, rows, ch, p + ".norm1", true);
@@ -842,32 +888,32 @@ struct CudaEngine::Impl {
         cnn_conv(cnn_normed.p, logits.p, width, height, p + ".ffn.router");
         pick.resize(rows); gates.resize(rows); counts.resize(8); ids0.resize(rows); ids1.resize(rows);
         sr_keys0.resize(rows); sr_keys1.resize(rows); sr_offsets.resize(9); sr_tiles.resize(9);
-        sr_lengths_buf.resize(rows); sr_item_offsets.resize(rows); row_group.resize(rows); group_in.resize(size);
-        group_hidden.resize(size_t(rows) * h); group_ffn.resize(size);
+        row_group.resize(rows); group_in.resize(size);
+        if (!fused_ffn) { group_hidden.resize(size_t(rows) * h); group_ffn.resize(size); }
         cu(cudaMemsetAsync(counts.p, 0, 8 * sizeof(int), stream));
-        sr_pick<<<grid(rows), 256, 0, stream>>>(logits.p, nullptr, pick.p, gates.p, sr_keys0.p, ids0.p, counts.p, rows, rows, 1, false, 8, 1.f, true);
+        cnn_pick_pixels<<<grid(rows), 256, 0, stream>>>(logits.p, pick.p, gates.p, sr_keys0.p, ids0.p, counts.p, rows);
         if (rows <= 4096) {
             sr_compact_map<<<8, 256, 0, stream>>>(pick.p, counts.p, row_group.p, sr_offsets.p, sr_tiles.p, rows, rows, 1, false, 8);
+            if (fused_ffn) cnn_inverse_map<<<grid(rows), 256, 0, stream>>>(row_group.p, ids1.p, rows);
         } else {
             size_t sort_bytes = 0;
             cu(cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, sr_keys0.p, sr_keys1.p, ids0.p, ids1.p, rows, 0, 3, stream));
             sr_sort_temp.resize(sort_bytes);
             cu(cub::DeviceRadixSort::SortPairs(sr_sort_temp.p, sort_bytes, sr_keys0.p, sr_keys1.p, ids0.p, ids1.p, rows, 0, 3, stream));
-            // Pixel routes have unit length; sorted positions already are offsets.
-            sr_lengths<<<grid(rows), 256, 0, stream>>>(ids1.p, sr_lengths_buf.p, rows, rows, 1, false);
-            size_t scan_bytes = 0;
-            cu(cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, sr_lengths_buf.p, sr_item_offsets.p, rows, stream));
-            sr_scan_temp.resize(scan_bytes);
-            cu(cub::DeviceScan::ExclusiveSum(sr_scan_temp.p, scan_bytes, sr_lengths_buf.p, sr_item_offsets.p, rows, stream));
             sr_descriptors<<<1, 32, 0, stream>>>(counts.p, sr_offsets.p, sr_tiles.p, 8);
-            sr_pack<<<rows, 128, 0, stream>>>(cnn_normed.p, group_in.p, row_group.p, ids1.p, sr_item_offsets.p, rows, 1, ch, false);
+            cnn_pack_pixels<<<grid(size), 256, 0, stream>>>(cnn_normed.p, group_in.p, row_group.p, ids1.p, rows, ch);
         }
         if (rows <= 4096) group_copy<<<grid(size), 256, 0, stream>>>(cnn_normed.p, group_in.p, row_group.p, rows, ch, true);
         const std::string f = "cnn:" + p + ".ffn";
         dim3 expand_grid((rows + 31) / 32 + 7, (h + 63) / 64), narrow_grid((rows + 31) / 32 + 7, (ch + 63) / 64);
-        sr_grouped_gemm<64><<<expand_grid, 256, 0, stream>>>(group_in.p, w(f + ".expand"), group_hidden.p, sr_offsets.p, sr_tiles.p, ch, h, true, 8, 0, w(f + ".expand_bias"));
-        sr_grouped_gemm<64><<<narrow_grid, 256, 0, stream>>>(group_hidden.p, w(f + ".narrow"), group_ffn.p, sr_offsets.p, sr_tiles.p, h, ch, false, 8, 0, w(f + ".narrow_bias"));
-        cnn_ffn_add<<<grid(size), 256, 0, stream>>>(x.p, group_ffn.p, row_group.p, gates.p, w(p + ".aux"), rows, ch);
+        if (fused_ffn) {
+            cnn_ffn32_64<<<expand_grid.x, 256, 0, stream>>>(group_in.p, w(f + ".expand"), w(f + ".narrow"),
+                w(f + ".expand_bias"), w(f + ".narrow_bias"), x.p, sr_offsets.p, sr_tiles.p, ids1.p, gates.p, w(p + ".aux"));
+        } else {
+            sr_grouped_gemm<64><<<expand_grid, 256, 0, stream>>>(group_in.p, w(f + ".expand"), group_hidden.p, sr_offsets.p, sr_tiles.p, ch, h, true, 8, 0, w(f + ".expand_bias"));
+            sr_grouped_gemm<64><<<narrow_grid, 256, 0, stream>>>(group_hidden.p, w(f + ".narrow"), group_ffn.p, sr_offsets.p, sr_tiles.p, h, ch, false, 8, 0, w(f + ".narrow_bias"));
+        }
+        if (!fused_ffn) cnn_ffn_add<<<grid(size), 256, 0, stream>>>(x.p, group_ffn.p, row_group.p, gates.p, w(p + ".aux"), rows, ch);
         record("blk-" + p, x.p, size); record("logits-" + p + ".ffn", logits.p, size_t(rows) * 8);
         record("gate-" + p + ".ffn", gates.p, rows); record_int("pick-" + p + ".ffn", pick.p, rows);
     }
